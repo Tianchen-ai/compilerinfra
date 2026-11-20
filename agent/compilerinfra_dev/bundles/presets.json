@@ -1,0 +1,5 @@
+{
+  "runtime": ["runtime"],
+  "development": ["runtime", "development"],
+  "measurement": ["runtime", "development", "measurement", "intent-bench", "weft-bench"]
+}

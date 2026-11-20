@@ -5,12 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "compilerinfra-agent"
 version = "0.0.0"
-description = "MCP tools for CompilerInfra product drivers"
+description = "Scoped compiler development, source plugins, CLI and MCP for CompilerInfra products"
 requires-python = ">=3.10"
-dependencies = ["mcp>=1.12,<2"]
+dependencies = ["mcp>=1.12,<2", "pydantic>=2,<3"]
 
 [project.scripts]
 compilerinfra-agent = "compilerinfra_agent:main"
+compilerinfra-dev = "compilerinfra_agent:cli"
 
 [tool.setuptools]
 py-modules = ["compilerinfra_agent"]
+packages = ["compilerinfra_dev"]
+
+[tool.setuptools.package-data]
+compilerinfra_dev = ["bundles/*.json", "bundles/*/*.json", "bundles/*/*.py", "bundles/*/*.md"]
