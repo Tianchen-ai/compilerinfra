@@ -1,4 +1,5 @@
 #include "ComponentIndex.h"
+#include "DecisionProgram.h"
 using namespace compilerinfra;
 
 namespace {
@@ -51,6 +52,23 @@ Compiler::impact(llvm::StringRef component) const {
   return llvm::json::Value(std::move(result));
 }
 
+llvm::Expected<llvm::StringRef>
+Compiler::boundaryModel(llvm::StringRef name, llvm::StringRef boundary) const {
+  auto found = llvm::find_if(
+      targets(), [&](const auto &target) { return target.name == name; });
+  if (found == targets().end())
+    return llvm::createStringError("unknown target " + name);
+  if (boundary == "input")
+    return llvm::StringRef(definition->inputModel);
+  if (llvm::none_of(found->stages,
+                    [&](const auto &stage) { return stage.name == boundary; }))
+    return llvm::createStringError(name + ": unknown boundary " + boundary);
+  if (!definition->index)
+    return llvm::StringRef{};
+  return *definition->index->entries.at(("lowering:" + boundary).str())
+              .declaration.getString("to");
+}
+
 llvm::Expected<llvm::json::Value> Compiler::plan(llvm::StringRef name) const {
   auto found = llvm::find_if(
       targets(), [&](const Target &target) { return target.name == name; });
@@ -58,6 +76,7 @@ llvm::Expected<llvm::json::Value> Compiler::plan(llvm::StringRef name) const {
     return llvm::createStringError("unknown target " + name);
   const auto *index = definition->index.get();
   llvm::json::Object result{{"target", found->name}};
+  result["input_model"] = definition->inputModel;
   if (index)
     result["route"] = index->targetRoutes.at(found->name);
   llvm::json::Array stages;
@@ -70,6 +89,15 @@ llvm::Expected<llvm::json::Value> Compiler::plan(llvm::StringRef name) const {
     llvm::json::Array groups;
     for (const PassGroup &group : stage.groups) {
       llvm::json::Object slot{{"required", group.isRequired()}};
+      if (const auto *p = group.decision()) {
+        llvm::json::Array ordered;
+        for (const auto &s : p->choice.strategies)
+          ordered.push_back(s);
+        slot["family"] = p->table->family.name;
+        slot["phase"] = p->materialize ? "materialize" : "decide";
+        slot["strategies"] = std::move(ordered);
+        slot["realizer"] = p->choice.realizer;
+      }
       if (!group.isRequired()) {
         slot["name"] = group.name().str();
         slot["default"] = group.defaultEnabled();

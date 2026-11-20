@@ -5,11 +5,16 @@
 
 namespace compilerinfra {
 struct IRComparison {
-  // Both arms start from one bytecode image at this boundary.
+  // Empty if independently linked definitions compiled the original input.
   std::string sharedThrough;
   Artifact baseline;
   Artifact candidate;
 };
+llvm::Expected<IRComparison> compareCompilers(const Compiler &baseline,
+                                              const Compiler &candidate,
+                                              llvm::StringRef target,
+                                              llvm::MemoryBufferRef input,
+                                              const StageRange &range);
 
 // Import once; execute the common prefix once. Compare the default and edited
 // pipelines at range.through in independent sessions. Neither emitter is

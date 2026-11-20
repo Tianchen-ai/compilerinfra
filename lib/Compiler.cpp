@@ -7,6 +7,14 @@
 using namespace compilerinfra;
 using llvm::createStringError;
 
+llvm::Expected<Artifact> Compiler::compile(llvm::StringRef target,
+                                           llvm::MemoryBufferRef input) const {
+  auto session = open(target);
+  if (!session)
+    return session.takeError();
+  return (*session)->compile(input);
+}
+
 PassGroup::PassGroup(bool requiredGroup, std::string slot, BuildPasses build,
                      bool enabled)
     : requiredGroup(requiredGroup), slot(std::move(slot)),
@@ -64,7 +72,9 @@ Compiler::create(Frontend frontend, std::vector<Target> targets,
   if (!frontend.import || targets.empty())
     return createStringError("compiler needs an importer and a target");
   llvm::StringSet<> names;
-  for (const Target &target : targets) {
+  for (Target &target : targets) {
+    for (auto &stage : target.stages)
+      stage.identity = std::make_shared<const char>(0);
     if (!frontend.verifyInput && !target.verifyInput)
       return createStringError("missing input model check for target " +
                                target.name);

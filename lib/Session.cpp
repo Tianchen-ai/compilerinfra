@@ -1,4 +1,5 @@
 #include "compilerinfra/Session.h"
+#include "DecisionProgram.h"
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
@@ -106,6 +107,10 @@ struct Session::Impl {
     if (bounds.begin) {
       if (auto error = checkBoundary(stages[bounds.begin - 1], module))
         return error;
+      if (mlir::failed(detail::verifyDecisionCheckpoint(
+              llvm::ArrayRef(target.stages).take_front(bounds.begin), module)))
+        return createStringError("invalid decision state at checkpoint " +
+                                 stages[bounds.begin - 1].spec.name);
     } else {
       if ((definition->frontend.verifyInput &&
            mlir::failed(definition->frontend.verifyInput(module))) ||
@@ -217,6 +222,11 @@ Session::create(std::shared_ptr<const Compiler::Definition> definition,
     passes->enableVerifier();
     for (const PassGroup &group : stage.groups) {
       const BuildPasses *build = &group.builder();
+      BuildPasses observed;
+      if (group.decision() && options.observeDecision) {
+        observed = group.decision()->builder(options.observeDecision);
+        build = &observed;
+      }
       bool enabled = group.defaultEnabled();
       auto override = edits.find(group.name().str());
       if (override != edits.end()) {

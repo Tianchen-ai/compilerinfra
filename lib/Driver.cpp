@@ -18,6 +18,15 @@ namespace {
 namespace cl = llvm::cl;
 
 struct DriverOptions {
+  cl::list<std::string> presets{
+      "preset",
+      cl::desc("Derive using a product preset JSON file (repeatable)")};
+  cl::list<std::string> against{
+      "against-preset",
+      cl::desc("Compare this compiler with its derived preset (repeatable)")};
+  cl::opt<bool> explain{
+      "explain",
+      cl::desc("Report observed IR decisions for this compilation as JSON")};
   cl::OptionCategory category{"CompilerInfra"};
   cl::opt<bool> compareIR{
       "compare-ir",
@@ -160,16 +169,31 @@ llvm::Error writeOutput(StringRef path, llvm::ArrayRef<char> bytes) {
   return temp->keep(path);
 }
 
-llvm::Error run(const DriverOptions &cmd, const Compiler &compiler) {
+llvm::Expected<Compiler> deriveFile(const Compiler &compiler,
+                                    llvm::StringRef path) {
+  auto input = llvm::MemoryBuffer::getFile(path);
+  if (!input)
+    return createStringError(input.getError(), "cannot read preset " + path);
+  auto value = llvm::json::parse((*input)->getBuffer());
+  if (!value)
+    return value.takeError();
+  auto preset = parsePreset(*value);
+  if (!preset)
+    return preset.takeError();
+  return compiler.derive(*preset);
+}
+llvm::Error run(const DriverOptions &cmd, const Compiler &compiler,
+                const Compiler &root) {
   unsigned queries = unsigned(cmd.list) + unsigned(cmd.components) +
                      cmd.impact.getNumOccurrences() +
                      cmd.plan.getNumOccurrences();
   if (queries) {
     if (queries != 1 || cmd.target.getNumOccurrences() || cmd.pipeline ||
-        cmd.compareIR || cmd.after.getNumOccurrences() ||
-        cmd.through.getNumOccurrences() || cmd.input.getNumOccurrences() ||
-        cmd.output.getNumOccurrences() || cmd.format.getNumOccurrences() ||
-        !cmd.enable.empty() || !cmd.disable.empty() || !cmd.replace.empty())
+        cmd.explain || !cmd.against.empty() || cmd.compareIR ||
+        cmd.after.getNumOccurrences() || cmd.through.getNumOccurrences() ||
+        cmd.input.getNumOccurrences() || cmd.output.getNumOccurrences() ||
+        cmd.format.getNumOccurrences() || !cmd.enable.empty() ||
+        !cmd.disable.empty() || !cmd.replace.empty())
       return createStringError(
           "use a single declaration query without execution options");
     if (cmd.list) {
@@ -204,18 +228,48 @@ llvm::Error run(const DriverOptions &cmd, const Compiler &compiler) {
   auto settings = sessionOptions(cmd);
   if (!settings)
     return settings.takeError();
+  llvm::json::Array decisions;
+  if (cmd.explain) {
+    if (cmd.compareIR || cmd.pipeline || cmd.format.getNumOccurrences())
+      return createStringError("--explain takes a compile request");
+    settings->observeDecision = [&](const DecisionEvent &e) {
+      decisions.push_back(
+          llvm::json::Object{{"family", e.family},
+                             {"action", e.action},
+                             {"implementation", e.implementation},
+                             {"operation", e.operation},
+                             {"location", e.location},
+                             {"value", e.value}});
+    };
+  }
+  if (!cmd.against.empty() &&
+      (!cmd.compareIR || !settings->optimizations.empty()))
+    return createStringError(
+        "--against-preset requires --compare-ir without slot overrides");
   if (cmd.compareIR) {
     if (cmd.pipeline || cmd.format.getNumOccurrences() || !range.through ||
-        settings->optimizations.empty())
+        (settings->optimizations.empty() && cmd.against.empty()))
       return createStringError("--compare-ir requires --through and an "
                                "optimization edit; output is JSON");
     auto input = llvm::MemoryBuffer::getFileOrSTDIN(cmd.input.getValue());
     if (!input)
       return createStringError(input.getError(),
                                "cannot read " + cmd.input.getValue());
-    auto pair =
-        compilerinfra::compareIR(compiler, cmd.target.getValue(),
-                                 (*input)->getMemBufferRef(), range, *settings);
+    auto pair = [&]() -> llvm::Expected<IRComparison> {
+      if (cmd.against.empty())
+        return compilerinfra::compareIR(compiler, cmd.target.getValue(),
+                                        (*input)->getMemBufferRef(), range,
+                                        *settings);
+      Compiler other = root;
+      for (const auto &path : cmd.against) {
+        auto c = deriveFile(other, path);
+        if (!c)
+          return c.takeError();
+        other = std::move(*c);
+      }
+      return compareCompilers(compiler, other, cmd.target.getValue(),
+                              (*input)->getMemBufferRef(), range);
+    }();
     if (!pair)
       return pair.takeError();
     llvm::json::Object data{
@@ -246,6 +300,16 @@ llvm::Error run(const DriverOptions &cmd, const Compiler &compiler) {
   auto result = (*session)->compile((*input)->getMemBufferRef(), range, format);
   if (!result)
     return result.takeError();
+  if (cmd.explain) {
+    std::string json =
+        llvm::formatv("{0}\n", llvm::json::Value(llvm::json::Object{
+                                   {"target", cmd.target.getValue()},
+                                   {"decisions", std::move(decisions)},
+                                   {"artifact_bytes", result->size()}}))
+            .str();
+    return writeOutput(cmd.output.getValue(),
+                       llvm::ArrayRef<char>(json.data(), json.size()));
+  }
   return writeOutput(cmd.output.getValue(), *result);
 }
 } // namespace
@@ -261,7 +325,13 @@ int compilerinfra::driverMain(
                                          &llvm::errs()))
     return 1;
   auto compiler = makeCompiler();
-  auto error = compiler ? run(cmd, *compiler) : compiler.takeError();
+  auto root = compiler ? std::optional<Compiler>(*compiler) : std::nullopt;
+  for (const auto &file : cmd.presets) {
+    if (!compiler)
+      break;
+    compiler = deriveFile(*compiler, file);
+  }
+  auto error = compiler ? run(cmd, *compiler, *root) : compiler.takeError();
   if (error) {
     llvm::logAllUnhandledErrors(std::move(error), llvm::errs(),
                                 llvm::Twine(argv[0]) + ": ");

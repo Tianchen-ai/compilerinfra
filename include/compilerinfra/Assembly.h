@@ -70,7 +70,8 @@ struct Model {
 struct ExtensionPoint {
   std::string name;
 };
-using LoweringStep = std::variant<ModelPasses, ExtensionPoint>;
+using LoweringStep =
+    std::variant<ModelPasses, ExtensionPoint, Decide, Materialize>;
 struct Lowering {
   std::string name;
   std::string from;
@@ -109,6 +110,10 @@ struct Provider {
   std::string accepts; // Model required by the emitter.
   RegisterDialects registerDialects;
   Emit emit;
+  DecisionChoices decisions;
+  std::function<llvm::Expected<TargetProfile>(const TargetProfile &,
+                                              const llvm::json::Object &)>
+      configurePreset;
 };
 
 // Registration order is immaterial. Linking is pure declaration work:
@@ -120,9 +125,14 @@ public:
   void add(Route route, SourceRef source);
   void add(Contribution contribution, SourceRef source);
   void add(Provider provider, SourceRef source);
+  void add(DecisionFamily value, SourceRef source);
+  void add(Strategy value, SourceRef source);
+  void add(Realizer value, SourceRef source);
 
   llvm::Expected<Compiler> link(Import importer,
                                 llvm::StringRef inputModel) const;
+  llvm::Expected<Compiler> link(Import importer, llvm::StringRef inputModel,
+                                const CompilerPreset &preset) const;
 
 private:
   template <typename T> struct Located {
@@ -134,7 +144,11 @@ private:
   std::vector<Located<Route>> routes;
   std::vector<Located<Contribution>> contributions;
   std::vector<Located<Provider>> providers;
+  std::vector<Located<DecisionFamily>> families;
+  std::vector<Located<Strategy>> strategies;
+  std::vector<Located<Realizer>> realizers;
   friend class AssemblyLinker;
+  friend class Compiler;
 };
 
 } // namespace compilerinfra

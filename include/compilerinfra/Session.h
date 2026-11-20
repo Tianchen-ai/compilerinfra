@@ -16,7 +16,6 @@ struct StageRange {
   std::optional<std::string> through;
 };
 
-using Artifact = llvm::SmallVector<char, 0>;
 // Borrowed, read-only view for the duration of the callback.
 using Observer =
     llvm::function_ref<llvm::Error(llvm::StringRef, mlir::ModuleOp)>;

@@ -1,11 +1,13 @@
 #ifndef COMPILERINFRA_COMPILER_H
 #define COMPILERINFRA_COMPILER_H
 
+#include "compilerinfra/Decision.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
@@ -50,8 +52,13 @@ public:
   bool defaultEnabled() const { return enabled; }
   const BuildPasses &builder() const { return build; }
   llvm::StringRef extensionPoint() const { return point; }
+  const detail::DecisionProgram *decision() const { return program.get(); }
 
 private:
+  friend class AssemblyLinker;
+  friend class Compiler;
+  static PassGroup forDecision(detail::DecisionProgram program);
+  std::shared_ptr<const detail::DecisionProgram> program;
   PassGroup(bool requiredGroup, std::string slot, BuildPasses build,
             bool enabled);
   bool requiredGroup;
@@ -66,6 +73,8 @@ struct Stage {
   std::vector<PassGroup> groups;
   // Checks the representation and target invariants both on exit and on resume.
   BoundaryCheck verifyOutput;
+  std::shared_ptr<const char>
+      identity; // Process-local sharing across immutable derivations.
 };
 
 struct Target {
@@ -87,12 +96,15 @@ using Optimizations = std::map<std::string, Optimization>;
 
 struct SessionOptions {
   Optimizations optimizations;
+  DecisionObserver observeDecision;
   // Install native MLIR instrumentation/options at session construction.
   std::function<llvm::Error(llvm::StringRef, mlir::PassManager &)>
       configureStage;
 };
 
 class Session;
+class Assembly;
+using Artifact = llvm::SmallVector<char, 0>;
 
 // Construct once per product configuration. Callbacks own their captures.
 class Compiler {
@@ -100,10 +112,19 @@ public:
   static llvm::Expected<Compiler> create(Frontend frontend,
                                          std::vector<Target> targets);
   llvm::ArrayRef<Target> targets() const;
+  llvm::Expected<Compiler> derive(const CompilerPreset &changes) const;
+  llvm::Expected<Artifact> compile(llvm::StringRef target,
+                                   llvm::MemoryBufferRef input) const;
+  bool sharesInputWith(const Compiler &other) const {
+    return definition->origin == other.definition->origin;
+  }
   // Static queries use the very same routes and optional slots as open().
   llvm::json::Value components() const;
   llvm::Expected<llvm::json::Value> impact(llvm::StringRef component) const;
   llvm::Expected<llvm::json::Value> plan(llvm::StringRef target) const;
+  // Assembly-linked products name the model carried by each boundary.
+  llvm::Expected<llvm::StringRef> boundaryModel(llvm::StringRef target,
+                                                llvm::StringRef boundary) const;
 
   llvm::Expected<std::unique_ptr<Session>>
   open(llvm::StringRef target, const SessionOptions &options = {}) const;
@@ -115,6 +136,7 @@ public:
 
 private:
   friend class Session;
+  friend class Assembly;
   friend class AssemblyLinker;
   static llvm::Expected<Compiler>
   create(Frontend frontend, std::vector<Target> targets,
@@ -123,6 +145,10 @@ private:
     Frontend frontend;
     std::vector<Target> targets;
     std::shared_ptr<const detail::ComponentIndex> index;
+    std::shared_ptr<const Assembly> assembly;
+    std::string inputModel;
+    CompilerPreset preset;
+    std::shared_ptr<const char> origin = std::make_shared<const char>(0);
   };
   explicit Compiler(std::shared_ptr<const Definition> definition);
   std::shared_ptr<const Definition> definition;
