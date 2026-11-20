@@ -30,4 +30,4 @@ cmake --install build
 | [仓库组织](doc/workspace.md) | 母仓代码、四个独立子仓、文档和临时工作区 |
 | [开发原则](AGENTS.md) | 代码结构、错误处理、少量针对性验证及性能口径 |
 
-这版交付母仓 SDK。IntentDSL 将作为首个接入产品，Triton–Weft 随后独立接入。正确性与性能测量分别由 IntentDSL Bench、Triton–Weft Bench 负责。
+IntentDSL 是首个接入产品。在其独立子仓中，`product.json` 将 KIR、Block、CPU、DSA 和 provider 组件链接到命令行与 Python JIT。Triton–Weft 作为另一台编译器独立接入。两者分别使用 IntentDSL Bench 和 Triton–Weft Bench 检查数值与测量性能。[工作区约定](doc/workspace.md)
