@@ -1,4 +1,5 @@
 #include "compilerinfra/Driver.h"
+#include "compilerinfra/Comparison.h"
 #include "compilerinfra/Session.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -18,6 +19,11 @@ namespace cl = llvm::cl;
 
 struct DriverOptions {
   cl::OptionCategory category{"CompilerInfra"};
+  cl::opt<bool> compareIR{
+      "compare-ir",
+      cl::desc(
+          "Compare default and edited IR at --through from one common input"),
+      cl::cat(category)};
   cl::opt<std::string> target{"target", cl::desc("Select product target"),
                               cl::cat(category)};
   cl::opt<std::string> input{cl::Positional, cl::init("-"), cl::desc("[input]"),
@@ -27,6 +33,17 @@ struct DriverOptions {
                               cl::cat(category)};
   cl::opt<bool> list{"list", cl::desc("List declarations as JSON"),
                      cl::cat(category)};
+  cl::opt<bool> components{
+      "components",
+      cl::desc("List source components and extension points as JSON"),
+      cl::cat(category)};
+  cl::opt<std::string> impact{
+      "impact", cl::desc("Describe affected targets for KIND:NAME as JSON"),
+      cl::cat(category)};
+  cl::opt<std::string> plan{"plan",
+                            cl::desc("Describe the linked route and "
+                                     "optimization slots for TARGET as JSON"),
+                            cl::cat(category)};
   cl::opt<bool> pipeline{"pipeline", cl::desc("Print the assembled pipeline"),
                          cl::cat(category)};
   cl::opt<std::string> after{"after", cl::desc("Resume after boundary"),
@@ -95,6 +112,13 @@ llvm::Expected<SessionOptions> sessionOptions(const DriverOptions &cmd) {
     auto [name, pipeline] = StringRef(spec).split('=');
     if (name.empty() || pipeline.empty())
       return createStringError("--replace requires NAME=MLIR-PASS-PIPELINE");
+    if (pipeline.consume_front("@")) {
+      if (pipeline.empty())
+        return createStringError("expected a contribution name after @");
+      if (auto error = add(name, {true, {}, pipeline.str()}))
+        return error;
+      continue;
+    }
     auto build = [text =
                       pipeline.str()](mlir::OpPassManager &pm) -> llvm::Error {
       std::string detail;
@@ -137,15 +161,29 @@ llvm::Error writeOutput(StringRef path, llvm::ArrayRef<char> bytes) {
 }
 
 llvm::Error run(const DriverOptions &cmd, const Compiler &compiler) {
-  if (cmd.list) {
-    if (cmd.target.getNumOccurrences() || cmd.pipeline ||
-        cmd.after.getNumOccurrences() || cmd.through.getNumOccurrences() ||
-        cmd.input.getNumOccurrences() || cmd.output.getNumOccurrences() ||
-        cmd.format.getNumOccurrences() || !cmd.enable.empty() ||
-        !cmd.disable.empty() || !cmd.replace.empty())
+  unsigned queries = unsigned(cmd.list) + unsigned(cmd.components) +
+                     cmd.impact.getNumOccurrences() +
+                     cmd.plan.getNumOccurrences();
+  if (queries) {
+    if (queries != 1 || cmd.target.getNumOccurrences() || cmd.pipeline ||
+        cmd.compareIR || cmd.after.getNumOccurrences() ||
+        cmd.through.getNumOccurrences() || cmd.input.getNumOccurrences() ||
+        cmd.output.getNumOccurrences() || cmd.format.getNumOccurrences() ||
+        !cmd.enable.empty() || !cmd.disable.empty() || !cmd.replace.empty())
       return createStringError(
-          "--list is a declaration query; use it on its own");
-    printCatalog(compiler);
+          "use a single declaration query without execution options");
+    if (cmd.list) {
+      printCatalog(compiler);
+    } else if (cmd.components) {
+      llvm::outs() << llvm::formatv("{0:2}\n", compiler.components());
+    } else {
+      auto value = cmd.plan.getNumOccurrences()
+                       ? compiler.plan(cmd.plan.getValue())
+                       : compiler.impact(cmd.impact.getValue());
+      if (!value)
+        return value.takeError();
+      llvm::outs() << llvm::formatv("{0:2}\n", *value);
+    }
     return flushStdout();
   }
   if (cmd.target.empty())
@@ -166,6 +204,31 @@ llvm::Error run(const DriverOptions &cmd, const Compiler &compiler) {
   auto settings = sessionOptions(cmd);
   if (!settings)
     return settings.takeError();
+  if (cmd.compareIR) {
+    if (cmd.pipeline || cmd.format.getNumOccurrences() || !range.through ||
+        settings->optimizations.empty())
+      return createStringError("--compare-ir requires --through and an "
+                               "optimization edit; output is JSON");
+    auto input = llvm::MemoryBuffer::getFileOrSTDIN(cmd.input.getValue());
+    if (!input)
+      return createStringError(input.getError(),
+                               "cannot read " + cmd.input.getValue());
+    auto pair =
+        compilerinfra::compareIR(compiler, cmd.target.getValue(),
+                                 (*input)->getMemBufferRef(), range, *settings);
+    if (!pair)
+      return pair.takeError();
+    llvm::json::Object data{
+        {"shared_through", pair->sharedThrough},
+        {"through", *range.through},
+        {"baseline", StringRef(pair->baseline.data(), pair->baseline.size())},
+        {"candidate",
+         StringRef(pair->candidate.data(), pair->candidate.size())}};
+    std::string bytes =
+        llvm::formatv("{0}\n", llvm::json::Value(std::move(data))).str();
+    return writeOutput(cmd.output.getValue(),
+                       llvm::ArrayRef<char>(bytes.data(), bytes.size()));
+  }
   auto session = compiler.open(cmd.target.getValue(), *settings);
   if (!session)
     return session.takeError();

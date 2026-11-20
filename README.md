@@ -1,6 +1,8 @@
 # compilerinfra
 
-compilerinfra 是在 MLIR 上构建领域编译器的 C++ 框架。产品提供前端、目标和 lowering 组件，框架负责选择显式目标、装配真实 pass pipeline、运行和检查各阶段，并调用目标 emitter 返回产物。JIT、优化 agent 和产品的开发工具使用同一条编译路径。
+compilerinfra 是为 coding agent 设计的 MLIR 编译器开发框架。一个优化 agent 可以查询产品的执行模型和源码位置，在已有扩展点贡献一个变换，直接让采用相同路线且能力匹配的后端使用它。一个新后端可以引用已有模型、路线和优化，提供自己的目标实现。产品 JIT、命令行和 MCP 使用同一份源码装配结果。
+
+从[组件开发与 MCP](doc/components.md)开始。文档列出了新增优化、模型和后端各要写哪些代码，以及哪些工作由框架承担。
 
 ## 构建与安装
 
@@ -23,7 +25,7 @@ cmake --install build
 
 | 入口 | 内容 |
 | --- | --- |
-| [框架设计](doc/foundation.md) | 框架掌握的生命周期、领域产品的职责、agent 与 Bench 的合作方式 |
+| [框架设计](doc/foundation.md) | 加法式扩展、框架掌握的生命周期、agent 与 Bench 的合作方式 |
 | [框架接口](doc/framework.md) | 产品装配、JIT、阶段边界、优化控制、驱动参数和对象寿命 |
 | [仓库组织](doc/workspace.md) | 母仓代码、四个独立子仓、文档和临时工作区 |
 | [开发原则](AGENTS.md) | 代码结构、错误处理、少量针对性验证及性能口径 |

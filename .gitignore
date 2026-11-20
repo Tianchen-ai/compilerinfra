@@ -10,3 +10,5 @@
 
 __pycache__/
 *.py[cod]
+/agent/build/
+/agent/*.egg-info/

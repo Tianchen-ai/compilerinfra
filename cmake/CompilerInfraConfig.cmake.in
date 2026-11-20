@@ -6,4 +6,5 @@ if(NOT TARGET CompilerInfra::Core)
   target_include_directories(CompilerInfra::Core SYSTEM INTERFACE
     ${MLIR_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 endif()
+include("${CMAKE_CURRENT_LIST_DIR}/CompilerInfraComponents.cmake")
 check_required_components(CompilerInfra)

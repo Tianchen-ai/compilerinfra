@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "compilerinfra-agent"
+version = "0.0.0"
+description = "MCP tools for CompilerInfra product drivers"
+requires-python = ">=3.10"
+dependencies = ["mcp>=1.12,<2"]
+
+[project.scripts]
+compilerinfra-agent = "compilerinfra_agent:main"
+
+[tool.setuptools]
+py-modules = ["compilerinfra_agent"]

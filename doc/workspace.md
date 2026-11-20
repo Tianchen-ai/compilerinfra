@@ -4,12 +4,13 @@
 
 ```text
 compilerinfra/                     基座主仓
-  README.md                        人的入口
+  README.md                        产品定位与安装入口
   AGENTS.md                        人和 agent 共用的开发原则
   CLAUDE.md                        引用 AGENTS.md
   CMakeLists.txt                   SDK 构建与安装
   cmake/                           find_package 配置
-  include/compilerinfra/           Core、Session 和 Driver 的公共接口
+  agent/                           可安装的 MCP 适配器，调用产品自己的驱动
+  include/compilerinfra/           组件装配、编译会话、IR 对照和产品驱动的公共接口
   lib/                             组件装配、编译会话和可链接驱动
   doc/                             框架设计与使用文档
   .work/<任务>/                    本地草稿、模型审阅和临时探索

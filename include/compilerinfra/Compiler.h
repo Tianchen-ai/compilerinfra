@@ -8,6 +8,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBufferRef.h"
 #include <functional>
 #include <map>
@@ -16,6 +17,9 @@
 #include <vector>
 
 namespace compilerinfra {
+namespace detail {
+struct ComponentIndex;
+}
 
 using RegisterDialects = std::function<void(mlir::DialectRegistry &)>;
 using Import = std::function<llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>>(
@@ -38,12 +42,14 @@ class PassGroup {
 public:
   static PassGroup required(BuildPasses build);
   static PassGroup optimization(std::string name, BuildPasses build,
-                                bool enabledByDefault = true);
+                                bool enabledByDefault = true,
+                                std::string point = {});
 
   bool isRequired() const { return requiredGroup; }
   llvm::StringRef name() const { return slot; }
   bool defaultEnabled() const { return enabled; }
   const BuildPasses &builder() const { return build; }
+  llvm::StringRef extensionPoint() const { return point; }
 
 private:
   PassGroup(bool requiredGroup, std::string slot, BuildPasses build,
@@ -52,6 +58,7 @@ private:
   std::string slot;
   BuildPasses build;
   bool enabled;
+  std::string point;
 };
 
 struct Stage {
@@ -66,11 +73,15 @@ struct Target {
   RegisterDialects registerDialects;
   std::vector<Stage> stages;
   Emit emit;
+  BoundaryCheck verifyInput;
 };
 
 struct Optimization {
   bool enabled = true;
   BuildPasses replacement;
+  // Select this eligible sibling instead, at its own declared ordering
+  // position.
+  std::string useContribution;
 };
 using Optimizations = std::map<std::string, Optimization>;
 
@@ -89,6 +100,10 @@ public:
   static llvm::Expected<Compiler> create(Frontend frontend,
                                          std::vector<Target> targets);
   llvm::ArrayRef<Target> targets() const;
+  // Static queries use the very same routes and optional slots as open().
+  llvm::json::Value components() const;
+  llvm::Expected<llvm::json::Value> impact(llvm::StringRef component) const;
+  llvm::Expected<llvm::json::Value> plan(llvm::StringRef target) const;
 
   llvm::Expected<std::unique_ptr<Session>>
   open(llvm::StringRef target, const SessionOptions &options = {}) const;
@@ -100,9 +115,14 @@ public:
 
 private:
   friend class Session;
+  friend class AssemblyLinker;
+  static llvm::Expected<Compiler>
+  create(Frontend frontend, std::vector<Target> targets,
+         std::shared_ptr<const detail::ComponentIndex> index);
   struct Definition {
     Frontend frontend;
     std::vector<Target> targets;
+    std::shared_ptr<const detail::ComponentIndex> index;
   };
   explicit Compiler(std::shared_ptr<const Definition> definition);
   std::shared_ptr<const Definition> definition;

@@ -1,6 +1,12 @@
 # 编译器开发框架
 
-compilerinfra 把编译器的**装配、编译、修改与重新执行**定义成一种产品开发模型。领域开发者提供可执行的生成过程，框架决定何时构造它、以什么程序为输入、如何交给下一阶段，以及何时返回产物。同一生成过程既用于正常编译，也能直接被人和 agent 改进。IntentDSL 和 Triton–Weft 可以完全独立地采用它。
+compilerinfra 面向开发编译器的 coding agent。它把编译器的装配、定位、修改与重新执行变成 agent 可调用的操作。输入仍然是产品真实的作者程序，留下来的成果是下一次编译会执行的代码。IntentDSL 和 Triton–Weft 可以完全独立地采用它。
+
+## 加法发生在哪里
+
+模型持有表示和 verifier，lowering 说明如何从一个模型得到另一个模型，路线复用具名 lowering 和子路线。Provider 选择终点并提供目标实现。优化贡献只引用一个 lowering 的一个扩展点。框架将这些独立声明链接成每个目标实际使用的编译过程。新增一个符合已有能力的后端，可以直接采用已有贡献；新增一个共享优化，也无需去每个相关后端修改一遍。真正需要专用算法或目标实现的工作仍归相应组件。
+
+MLIR 已提供 pass、IR 与 verifier，LLVM 也已有 pipeline 扩展点。这里的设计取舍是让源码装配同时成为 agent 发现修改位置、查询影响范围、试换和编译的依据。是否缩短 agent 达到相同性能的时间、是否能得到更快的数值正确实现，都要通过同信息和同预算的实际比较判断。[LLVM 的 pipeline 扩展点](https://llvm.org/docs/NewPassManager.html#inserting-passes-into-default-pipelines)
 
 ## 框架与领域产品
 

@@ -2,7 +2,9 @@
 
 SDK 暴露两个 CMake 目标。[Compiler.h](../include/compilerinfra/Compiler.h) 和 [Session.h](../include/compilerinfra/Session.h) 属于 `CompilerInfra::Core`。[Driver.h](../include/compilerinfra/Driver.h) 属于可选的 `CompilerInfra::Driver`。使用 `open` 创建会话的翻译单元包含 `Session.h`。
 
-## 装配一台编译器
+## 执行接口
+
+采用基座的产品从 [Assembly](components.md) 登记一次模型、路线和优化，再调用 `link`。下面的 `Target` / `Stage` 是链接后送入同一执行器的低层形式。手中已有显式展开管线的调用方仍可直接使用它；只有经源码装配链接的产物有组件来源和影响查询。
 
 1. 产品提供 `Frontend`。它登记源 dialect，导入源文件或内存输入，并验证源 module 是否属于本产品接受的表示。直接接收 MLIR 文本或 bytecode 的入口可以使用 `importMLIR`。
 2. 每个 `Target` 声明名称、自己的 dialect 登记函数、顺序阶段以及最终 emitter。选项、硬件能力和工具链路径可用产品原有的强类型对象捕获到这些回调中。登记只描述能力。只有选中的目标才会装配 pipeline。
@@ -45,5 +47,8 @@ SDK 暴露两个 CMake 目标。[Compiler.h](../include/compilerinfra/Compiler.h
 | `--format asm\|bytecode` | 指定 through 输出的编码。命令行默认文本 |
 | `--enable NAME` / `--disable NAME` | 针对本次会话修改已声明的优化 |
 | `--replace NAME=PIPELINE` | 把产品已注册的 MLIR pass 或嵌套 pass pipeline 装在指定可选槽位，PIPELINE 是 module 内的 pipeline 内容 |
+| `--components` / `--impact KIND:NAME` / `--plan TARGET` | JSON 源码组件目录、静态影响范围和链接后的目标管线 |
+| `--replace NAME=@OTHER` | 选择同一扩展点上另一个已编入、适用于当前目标的贡献，保持其声明次序 |
+| `--compare-ir --target TARGET --through STAGE` 加优化设置 | 从同一前缀 checkpoint 比较默认和修改后的阶段结果，JSON 输出两份 IR |
 
 驱动会诊断实际执行区间之外的显式优化修改，以免把跳过的优化当作已运行的比较。写普通文件时，在目标路径旁产生临时文件，写入成功后替换最终文件。Bench 通过正常产品接口选择编译模式和输出位置，仍以产品的完整运行结果进行比较。

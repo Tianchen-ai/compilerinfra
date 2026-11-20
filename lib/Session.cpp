@@ -2,7 +2,7 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
-#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace compilerinfra;
@@ -107,7 +107,9 @@ struct Session::Impl {
       if (auto error = checkBoundary(stages[bounds.begin - 1], module))
         return error;
     } else {
-      if (mlir::failed(definition->frontend.verifyInput(module)))
+      if ((definition->frontend.verifyInput &&
+           mlir::failed(definition->frontend.verifyInput(module))) ||
+          (target.verifyInput && mlir::failed(target.verifyInput(module))))
         return createStringError(
             target.name +
             ": module does not satisfy the frontend input boundary");
@@ -159,18 +161,40 @@ llvm::Expected<std::unique_ptr<Session>>
 Session::create(std::shared_ptr<const Compiler::Definition> definition,
                 const Target &target, mlir::MLIRContext *external,
                 const SessionOptions &options) {
-  llvm::StringSet<> known;
+  struct Slot {
+    const Stage *stage;
+    const PassGroup *group;
+  };
+  llvm::StringMap<Slot> known;
   for (const Stage &stage : target.stages)
     for (const PassGroup &group : stage.groups)
       if (!group.isRequired())
-        known.insert(group.name());
+        known.try_emplace(group.name(), Slot{&stage, &group});
+  auto edits = options.optimizations;
   for (const auto &[name, option] : options.optimizations) {
     if (!known.contains(name))
       return createStringError("unknown optional optimization '" + name +
                                "' for target " + target.name);
-    if (!option.enabled && option.replacement)
+    if (!option.enabled &&
+        (option.replacement || !option.useContribution.empty()))
       return createStringError("disabled optimization has a replacement: " +
                                name);
+    if (!option.useContribution.empty()) {
+      auto source = known.find(option.useContribution);
+      auto dest = known.find(name);
+      if (source == known.end() || option.replacement ||
+          dest->second.stage != source->second.stage ||
+          dest->second.group->extensionPoint().empty() ||
+          dest->second.group->extensionPoint() !=
+              source->second.group->extensionPoint())
+        return createStringError(
+            "replacement " + option.useContribution +
+            " must be an eligible contribution at the same point as " + name);
+      if (!edits.emplace(option.useContribution, Optimization{}).second)
+        return createStringError("conflicting overrides for " +
+                                 option.useContribution);
+      edits.at(name) = Optimization{false, {}, {}};
+    }
   }
 
   auto state = std::make_unique<Impl>(std::move(definition), target);
@@ -194,8 +218,8 @@ Session::create(std::shared_ptr<const Compiler::Definition> definition,
     for (const PassGroup &group : stage.groups) {
       const BuildPasses *build = &group.builder();
       bool enabled = group.defaultEnabled();
-      auto override = options.optimizations.find(group.name().str());
-      if (override != options.optimizations.end()) {
+      auto override = edits.find(group.name().str());
+      if (override != edits.end()) {
         state->overrides.emplace_back(override->first, state->stages.size());
         enabled = override->second.enabled;
         if (override->second.replacement)

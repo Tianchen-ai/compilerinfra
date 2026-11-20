@@ -17,8 +17,10 @@ PassGroup PassGroup::required(BuildPasses build) {
 }
 
 PassGroup PassGroup::optimization(std::string name, BuildPasses build,
-                                  bool enabledByDefault) {
-  return PassGroup(false, std::move(name), std::move(build), enabledByDefault);
+                                  bool enabledByDefault, std::string point) {
+  PassGroup group(false, std::move(name), std::move(build), enabledByDefault);
+  group.point = std::move(point);
+  return group;
 }
 
 Compiler::Compiler(std::shared_ptr<const Definition> definition)
@@ -53,11 +55,19 @@ static llvm::Error validateTarget(const Target &target) {
 
 llvm::Expected<Compiler> Compiler::create(Frontend frontend,
                                           std::vector<Target> targets) {
-  if (!frontend.import || !frontend.verifyInput || targets.empty())
-    return createStringError(
-        "compiler needs an importer, an input check and a target");
+  return create(std::move(frontend), std::move(targets), nullptr);
+}
+
+llvm::Expected<Compiler>
+Compiler::create(Frontend frontend, std::vector<Target> targets,
+                 std::shared_ptr<const detail::ComponentIndex> index) {
+  if (!frontend.import || targets.empty())
+    return createStringError("compiler needs an importer and a target");
   llvm::StringSet<> names;
   for (const Target &target : targets) {
+    if (!frontend.verifyInput && !target.verifyInput)
+      return createStringError("missing input model check for target " +
+                               target.name);
     if (target.name.empty() || !names.insert(target.name).second)
       return createStringError("empty or duplicate target name '" +
                                target.name + "'");
@@ -65,7 +75,7 @@ llvm::Expected<Compiler> Compiler::create(Frontend frontend,
       return error;
   }
   return Compiler(std::make_shared<Definition>(
-      Definition{std::move(frontend), std::move(targets)}));
+      Definition{std::move(frontend), std::move(targets), std::move(index)}));
 }
 
 llvm::ArrayRef<Target> Compiler::targets() const { return definition->targets; }
