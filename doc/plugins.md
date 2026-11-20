@@ -73,6 +73,8 @@ Python 插件的 `register(registry)` 接收候选作用域，支持下面的操
 
 ## 接入独立 Bench
 
+Intent 产品插件可以绑定 `intentdsl.bench.worker(compiler, interpreter, scratch)`，返回使用该候选完整安装的本机 Python 入口。测量动作从 Bench 读取所选环境，保留设备与工具链设置，让控制端和 worker 都从这份安装导入前端、runtime 并使用候选 preset。远端候选在实际主机打开作用域，避免将控制机的安装路径当作远端可执行文件。已有仅选择原生编译工具的安装沿用显式 `--compiler`。输出根也可由 `INTENT_BENCH_OUTPUT_ROOT` 指定，短根下的临时路径可用于 cuTile 的 Unix socket。
+
 使用 `measurement` 组合并在产品配置的 `bench` 对象内配置相应工具。结果路径由 Bench 接收，保存在其输出根下。基座不实现采样、设备选择、数值裁判或 baseline。
 
 | 产品配置键 | 所需绑定与实际调用 |
