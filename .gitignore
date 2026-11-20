@@ -1,0 +1,12 @@
+# Local design sessions, drafts, and experiments
+/.work/
+
+# Independent child repositories in the local workspace
+/projects/
+
+# Out-of-source builds
+/build/
+/compile_commands.json
+
+__pycache__/
+*.py[cod]
