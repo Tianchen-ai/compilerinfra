@@ -27,14 +27,14 @@
 产品通过 `find_package(CompilerInfra CONFIG REQUIRED)` 或 `add_subdirectory` 获得以下 CMake 函数。
 
 1. `compilerinfra_add_component(TARGET ENTRY FUNCTION SOURCES ... [LINK_LIBRARIES ...] [REGISTER_PASSES FUNCTION])`。组件实现 `void compilerinfra_components::FUNCTION(compilerinfra::Assembly &)`，声明与依赖留在对应源码旁。可选的原生 pass 登记函数签名为 `void compilerinfra_components::FUNCTION()`，供文本替换等 MLIR 操作使用。
-2. `compilerinfra_assemble(BUNDLE COMPONENTS ...)`。生成静态链接的调用表与头文件 `<BUNDLE/Components.h>`。产品 JIT 调用 `BUNDLE::registerComponents(assembly)`；需要 MLIR 全局 pass 名称时调用 `BUNDLE::registerPasses()`。显式函数引用保留静态库里的组件。打包为产品 SDK 时可将 bundle 的 `PUBLIC_HEADER` 安装到 `include/BUNDLE/`，组件的登记属性随 CMake export 输出。
+2. `compilerinfra_assemble(BUNDLE PRODUCT product.json COMPONENTS ...)` 读取产品插件选择和默认 preset，生成静态强引用与头文件 `<BUNDLE/Components.h>`。也可直接指定 `PLUGINS` 和 `PRESET`。产品 JIT 调用 `BUNDLE::registerComponents(assembly)`，再由 `BUNDLE::link(assembly, importer, inputModel)` 应用与产品驱动相同的内置默认值。需要 MLIR 全局 pass 名称时调用 `BUNDLE::registerPasses()`。打包为产品 SDK 时可将 bundle 的 `PUBLIC_HEADER` 安装到 `include/BUNDLE/`。
 3. 原生 MLIR 输入的工具可以直接使用 `compilerinfra_add_driver(TOOL ASSEMBLY BUNDLE INPUT_MODEL MODEL)`。使用自有语言前端或产品专用命令行选项时，由产品提供 importer，仍使用同一个 bundle、`Assembly::link` 和 `driverMain`。组件需要运行时配置时，可在 JIT 装配组合时用普通 C++ 注册捕获产品配置的 provider。
 
 一次新增通常改组件源码及所属产品的构建清单。已有 N 个目标并不需要 N 份登记。新模型间的 lowering、显式路线选择和真正的硬件专用实现仍有成本。完整的会话和检查点接口见[框架接口](framework.md)。
 
 ## MCP 与命令行
 
-安装一次 `python -m pip install ./agent`，从 MCP 客户端以 stdio 启动 `compilerinfra-agent --driver /absolute/product-tool --workspace /product/checkout --output-dir /chosen/output`。产品专用的固定参数可重复传 `--driver-arg=VALUE`。服务调用指定的真实产品可执行文件。产品重新构建后，下一次工具调用即能看到它的新组件。
+安装一次 `python -m pip install ./agent`，从 MCP 客户端以 stdio 启动 `compilerinfra-agent --driver /absolute/product-tool --workspace /product/checkout --output-dir /chosen/output`。产品专用的固定参数可重复传 `--driver-arg=VALUE`。作用域绑定启动时的定义，`derive` 为新源码或配置分配新的编译器引用。[候选生命周期与完整动作](derivation.md)
 
 | 工具 | 相同的产品驱动能力 |
 | --- | --- |

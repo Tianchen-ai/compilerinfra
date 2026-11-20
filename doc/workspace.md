@@ -9,7 +9,8 @@ compilerinfra/                     基座主仓
   CLAUDE.md                        引用 AGENTS.md
   CMakeLists.txt                   SDK 构建与安装
   cmake/                           find_package 配置
-  agent/                           可安装的 MCP 适配器，调用产品自己的驱动
+  agent/                           可安装的作用域、动作、默认插件、CLI 与 MCP 入口
+  hosts/dsh/                       DSH 的工具与技能宿主插件
   include/compilerinfra/           组件装配、编译会话、IR 对照和产品驱动的公共接口
   lib/                             组件装配、编译会话和可链接驱动
   doc/                             框架设计与使用文档

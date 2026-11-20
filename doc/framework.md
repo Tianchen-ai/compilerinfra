@@ -41,6 +41,9 @@ SDK 暴露两个 CMake 目标。[Compiler.h](../include/compilerinfra/Compiler.h
 | 参数 | 行为 |
 | --- | --- |
 | `--list` | JSON 格式列出目标、阶段以及各优化默认状态，查询时不运行 builder |
+| `--preset FILE` | 从内置产品组合依次派生，可重复，用于编译和查询 |
+| `--explain --target NAME INPUT` | 运行实际编译，返回观察到的 family、策略、决定值、兑现者及产物大小 |
+| `--compare-ir --against-preset FILE --target NAME --through STAGE` | 比较选中定义与从同一产品默认组合派生的另一组设置，输出该边界的两份 IR |
 | `--target NAME --pipeline` | 组装并打印指定目标的实际 pipeline，可与优化开关组合 |
 | `--target NAME [INPUT] -o PATH` | 编译并写出目标产物。输入输出默认使用标准输入输出 |
 | `--after STAGE` / `--through STAGE` | 从阶段 IR 续跑，或在阶段输出停止 |
@@ -52,3 +55,5 @@ SDK 暴露两个 CMake 目标。[Compiler.h](../include/compilerinfra/Compiler.h
 | `--compare-ir --target TARGET --through STAGE` 加优化设置 | 从同一前缀 checkpoint 比较默认和修改后的阶段结果，JSON 输出两份 IR |
 
 驱动会诊断实际执行区间之外的显式优化修改，以免把跳过的优化当作已运行的比较。写普通文件时，在目标路径旁产生临时文件，写入成功后替换最终文件。Bench 通过正常产品接口选择编译模式和输出位置，仍以产品的完整运行结果进行比较。
+
+使用产品 preset 的 JIT 先登记 bundle，再调用生成的 `BUNDLE::link`。自定义装配可以直接调用 `Assembly::link(importer, inputModel, preset)`，在检查目标路线前应用初始的策略绑定和目标选项。链接完成后可以通过 `Compiler::derive` 生成其他定义。[决定与派生](derivation.md)
