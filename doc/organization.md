@@ -1,5 +1,7 @@
 # 产品编译树
 
+受管单元直接声明的链接项必须是 CMake target。通过 `find_package` 导入的 target 可以在传递接口里引用系统库。可解析的 target 边仍逐级检查，runtime 经导入 target 间接链接 Core 或编译单元也会报错。
+
 `product.json` 声明产品名、版本和 SDK 版本、frontend、levels、nodes、exits、runtimes、configuration、build 和 install。可另外声明 extensions 和 bench。使用 `init` 创建这份文件，用 `add-level`、`add-node`、`add-exit`、`add-runtime` 逐步补充。即使还没有安装产品，开发宿主也能调用这些动作。
 
 级的顺序决定父子表示可以如何排列，每一级有一句职责。节点具有唯一名字、表示合同、父节点和非空有序边界。根的父为保留字 `entry`，子节点用 parent="node@boundary" 指定父节点的接出点，单写节点名等价于选择父节点的最后一个边界。节点与出口共用唯一的名字空间。节点和出口的 layout 均给出 at 和 path；每经过一个接出点，编译就转入接收单元。每个出口配一个运行时，节点也可以拥有共享运行时。
