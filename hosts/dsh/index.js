@@ -5,24 +5,21 @@ import {randomUUID} from "node:crypto";
 export const inject = ["tools", "skills"];
 export const name = "compilerinfra";
 export const Config = z.object({
-  driver: z.string().required(),
+  library: z.string(),
   workspace: z.string().required(),
   outputs: z.string().required(),
-  product: z.string(),
-  bundle: z.union(["runtime", "development", "measurement"]).default("development"),
+  profile: z.union(["runtime", "development"]).default("development"),
   namespace: z.string().default("compilerinfra"),
   launcher: z.string().default("compilerinfra-agent"),
-  driverArgs: z.array(String).default([]),
   toolCallTimeoutMs: z.number().default(300000),
 });
 
 export async function apply(ctx, config) {
   const args = [
-    "--driver", config.driver, "--workspace", config.workspace, "--output-dir",
-    config.outputs, "--bundle", config.bundle
+    "--workspace", config.workspace, "--output-dir",
+    config.outputs, "--profile", config.profile
   ];
-  if (config.product) args.push("--product", config.product);
-  for (const arg of config.driverArgs) args.push("--driver-arg=" + arg);
+  if (config.library) args.push("--library", config.library);
   // Use DSH's scoped, disposable native tool bridge for this compiler. Skills
   // and action schemas come from this exact same candidate's plugin catalog.
   await mountCompiler(ctx, {
@@ -45,10 +42,12 @@ export async function apply(ctx, config) {
     if (result.isError) throw new Error(result.error.message);
     return result.value.structuredContent ?? result.value.content;
   }
-  const catalog = await call("inspect_compiler", {});
+  if (!config.library || config.profile === "runtime") return;
+  const response = await call("inspect", {});
+  const catalog = Array.isArray(response) ? JSON.parse(response[0].text) : response;
   for (const id of catalog.skills) {
-    const body = await call("read_skill", {skill: id});
-    const content = typeof body.result === "string" ? body.result : body[0].text;
+    const body = await call("read-skill", {name: id});
+    const content = Array.isArray(body) ? JSON.parse(body[0].text) : body;
     ctx.skills.register({
       name: (config.namespace + "-" + id).toLowerCase().replace(/[^a-z0-9]+/g, "-"),
       description: content.split("\n", 1)[0].replace(/^#+\s*/, ""),

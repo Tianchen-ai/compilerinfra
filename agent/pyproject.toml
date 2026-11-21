@@ -7,7 +7,7 @@ name = "compilerinfra-agent"
 version = "0.2.0"
 description = "Scoped compiler development, source plugins, CLI and MCP for CompilerInfra products"
 requires-python = ">=3.10"
-dependencies = ["mcp>=1.12,<2", "pydantic>=2,<3"]
+dependencies = ["compilerinfra==0.2.0", "mcp>=1.12,<2", "pydantic>=2,<3"]
 
 [project.scripts]
 compilerinfra-agent = "compilerinfra_agent:main"
@@ -18,4 +18,4 @@ py-modules = ["compilerinfra_agent"]
 packages = ["compilerinfra_dev"]
 
 [tool.setuptools.package-data]
-compilerinfra_dev = ["bundles/*.json", "bundles/*/*.json", "bundles/*/*.py", "bundles/*/*.md"]
+compilerinfra_dev = ["skills/*.md"]

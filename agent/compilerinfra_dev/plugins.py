@@ -1,19 +1,16 @@
 """Source plugin declarations, activated once per compiler candidate."""
 
 import inspect
-import json
 import importlib.util
-import shutil
+import hashlib
 import sys
-import types
 from contextlib import ExitStack
 from uuid import uuid4
-from pathlib import Path
 from typing import get_type_hints
 
 from pydantic import ConfigDict, create_model
 
-from .source import relative
+from compilerinfra.tree import relative
 
 
 class Actions:
@@ -61,7 +58,7 @@ class Actions:
             self.resources.close()
         finally:
             for k in list(sys.modules):
-                if k == self.namespace or k.startswith(self.namespace + "."):
+                if k.startswith(self.namespace + "_"):
                     sys.modules.pop(k, None)
             self.services.clear()
             self.actions.clear()
@@ -87,90 +84,35 @@ class Actions:
         return await value if inspect.isawaitable(value) else value
 
 
-def load(paths, compiler):
-    entries = {}
-    for path in paths:
-        meta = json.loads(path.read_text())
-        name = meta["id"]
-        if name in entries:
-            raise ValueError(f"duplicate plugin {name}")
-        entries[name] = (path, meta)
+def installed(compiler):
+    """Resolve every product asset from the embedded installation manifest."""
     registry = Actions(compiler)
-    package = types.ModuleType(registry.namespace)
-    package.__path__ = []
-    sys.modules[registry.namespace] = package
-    pending = set()
-
-    def activate(name):
-        if name in registry.owners:
-            return
-        if name in pending or name not in entries:
-            raise ValueError(f"cyclic or missing plugin dependency: {name}")
-        pending.add(name)
-        descriptor, meta = entries[name]
-        folder = descriptor.parent
-
-        def resource(name):
-            file = (folder / relative(name)).resolve(strict=True)
-            if not file.is_relative_to(folder.resolve()):
-                raise ValueError(f"plugin resource escapes package: {name}")
-            return file
-
-        for dep in meta.get("dependencies", []):
-            activate(dep)
-        for skill, path in meta.get("skills", {}).items():
-            registry.skills[f"{name}/{skill}"] = resource(path)
-        previous = set(registry.actions)
-        provided = set(registry.services)
-        if action := meta.get("actions"):
-            path, function = action.rsplit(":", 1)
-            source = resource(path)
-            package_name = registry.namespace + ".p" + str(len(registry.owners))
-            package = types.ModuleType(package_name)
-            package.__path__ = [str(source.parent)]
-            sys.modules[package_name] = package
-            spec = importlib.util.spec_from_file_location(
-                package_name + "." + source.stem, source
-            )
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            spec.loader.exec_module(module)
-            getattr(module, function)(registry)
-        registry.owners[name] = {
-            "descriptor": str(
-                descriptor.relative_to(compiler.value.source_root)
-                if descriptor.is_relative_to(compiler.value.source_root)
-                else descriptor
-            ),
-            "native": meta.get("native", []),
-            "actions": sorted(set(registry.actions) - previous),
-            "entry": meta.get("actions"),
-            "services": sorted(set(registry.services) - provided),
-            "skills": meta.get("skills", {}),
-            "dependencies": meta.get("dependencies", []),
-        }
-        pending.remove(name)
-
+    description = compiler.describe()
+    root = compiler.library.path.parent / (description["product"]["name"] + ".assets")
     try:
-        for name in entries:
-            activate(name)
+        for entry in description["assets"]:
+            rel = relative(entry["path"])
+            src = (root / rel).resolve(strict=True)
+            if (
+                not src.is_relative_to(root)
+                or hashlib.sha256(src.read_bytes()).hexdigest() != entry["sha256"]
+            ):
+                raise ValueError(
+                    f"{src}: installed asset differs from product manifest"
+                )
+            if src.suffix == ".md":
+                registry.skills[str(rel)] = src
+            elif src.name == "actions.py":
+                ns = registry.namespace + "_" + str(len(registry.owners))
+                spec = importlib.util.spec_from_file_location(
+                    ns, src, submodule_search_locations=[str(src.parent)]
+                )
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[ns] = module
+                spec.loader.exec_module(module)
+                module.register(registry)
+                registry.owners[str(rel)] = str(src)
+        return registry
     except BaseException:
         registry.close()
         raise
-    return registry
-
-
-def snapshot_plugins(workspace, dest, descriptors):
-    for rel in descriptors:
-        src = (workspace / relative(rel)).parent
-        out = (dest / relative(rel)).parent
-
-        def ignore(folder, names):
-            return {
-                n
-                for n in names
-                if n in {".git", ".work", "build", "__pycache__"}
-                or dest.is_relative_to((Path(folder) / n).resolve())
-            }
-
-        shutil.copytree(src, out, ignore=ignore, dirs_exist_ok=True, symlinks=True)

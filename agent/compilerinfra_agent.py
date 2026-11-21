@@ -1,93 +1,98 @@
-"""Host bindings for a scoped product compiler."""
+"""Stdio MCP, a persistent JSON-lines CLI, and one-shot SDK actions."""
 
 import argparse
 import asyncio
-from contextlib import asynccontextmanager
 import json
 from pathlib import Path
 import sys
-
-from mcp.server.fastmcp import FastMCP
-
-from compilerinfra_dev.actions import catalog
+from compilerinfra_dev.actions import Catalog
 from compilerinfra_dev.scope import Scope
-
-
-def server(driver, workspace, outputs, args=(), product=None, bundle="development"):
-    scope = Scope(driver, workspace, outputs, args, product, bundle)
-
-    @asynccontextmanager
-    async def lifetime(_):
-        try:
-            await scope.start()
-            for name, (fn, _) in catalog(scope).actions.items():
-                app.add_tool(fn, name=name)
-            yield scope
-        finally:
-            await scope.close()
-
-    app = FastMCP("CompilerInfra", lifespan=lifetime)
-    return app
 
 
 def options():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--driver", type=Path, required=True)
-    parser.add_argument("--workspace", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--driver-arg", action="append", default=[])
+    parser.add_argument("--library", type=Path)
+    parser.add_argument("--workspace", type=Path, default=Path.cwd())
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
-        "--product", type=Path, help="Product development configuration (JSON)"
+        "--profile", choices=["runtime", "development"], default="development"
     )
-    parser.add_argument(
-        "--bundle",
-        choices=["runtime", "development", "measurement"],
-        default="development",
+    parser.add_argument("action", nargs="?")
+    parser.add_argument("arguments", nargs="?", default="{}")
+    return parser.parse_args()
+
+
+async def host(mcp):
+    opts = options()
+    scope = Scope(
+        opts.workspace,
+        opts.output_dir or opts.workspace / ".work" / "development",
+        opts.library,
+        opts.profile,
     )
-    c = parser.parse_args()
-    product = json.loads(c.product.read_text()) if c.product else {}
-    if c.product and c.product.resolve().is_relative_to(c.workspace.resolve()):
-        product["_descriptor"] = str(
-            c.product.resolve().relative_to(c.workspace.resolve())
-        )
-    return (c.driver, c.workspace, c.output_dir, c.driver_arg, product, c.bundle)
+    catalog = Catalog(scope)
+    lock = asyncio.Lock()
+
+    async def invoke(name, args):
+        async with lock:
+            return await catalog.invoke(name, args)
+
+    try:
+        if opts.action:
+            value = await invoke(opts.action, json.loads(opts.arguments))
+            print(
+                value
+                if isinstance(value, str)
+                else json.dumps(value, ensure_ascii=False)
+            )
+        elif mcp:
+            from mcp.server import Server
+            from mcp.server.stdio import stdio_server
+            from mcp.types import TextContent, Tool
+
+            server = Server("compilerinfra")
+
+            @server.list_tools()
+            async def tools():
+                return [
+                    Tool(
+                        name=id,
+                        description=s["description"] or id,
+                        inputSchema=s["parameters"],
+                    )
+                    for id, s in catalog.schemas().items()
+                ]
+
+            @server.call_tool()
+            async def call(name, arguments):
+                value = await invoke(name, arguments)
+                return [
+                    TextContent(type="text", text=json.dumps(value, ensure_ascii=False))
+                ]
+
+            async with stdio_server() as (reader, writer):
+                await server.run(reader, writer, server.create_initialization_options())
+        else:
+            for line in sys.stdin:
+                try:
+                    req = json.loads(line)
+                    result = {
+                        "result": await invoke(req["action"], req.get("arguments", {}))
+                    }
+                except Exception as exc:
+                    result = {"error": str(exc)}
+                print(json.dumps(result, ensure_ascii=False), flush=True)
+    finally:
+        scope.close()
 
 
 def main():
-    server(*options()).run(transport="stdio")
+    asyncio.run(host(True))
 
 
 def cli():
-    """Persistent JSON-lines CLI. Each request names one of the MCP actions."""
-
-    if sys.argv[1:2] == ["check"]:
-        from compilerinfra_dev.check import main as check
-        return check(sys.argv[2:])
-
-    async def run():
-        scope = Scope(*options())
-        try:
-            await scope.start()
-            actions = catalog(scope)
-            for line in sys.stdin:
-                try:
-                    request = json.loads(line)
-                    result = (
-                        actions.describe()
-                        if request["action"] == "actions"
-                        else await actions.invoke(
-                            request["action"], request.get("arguments", {})
-                        )
-                    )
-                    response = {"result": result}
-                except Exception as err:
-                    response = {"error": str(err)}
-                print(json.dumps(response), flush=True)
-        finally:
-            await scope.close()
-
-    asyncio.run(run())
+    asyncio.run(host(False))
 
 
 if __name__ == "__main__":
-    main()
+    cli()

@@ -1,299 +1,175 @@
-"""Public operations shared by MCP, the DSH scope and the headless CLI."""
+"""Canonical action catalog used by every host."""
 
-from typing import Any, Literal, Optional, get_type_hints
-import inspect
-from functools import wraps
-
+import base64
+import difflib
+from pathlib import Path
+from typing import Any
+from . import scaffold
 from .plugins import Actions
 
 
-def edits(enable, disable, replace):
-    options = []
-    for name in enable or ():
-        options += ["--enable", name]
-    for name in disable or ():
-        options += ["--disable", name]
-    for name, pipeline in (replace or {}).items():
-        options += ["--replace", f"{name}={pipeline}"]
-    return options
+class Catalog:
+    def __init__(self, scope):
+        self.scope = scope
+        self.builtins = Actions(None)
 
+        def action(name, fn):
+            self.builtins.action(fn)
+            self.builtins.actions[name] = self.builtins.actions.pop(fn.__name__)
 
-def excerpt(baseline, candidate, shared, through):
-    result = {
-        "shared_through": shared,
-        "through": through,
-        "changed": baseline != candidate,
-    }
-    if result["changed"]:
-        left, right = baseline.splitlines(keepends=True), candidate.splitlines(
-            keepends=True
-        )
-        line = next(
-            (i for i, (a, b) in enumerate(zip(left, right)) if a != b),
-            min(len(left), len(right)),
-        )
-        result.update(
-            first_line=line + 1,
-            baseline_excerpt="".join(left[line : line + 6])[:4096],
-            candidate_excerpt="".join(right[line : line + 6])[:4096],
-        )
-    return result
+        def layout(compiler: str = "base"):
+            """Describe the linked tree, native owners, source locations and actual configuration."""
+            return scope.values[scope.key(compiler)].description
 
+        def inspect_compiler(compiler: str = "base"):
+            """Inspect the installed compiler and its scoped development assets."""
+            return dict(layout(compiler), **self.plugins(compiler))
 
-def catalog(scope):
-    actions = Actions(None)
-
-    @actions.action
-    async def components(
-        kind: Optional[str] = None,
-        contains: str = "",
-        file: Optional[str] = None,
-        compiler: str = "base",
-    ) -> list[dict[str, Any]]:
-        """Find registered components and their source locations."""
-        async with scope.use(compiler) as c:
-            items = await c.query("--components")
-        return [
-            i
-            for i in items
-            if contains in i["id"]
-            and (kind is None or i["id"].partition(":")[0] == kind)
-            and (file is None or i["source"]["file"] == file)
-        ]
-
-    @actions.action
-    async def layout(compiler: str = "base") -> dict[str, Any]:
-        """Locate linked units and their permitted dependency directions."""
-        async with scope.use(compiler) as bound:
-            return await bound.query("--layout")
-
-    @actions.action
-    async def plan(target: str, compiler: str = "base") -> dict[str, Any]:
-        """Inspect the actual route, strategies, realizers and optimization slots."""
-        async with scope.use(compiler) as c:
-            return await c.query("--plan", target)
-
-    @actions.action
-    async def impact(component: str, compiler: str = "base") -> dict[str, Any]:
-        """Find eligible targets for a kind:name and distinguish off-route targets."""
-        async with scope.use(compiler) as c:
-            return await c.query("--impact", component)
-
-    @actions.action
-    async def inspect_compiler(compiler: str = "base") -> dict[str, Any]:
-        """Inspect this definition, its parent, plugin actions, services and skills."""
-        async with scope.use(compiler) as c:
-            return {
-                "compiler": compiler,
-                "parent": c.value.parent,
-                "preset": c.value.preset,
-                "targets": await c.query("--list"),
-                **scope.plugins[compiler].describe(),
-            }
-
-    @actions.action
-    async def compile_program(
-        target: str,
-        source: str,
-        output: str,
-        after: Optional[str] = None,
-        through: Optional[str] = None,
-        encoding: Literal["asm", "bytecode"] = "asm",
-        enable: Optional[list[str]] = None,
-        disable: Optional[list[str]] = None,
-        replace: Optional[dict[str, str]] = None,
-        compiler: str = "base",
-    ) -> dict[str, Any]:
-        """Compile through the candidate's normal entry, optionally resume/stop at a verified boundary."""
-        async with scope.use(compiler) as c:
-            path, dest = c.source(source), c.output(output)
-            if path == dest:
-                raise ValueError("input and output must be distinct")
-            args = ["--target", target, "-o", str(dest)]
-            if after:
-                args += ["--after", after]
-            if through:
-                args += ["--through", through, "--format", encoding]
-            _, diagnostic = await c.run(
-                *args, *edits(enable, disable, replace), "--", str(path)
-            )
-            return {
-                "compiler": compiler,
-                "target": target,
-                "through": through,
-                "path": str(dest),
-                "bytes": dest.stat().st_size,
-                "diagnostics": diagnostic,
-            }
-
-    @actions.action
-    async def read_skill(skill: str, compiler: str = "base") -> str:
-        """Load one skill from the active compiler's plugin scope."""
-        async with scope.use(compiler):
-            return scope.plugins[compiler].skills[skill].read_text()
-
-    @actions.action
-    async def call_action(
-        name: str, arguments: dict[str, Any], compiler: str = "base"
-    ) -> Any:
-        """Execute a typed plugin action listed by inspect_compiler on the chosen compiler."""
-        async with scope.use(compiler):
-            return await scope.plugins[compiler].invoke(name, arguments)
-
-    if scope.bundle == "runtime":
-        return bind_plugins(actions, scope)
-
-    @actions.action
-    async def derive(
-        parent: str = "base",
-        preset: Optional[dict[str, Any]] = None,
-        source_patch: str = "",
-    ) -> dict[str, Any]:
-        """Derive a new compiler from a product preset and/or a Git source patch."""
-        return await scope.derive(parent, preset or {}, source_patch)
-
-    @actions.action
-    async def adopt(compiler: str) -> dict[str, Any]:
-        """Apply the candidate's cumulative changes to the product working tree without staging or committing."""
-        return await scope.adopt(compiler)
-
-    @actions.action
-    async def discard(compiler: str) -> dict[str, Any]:
-        """Release a candidate and its scoped registrations; descendants retain their installation."""
-        return await scope.discard(compiler)
-
-    @actions.action
-    async def pipeline(
-        target: str,
-        enable: Optional[list[str]] = None,
-        disable: Optional[list[str]] = None,
-        replace: Optional[dict[str, str]] = None,
-        compiler: str = "base",
-    ) -> str:
-        """Print the assembled native MLIR pass pipelines without executing an input."""
-        async with scope.use(compiler) as c:
-            text, _ = await c.run(
-                "--target", target, "--pipeline", *edits(enable, disable, replace)
-            )
-            return text.decode()
-
-    @actions.action
-    async def explain(
-        target: str, source: str, compiler: str = "base", through: Optional[str] = None
-    ) -> dict[str, Any]:
-        """Compile and report observed decision matches, preserved values and realizations."""
-        async with scope.use(compiler) as c:
-            return await c.query(
-                "--explain",
-                "--target",
-                target,
-                *(["--through", through] if through else []),
-                "--",
-                str(c.source(source)),
-            )
-
-    @actions.action
-    async def compare_ir(
-        target: str,
-        source: str,
-        through: str,
-        after: Optional[str] = None,
-        enable: Optional[list[str]] = None,
-        disable: Optional[list[str]] = None,
-        replace: Optional[dict[str, str]] = None,
-        compiler: str = "base",
-    ) -> dict[str, Any]:
-        """Compare this compiler's ordinary route against slot edits from a shared checkpoint."""
-        async with scope.use(compiler) as c:
-            pair = await c.query(
-                "--compare-ir",
-                "--target",
-                target,
-                "--through",
+        def compile_ir(
+            input: str,
+            exit: str,
+            compiler: str = "base",
+            through: str | None = None,
+            after: str | None = None,
+            output: str | None = None,
+            author_input: bool = False,
+        ):
+            """Compile root IR or resume bytecode at a named boundary."""
+            artifact = scope.compile(
+                compiler,
+                Path(input).read_bytes(),
+                exit,
                 through,
-                *(["--after", after] if after else []),
-                *edits(enable, disable, replace),
-                "--",
-                str(c.source(source)),
+                after,
+                author_input=author_input,
             )
-            return excerpt(
-                pair["baseline"], pair["candidate"], pair["shared_through"], through
+            if output:
+                Path(output).write_bytes(artifact)
+                return {"output": output, "bytes": len(artifact)}
+            return {"base64": base64.b64encode(artifact).decode()}
+
+        action("layout", layout)
+        action("inspect", inspect_compiler)
+        action("compile", compile_ir)
+        if scope.profile == "runtime":
+            return
+
+        def derive(
+            configuration: dict | None = None,
+            patch: str = "",
+            compiler: str = "base",
+            extension_patches: dict[str, str] | None = None,
+        ):
+            """Derive a compiler configuration or build an independent patched source candidate."""
+            return scope.derive(compiler, configuration or {}, patch, extension_patches)
+
+        def explain(
+            input: str, exit: str, compiler: str = "base", through: str | None = None
+        ):
+            """Collect the strategy and realization events produced by this input."""
+            scope.compile(
+                compiler, Path(input).read_bytes(), exit, through, observe=True
             )
+            return scope.values[scope.key(compiler)].events
 
-    @actions.action
-    async def compare(
-        parent: str, candidate: str, target: str, source: str, through: str
-    ) -> dict[str, Any]:
-        """Compare two compiler definitions; independent native builds both receive the original input."""
-        async with scope.use(parent) as a, scope.use(candidate) as b:
-            path = a.source(source)
-            args = ["--target", target, "--through", through]
-            if a.value.driver == b.value.driver:
-                empty = scope.private / "empty-preset.json"
-                if not empty.exists():
-                    empty.write_text("{}")
-                pair = await a.query(
-                    "--compare-ir",
-                    "--against-preset",
-                    str(b.value.preset_file or empty),
-                    *args,
-                    "--",
-                    str(path),
-                )
-                return excerpt(
-                    pair["baseline"],
-                    pair["candidate"],
-                    pair["shared_through"] or None,
-                    through,
-                )
+        def compare(
+            input: str, exit: str, through: str, compiler: str, baseline: str = "base"
+        ):
+            """Compare two candidates at the same representation boundary."""
+            node = through.partition("@")[0]
+            if (
+                layout(compiler)["nodes"][node]["contract"]
+                != layout(baseline)["nodes"][node]["contract"]
+            ):
+                raise ValueError(f"different representation contracts at {through}")
+            data = Path(input).read_bytes()
+            a, b = [
+                scope.compile(id, data, exit, through)
+                .decode()
+                .splitlines(keepends=True)
+                for id in (baseline, compiler)
+            ]
+            return {
+                "changed": a != b,
+                "diff": "".join(difflib.unified_diff(a, b, baseline, compiler)),
+            }
 
-            async def boundary(compiler):
-                route = await compiler.query("--plan", target)
-                if through == "input":
-                    return route.get("input_model")
-                for stage in route["stages"]:
-                    if stage["boundary"] == through:
-                        return (
-                            stage.get("component", {}).get("declaration", {}).get("to")
-                        )
-                raise ValueError(f"{target} has no boundary {through}")
+        def impact(component: str, compiler: str = "base"):
+            """Inspect reachability, configuration selection and hits in the last observed input."""
+            return scope.impact(compiler, component)
 
-            if await boundary(a) != await boundary(b):
-                raise ValueError(f"different output models at {target}/{through}")
-            data = path.read_bytes()
-            x, _ = await a.run(*args, "--format", "asm", "-", data=data)
-            y, _ = await b.run(*args, "--format", "asm", "-", data=data)
-            return excerpt(x.decode(), y.decode(), None, through)
+        def read_skill(name: str, compiler: str = "base"):
+            """Read a framework or installed product skill."""
+            if name == "compiler-development":
+                return (
+                    Path(__file__).parent / "skills" / "compiler-development.md"
+                ).read_text()
+            key = scope.key(compiler)
+            return scope.values[key].worker.call("skill", key, name=name)
 
-    return bind_plugins(actions, scope)
+        async def measure(workload: Any, output_dir: str, compiler: str = "base"):
+            """Hand this installed candidate and the opaque workload to the product's Bench."""
+            return await scope.measure(compiler, workload, output_dir)
 
+        def adopt(compiler: str):
+            """Apply the candidate to the product sources, rebuild and reinstall the baseline."""
+            return scope.adopt(compiler)
 
-def bind_plugins(actions, scope):
-    def project(name, fn):
-        @wraps(fn)
-        async def dispatch(*, compiler="base", **kwargs):
-            async with scope.use(compiler):
-                return await scope.plugins[compiler].invoke(name, kwargs)
+        def discard(compiler: str):
+            """Release one candidate handle and any build it alone owns."""
+            return scope.discard(compiler)
 
-        sig = inspect.signature(fn)
-        if "compiler" in sig.parameters or name in actions.actions:
-            raise ValueError(f"plugin action collides with a framework binding: {name}")
-        hints = get_type_hints(fn)
-        dispatch.__signature__ = sig.replace(
-            parameters=[
-                *(p.replace(annotation=hints[p.name]) for p in sig.parameters.values()),
-                inspect.Parameter(
-                    "compiler",
-                    inspect.Parameter.KEYWORD_ONLY,
-                    default="base",
-                    annotation=str,
-                ),
-            ],
-            return_annotation=hints.get("return", sig.return_annotation),
+        for fn in [
+            derive,
+            explain,
+            compare,
+            impact,
+            read_skill,
+            measure,
+            adopt,
+            discard,
+            scaffold.init,
+            scaffold.add_level,
+            scaffold.add_node,
+            scaffold.add_exit,
+            scaffold.add_runtime,
+            scaffold.host_config,
+        ]:
+            action(fn.__name__.replace("_", "-"), fn)
+
+    def plugins(self, id):
+        key = self.scope.key(id)
+        catalog = self.scope.values[key].worker.call("catalog", key)
+        if self.scope.profile == "development":
+            catalog["skills"].append("compiler-development")
+        return catalog
+
+    def schemas(self):
+        result = self.builtins.describe()["actions"]
+        for key in self.scope.values:
+            for name, entry in self.plugins(key)["actions"].items():
+                if name in self.builtins.actions:
+                    raise ValueError(
+                        f"installed action collides with SDK action {name}"
+                    )
+                schema = entry["parameters"]
+                if "compiler" in schema["properties"]:
+                    raise ValueError(
+                        f"{name}: compiler is reserved for candidate selection"
+                    )
+                schema["properties"]["compiler"] = {"type": "string", "default": "base"}
+                if name in result and result[name] != entry:
+                    raise ValueError(f"candidate action schemas differ for {name}")
+                result[name] = entry
+        return result
+
+    async def invoke(self, name, args):
+        if name == "actions":
+            return self.schemas()
+        if name in self.builtins.actions:
+            return await self.builtins.invoke(name, args)
+        args = dict(args)
+        key = self.scope.key(args.pop("compiler", "base"))
+        return self.scope.values[key].worker.call(
+            "action", key, name=name, arguments=args
         )
-        dispatch.__annotations__ = {**hints, "compiler": str}
-        actions.action(dispatch)
-
-    for name, (fn, _) in scope.plugins["base"].actions.items():
-        project(name, fn)
-    return actions

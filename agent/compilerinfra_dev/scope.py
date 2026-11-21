@@ -1,294 +1,297 @@
-import asyncio
-import copy
-from contextlib import ExitStack, asynccontextmanager
+"""Installed compiler candidates, each retaining its own build and effective configuration."""
+
 from dataclasses import dataclass
-import json
+from importlib import import_module
+import inspect
 from pathlib import Path
 import shutil
-import shlex
+import subprocess
 from tempfile import TemporaryDirectory
 from uuid import uuid4
+from compilerinfra.tree import provenance, relative, tree
+from .source import Snapshot, adoption_lock, applied, build, publish
+from .worker import Worker
 
-from .plugins import load
-from .process import execute
-from .source import Sources, merge, relative
 
-
-@dataclass(frozen=True)
+@dataclass
 class Candidate:
-    name: str
+    worker: Worker
+    snapshot: Snapshot | None
+    description: dict
     parent: str | None
-    tree: str | None
-    install: Path | None
-    driver: Path
-    preset: dict
-    preset_file: Path | None
-    source_root: Path
+    configuration: dict
+    events: list | None = None
+    measured_exit: str | None = None
 
 
-class BoundCompiler:
-    def __init__(self, scope, value):
-        self.scope, self.value = scope, value
+def overlay(base, delta):
+    import copy
 
-    @property
-    def product(self):
-        return self.scope.configs[self.value.name]
-
-    def executable(self, binary, args=(), wrapper_name="product-driver"):
-        """Bind preset and product arguments for callers which launch the tool directly."""
-        options = list(args)
-        if self.value.preset_file:
-            options.extend(("--preset", str(self.value.preset_file)))
-        if not options:
-            return binary
-        folder = (
-            self.scope.private
-            if self.value.name == "base"
-            else self.scope.candidates / self.value.name
-        )
-        path = folder / wrapper_name
-        if not path.exists():
-            path.write_text(
-                "#!/bin/sh\nexec " + shlex.join([str(binary), *options]) + ' "$@"\n'
-            )
-            path.chmod(0o700)
-        return path
-
-    async def run(self, *args, data=None):
-        if self.value.preset_file:
-            args = ("--preset", str(self.value.preset_file), *args)
-        cwd = self.value.source_root if self.value.tree else self.scope.workspace
-        return await execute(
-            [self.value.driver, *self.scope.args, *args], cwd, data=data
-        )
-
-    async def query(self, *args):
-        out, _ = await self.run(*args)
-        return json.loads(out)
-
-    def source(self, path):
-        source = (self.scope.workspace / path).resolve(strict=True)
-        if not (
-            source.is_relative_to(self.scope.workspace)
-            or source.is_relative_to(self.scope.outputs)
-        ):
-            raise ValueError("source lies outside workspace and outputs")
-        return source
-
-    def output(self, path):
-        dest = (self.scope.outputs / relative(path)).resolve()
-        if not dest.is_relative_to(self.scope.outputs) or dest.is_relative_to(
-            self.scope.private
-        ):
-            raise ValueError("output leaves product output directory")
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        return dest
+    result = copy.deepcopy(base)
+    for section, scopes in delta.items():
+        for scope, settings in scopes.items():
+            current = result.setdefault(section, {}).setdefault(scope, {})
+            for group, items in settings.items():
+                current.setdefault(group, {}).update(items)
+    return result
 
 
 class Scope:
-    def __init__(
-        self, driver, workspace, outputs, args=(), product=None, bundle="development"
-    ):
-        self.workspace = Path(workspace).resolve(strict=True)
-        self.outputs = Path(outputs).resolve()
-        self.outputs.mkdir(parents=True, exist_ok=True)
-        self.temp = TemporaryDirectory(prefix=".compiler-", dir=self.outputs)
-        self.private = Path(self.temp.name)
-        self.candidates = self.private / "candidates"
-        self.candidates.mkdir()
-        self.args = tuple(args)
-        self.bundle = bundle
-        self.product = product or {}
-        self.sources = Sources(
-            self.workspace, self.private, self.product.get("build", {})
-        )
-        self.driver = Path(driver).resolve(strict=True)
-        self.values = {}
-        self.parents = {}
-        self.adoptions = {}
-        self.plugins = {}
-        self.configs = {}
-        self.leases = {}
-        self.lock = asyncio.Lock()
-        self.idle = asyncio.Event()
-        self.idle.set()
-        self.closing = False
-
-    async def start(self):
-        source = self.private / "base-source"
-        if self.sources.config:
-            tree = await self.sources.start()
-            await self.sources.export(tree, source)
-        else:
-            tree = None
-            source.mkdir()
-            from .plugins import snapshot_plugins
-
-            snapshot_plugins(self.workspace, source, self.product.get("plugins", []))
-        base_driver = self.driver
-        install = None
-        if base_install := self.product.get("base_install"):
-            prefix = Path(base_install).resolve(strict=True)
-            rel = self.driver.relative_to(prefix)
-            if self.private.is_relative_to(prefix):
-                raise ValueError("scope output must be outside base_install")
-            install = self.private / "base-install"
-            shutil.copytree(prefix, install, symlinks=True)
-            base_driver = install / rel
-        elif tree and self.sources.config.get("target"):
-            install = self.private / "base-install"
-            base_driver = await self.sources.compile(
-                tree, install, self.product["build"]
-            )
-        else:
-            # Preserve $ORIGIN and $ORIGIN/../lib lookup for packaged tools.
-            # External SDKs remain dependencies of the installation.
-            mirror = self.private / "base-tool"
-            folder = mirror / self.driver.parent.name
-            folder.mkdir(parents=True)
-            for path in self.driver.parent.parent.iterdir():
-                if path != self.driver.parent:
-                    (mirror / path.name).symlink_to(path)
-            for path in self.driver.parent.iterdir():
-                if path != self.driver:
-                    (folder / path.name).symlink_to(path)
-            base_driver = folder / self.driver.name
-            shutil.copy2(self.driver, base_driver)
-        base = Candidate("base", None, tree, install, base_driver, {}, None, source)
-        self.activate(base, source)
-        self.values["base"] = base
-
-    def product_at(self, src):
-        if self.sources.config and "_descriptor" in self.product:
-            path = src / relative(self.product["_descriptor"])
-            return json.loads(path.read_text())
-        return self.product
-
-    def activate(self, candidate, src):
-        builtin = Path(__file__).parent / "bundles"
-        packages = json.loads((builtin / "presets.json").read_text())[self.bundle]
-        paths = [builtin / package / "plugin.json" for package in packages]
-        product = self.product_at(src)
-        paths.extend(src / relative(p) for p in product.get("plugins", []))
-        self.configs[candidate.name] = product
-        self.plugins[candidate.name] = load(paths, BoundCompiler(self, candidate))
-
-    @asynccontextmanager
-    async def use(self, name):
-        if self.closing:
-            raise ValueError("compiler scope is closing")
-        value = self.values[name]
-        self.idle.clear()
-        self.leases[name] = self.leases.get(name, 0) + 1
-        try:
-            yield BoundCompiler(self, value)
-        finally:
-            self.leases[name] -= 1
-            if not any(self.leases.values()):
-                self.idle.set()
-
-    async def derive(self, parent, preset, source_patch):
-        async with self.lock:
-            if self.closing:
-                raise ValueError("compiler scope is closing")
-            base = self.values[parent]
-            if not preset and not source_patch:
-                raise ValueError("derive requires a preset or source patch")
-            name = uuid4().hex
-            folder = self.candidates / name
-            folder.mkdir()
-            try:
-                install, tree, driver = base.install, base.tree, base.driver
-                src = base.source_root
-                if source_patch:
-                    if not self.sources.config.get("target"):
-                        raise ValueError("product has not configured a source build")
-                    initial = await self.sources.start()
-                    tree = await self.sources.change(tree or initial, source_patch)
-                    install = folder / "install"
-                    src = folder / "source"
-                    await self.sources.export(tree, src)
-                    driver = await self.sources.compile(
-                        tree, install, self.product_at(src)["build"]
-                    )
-                merged = merge(copy.deepcopy(base.preset), preset)
-                path = None
-                if merged:
-                    path = folder / "preset.json"
-                    path.write_text(json.dumps(merged))
-                candidate = Candidate(
-                    name, parent, tree, install, driver, merged, path, src
+    def __init__(self, workspace, output_dir, library, profile):
+        self.workspace = Path(workspace).resolve()
+        self.outputs = Path(output_dir).resolve()
+        if (
+            library
+            and profile == "development"
+            and self.outputs.is_relative_to(self.workspace)
+        ):
+            rel = self.outputs.relative_to(self.workspace) / ".compiler-scope"
+            if subprocess.run(
+                ["git", "-C", self.workspace, "check-ignore", "-q", str(rel)]
+            ).returncode:
+                raise ValueError(
+                    f"place --output-dir outside product sources or in a Git-ignored directory: {self.outputs}"
                 )
-                bound = BoundCompiler(self, candidate)
-                await bound.query("--components")
-                entry = bound.executable(driver, self.args)
-                self.activate(candidate, src)
-                self.values[name] = candidate
-                self.parents[name] = parent
-                return {
-                    "compiler": name,
-                    "parent": parent,
-                    "driver": str(entry),
-                    "cwd": str(src if tree else self.workspace),
-                    "preset_file": str(path) if path else None,
-                    "installation": str(install) if install else None,
-                    "source_changed": bool(source_patch),
-                }
+        self.outputs.mkdir(parents=True, exist_ok=True)
+        self.private = TemporaryDirectory(dir=self.outputs, prefix=".compiler-")
+        self.root = Path(self.private.name)
+        self.profile = profile
+        self.library = Path(library).resolve(strict=True) if library else None
+        self.values = {}
+        self.owned = {}
+        self.base_key = None
+        if self.library:
+            try:
+                self.load_base()
             except BaseException:
-                installed = self.plugins.pop(name, None)
-                self.configs.pop(name, None)
-                if installed:
-                    installed.close()
-                shutil.rmtree(folder)
+                self.close()
                 raise
 
-    async def adopt(self, name):
-        async with self.lock:
-            if name == "base":
-                raise ValueError("select a derived compiler")
-            value = self.values[name]
-            initial = await self.sources.start()
-            ancestor = name
-            while ancestor not in self.adoptions and ancestor != "base":
-                ancestor = self.parents[ancestor]
-            tree, changed = await self.sources.adopt(
-                value.tree or initial,
-                value.preset,
-                self.adoptions.get(ancestor, initial),
-                self.configs[name].get("build", {}),
+    def load_base(self):
+        key = uuid4().hex
+        # Pin the library inode and its installed assets for the lifetime of
+        # this build. A later adoption can replace the public installation.
+        pinned = self.root / key / "baseline" / self.library.parent.name
+        pinned.mkdir(parents=True)
+        for file in self.library.parent.iterdir():
+            if file == self.library:
+                shutil.copy2(file, pinned / file.name)
+            elif (
+                file.name
+                == self.library.name.removeprefix("lib").split(".so")[0] + ".assets"
+            ):
+                shutil.copytree(file, pinned / file.name)
+            else:
+                (pinned / file.name).symlink_to(file)
+        worker = Worker(pinned / self.library.name, self.profile)
+        try:
+            desc = worker.call("open", key, configuration={})
+            snap = None
+            if self.profile == "development":
+                model = tree(self.workspace)
+                self.check_fingerprint(desc, model)
+                roots = {k: Path(p) for k, p in model["packages"].items()}
+                snap = Snapshot(self.root / key, roots)
+                self.check_fingerprint(desc, model)
+                worker.call("activate", key)
+            self.values[key] = Candidate(worker, snap, desc, None, {})
+            self.owned[worker] = self.root / key
+            self.base_key = key
+        except BaseException:
+            worker.close()
+            raise
+
+    @staticmethod
+    def check_fingerprint(desc, model):
+        actual = provenance(model)
+        if actual != desc["fingerprint"]:
+            raise ValueError(
+                f"workspace differs from installation: installed={desc['fingerprint']} workspace={actual}"
             )
-            self.adoptions[name] = tree
+
+    def key(self, id):
+        k = self.base_key if id == "base" else id
+        if k not in self.values:
+            raise ValueError(
+                f"unknown compiler {id}; open an installed product with --library"
+            )
+        return k
+
+    def derive(self, parent, configuration, patch, extensions):
+        base_key = self.key(parent)
+        base = self.values[base_key]
+        key = uuid4().hex
+        folder = self.root / key
+        changes = overlay(base.configuration, configuration)
+        worker, snap = base.worker, base.snapshot
+        patches = dict(extensions or {})
+        if patch:
+            patches["."] = patch
+        try:
+            if patches:
+                snap = snap.derive(folder, patches)
+                lib = build(snap.roots, folder / "build", folder / "install")
+                worker = Worker(lib, self.profile)
+                desc = worker.call("open", key, configuration=changes)
+                self.owned[worker] = folder
+            else:
+                desc = worker.call(
+                    "derive", key, parent=base_key, configuration=configuration
+                )
+            worker.call("activate", key)
+            self.values[key] = Candidate(worker, snap, desc, base_key, changes)
+        except BaseException:
+            if worker is not base.worker:
+                worker.close()
+            elif not patches:
+                # Derivation may have succeeded before an installed action failed to load.
+                try:
+                    worker.call("discard", key)
+                except ValueError:
+                    pass
+            if folder.exists():
+                shutil.rmtree(folder)
+            raise
+        return key
+
+    def discard(self, id):
+        key = self.key(id)
+        if key == self.base_key:
+            raise ValueError("the active baseline is in use")
+        c = self.values[key]
+        c.worker.call("discard", key)
+        del self.values[key]
+        if not any(x.worker is c.worker for x in self.values.values()):
+            c.worker.close()
+            folder = self.owned.pop(c.worker)
+            if folder.exists():
+                shutil.rmtree(folder)
+        return key
+
+    def adopt(self, id):
+        key = self.key(id)
+        c = self.values[key]
+        folder = self.root / uuid4().hex
+        with adoption_lock(self.workspace):
+            model = tree(self.workspace)
+            self.check_fingerprint(self.values[self.base_key].description, model)
+            if c.snapshot.initial != self.values[self.base_key].snapshot.initial:
+                raise ValueError(
+                    "candidate source diverged from the installed baseline"
+                )
+            roots = {k: Path(p) for k, p in model["packages"].items()}
+            # Write configuration in a disposable snapshot to keep existing candidates immutable.
+            snap = c.snapshot.derive(folder, {})
+            patches = snap.delta(c.description["configuration"])
+            with applied(roots, patches):
+                stage = folder / "install"
+                lib = build(roots, folder / "build", stage)
+                rel = relative(c.description["product"]["install"]["library"])
+                prefix = self.library.parents[len(rel.parts) - 1]
+                if (prefix / rel) != self.library:
+                    raise ValueError(
+                        "installed library does not match product install entry"
+                    )
+                with publish(stage, prefix, folder / "backup"):
+                    if lib.relative_to(stage) != rel:
+                        raise ValueError(
+                            "install did not produce expected compiler library"
+                        )
+                    previous = self.base_key
+                    self.load_base()
             return {
-                "compiler": name,
-                "workspace": str(self.workspace),
-                "applied": changed,
+                "base": self.base_key,
+                "previous": previous,
+                "library": str(self.library),
             }
 
-    async def discard(self, name):
-        async with self.lock:
-            if name == "base" or self.leases.get(name):
-                raise ValueError("cannot discard base or an active invocation")
-            del self.values[name]
-            self.plugins.pop(name).close()
-            del self.configs[name]
-            self.leases.pop(name, None)
-            # Config-only descendants can retain a discarded ancestor's installation.
-            live = {v.install.parent for v in self.values.values() if v.install}
-            live.update(v.source_root.parent for v in self.values.values())
-            for folder in self.candidates.iterdir():
-                if folder.name not in self.values and folder not in live:
-                    shutil.rmtree(folder)
-            return {"discarded": name}
+    def compile(
+        self,
+        id,
+        source,
+        exit,
+        through=None,
+        after=None,
+        observe=False,
+        author_input=False,
+    ):
+        key = self.key(id)
+        c = self.values[key]
+        c.events, c.measured_exit = None, None
+        result = c.worker.call(
+            "compile",
+            key,
+            source=source,
+            exit=exit,
+            through=through,
+            after=after,
+            text=bool(through),
+            explain=observe,
+            author_input=author_input,
+        )
+        if observe:
+            artifact, c.events = result
+            c.measured_exit = exit
+            return artifact
+        return result
 
-    async def close(self):
-        self.closing = True
-        await self.idle.wait()
-        async with self.lock:
-            try:
-                with ExitStack() as cleanup:
-                    for plugin in self.plugins.values():
-                        cleanup.callback(plugin.close)
-            finally:
-                self.plugins.clear()
-                self.values.clear()
-                self.temp.cleanup()
+    def impact(self, id, component):
+        c = self.values[self.key(id)]
+        item = c.description["components"][component]
+        at = item["at"]
+        reachable = [
+            k for k, v in c.description["exits"].items() if at in v["boundaries"]
+        ]
+        owner = c.description["units"][item["unit"]]["owner"]
+        if owner.startswith("exits/"):
+            reachable = [e for e in reachable if owner == "exits/" + e]
+        elif owner.startswith("levels/"):
+            node = owner.split("/")[-1] + "@"
+            reachable = [
+                e
+                for e in reachable
+                if any(
+                    b.startswith(node) for b in c.description["exits"][e]["boundaries"]
+                )
+            ]
+        events = c.events
+        return dict(
+            reachable=reachable,
+            selected=[
+                e for e in reachable if component in c.description["selected"][e]
+            ],
+            observed_exit=c.measured_exit,
+            hits=None
+            if events is None
+            else [
+                v
+                for v in events
+                if v["action"] != "no_match"
+                and component in (v["implementation"], v["family"])
+            ],
+        )
+
+    async def measure(self, id, workload, output_dir):
+        key = self.key(id)
+        c = self.values[key]
+        p = c.description["product"]
+        adapter = p.get("bench")
+        if not adapter:
+            raise ValueError("product has no external Bench adapter")
+        request = dict(
+            candidate=key,
+            library=str(c.worker.library),
+            configuration=c.description["configuration"],
+            python=p["install"]["python"],
+            workload=workload,
+            output_dir=str(Path(output_dir).resolve()),
+        )
+        result = import_module(adapter["package"]).measure(request)
+        return await result if inspect.isawaitable(result) else result
+
+    def close(self):
+        for worker in self.owned:
+            worker.close()
+        self.values.clear()
+        self.owned.clear()
+        self.private.cleanup()
