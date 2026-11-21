@@ -9,8 +9,8 @@
 | 路径 | 职责及可用区域 |
 |---|---|
 | frontend/<language>/ | 安装包中的入口把作者程序转成根 IR 字节。entry 取 module:callable。模块路径从本单元目录起算，Python 源码随候选安装并逐文件核对摘要；候选内的模块可以用相对导入。原生绑定可以登记根输入校验及 dialect。 |
-| levels/<level>/<node>/ | ir、lowering、analysis、transforms、decisions、abi、agent。子节点拥有从父到子的 lowering。 |
-| exits/<exit>/ | ir、legalize、transforms、decisions、capabilities、emit、abi、agent。一个出口独用的表示在此维护；多个出口共用的表示提升为节点。 |
+| levels/<level>/<node>/ | ir、lowering、analysis、transforms、decisions、cost、abi、agent。子节点拥有从父到子的 lowering。 |
+| exits/<exit>/ | ir、legalize、transforms、decisions、cost、capabilities、emit、abi、agent。一个出口独用的表示在此维护；多个出口共用的表示提升为节点。 |
 | runtime/<name>/ | binding、launch、cache。名称对应节点或出口。运行时可依赖沿父链登记的运行时、所属单元及祖先节点的 ABI、精简 Runtime。 |
 | include/<product>/<unit>/ | 供其他单元包含的公开接口。在节点或出口的 abi/ 编写头或数据描述，构建与安装自动提供 include/<product>/<unit>/abi/。也可直接在公开目录提供合同；同一公开路径只能有一份源文件。 |
 | agent/ | 产品级动作和 skill。纯开发扩展可使用 agent/<name>/。 |
@@ -20,3 +20,6 @@
 目录按需建立。一个原生单元目录调用一次 `compilerinfra_unit(SOURCES ... [LINK_LIBRARIES ...])`。目标名和 C++ 登记命名空间由路径生成，可用 `compilerinfra_target(out unit-path)` 取得 CMake 目标名。根 CMakeLists 通过 SDK 的 Project 组件和 compilerinfra_project_name 从 product.json 读取名称，再调用 project()。根目录调用一次 `compilerinfra_product()`。每个节点可以依赖祖先，出口可以依赖挂接节点及其祖先，frontend 可以使用根的公开接口。配置结束时检查单元源码和传递链接闭包。库安装位置从实际构建目标取得。开发进程按安装的解释器入口启动；该环境需要已安装的 SDK 运行时和开发 worker。组件目录及登记位置相对于产品源码根，扩展路径保留其相对位置。
 
 扩展包在产品的 extensions 数组中声明 name 和 path，包根的 product.json 可以补充 levels、nodes、exits 和 runtimes。复用已有逻辑节点或出口的目录表示对它的贡献。扩展单元以 extensions/<name>/ 开头获得单独的登记命名空间。产品与扩展各自保有 Git 根目录。
+
+
+结构代价模型在决定所属节点的 `cost/` 登记。出口的 `cost/` 可以提供局部估算，`capabilities/<profile>.calibration.json` 提供带来源和版本的实测机器参数。每个编程模型的优化依据写入 `doc/design/performance-<node>.md`。[候选选择、校准和测量合同](performance.md)

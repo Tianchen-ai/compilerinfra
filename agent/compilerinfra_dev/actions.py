@@ -117,16 +117,26 @@ class Catalog:
 
         def read_skill(name: str, compiler: str = "base"):
             """Read a framework or installed product skill."""
-            if name == "compiler-development":
-                return (
-                    Path(__file__).parent / "skills" / "compiler-development.md"
-                ).read_text()
+            if name in {"compiler-development", "performance-iteration"}:
+                return (Path(__file__).parent / "skills" / (name + ".md")).read_text()
             key = scope.key(compiler)
             return scope.values[key].worker.call("skill", key, name=name)
 
-        async def measure(workload: Any, output_dir: str, compiler: str = "base"):
+        def model_accuracy(records: str, k: int = 1):
+            """Compare structural predictions to Bench measurements, separated by data split."""
+            import json
+            from compilerinfra.performance import accuracy
+
+            return accuracy(json.loads(Path(records).read_text()), k)
+
+        async def measure(
+            workload: Any,
+            output_dir: str,
+            compiler: str = "base",
+            compilation_id: str | None = None,
+        ):
             """Hand this installed candidate and the opaque workload to the product's Bench."""
-            return await scope.measure(compiler, workload, output_dir)
+            return await scope.measure(compiler, workload, output_dir, compilation_id)
 
         def adopt(compiler: str):
             """Apply the candidate to the product sources, rebuild and reinstall the baseline."""
@@ -142,6 +152,7 @@ class Catalog:
             compare,
             impact,
             read_skill,
+            model_accuracy,
             measure,
             adopt,
             discard,
@@ -158,7 +169,7 @@ class Catalog:
         key = self.scope.key(id)
         catalog = self.scope.values[key].worker.call("catalog", key)
         if self.scope.profile == "development":
-            catalog["skills"].append("compiler-development")
+            catalog["skills"].extend(("compiler-development", "performance-iteration"))
         return catalog
 
     def schemas(self):

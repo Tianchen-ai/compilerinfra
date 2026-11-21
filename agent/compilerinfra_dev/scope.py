@@ -298,24 +298,33 @@ class Scope:
                 if any(b.startswith(node) for b in description["exits"][e]["path"])
             ]
         events = report["events"] if report else None
+
+        def hit(event):
+            action = event["action"]
+            if action == "candidate":
+                detail = event["details"]
+                if item["kind"] == "cost_model":
+                    return detail["estimated"] and component == detail.get("model")
+                return (
+                    item["kind"] == "local_estimator"
+                    and component in detail["estimator_versions"]
+                )
+            if action == "no_match" or (
+                action == "contribution" and not event["changed"]
+            ):
+                return False
+            return component in (event["implementation"], event.get("family"))
+
         return dict(
             reachable=reachable,
             selected=[e for e in reachable if component in description["selected"][e]],
             compilation_id=compilation_id,
             observed_exit=report["exit"] if report else None,
             root_sha256=report["root_sha256"] if report else None,
-            hits=None
-            if events is None
-            else [
-                v
-                for v in events
-                if v["action"] != "no_match"
-                and (v["action"] != "contribution" or v["changed"])
-                and component in (v["implementation"], v.get("family"))
-            ],
+            hits=None if events is None else [event for event in events if hit(event)],
         )
 
-    async def measure(self, id, workload, output_dir):
+    async def measure(self, id, workload, output_dir, compilation_id=None):
         key = self.key(id)
         c = self.values[key]
         p = c.description["product"]
@@ -330,6 +339,22 @@ class Scope:
             workload=workload,
             output_dir=str(Path(output_dir).resolve()),
         )
+        if compilation_id is not None:
+            report, _ = self.observations[compilation_id]
+            if report["candidate"] != key or report["error"]:
+                raise ValueError(
+                    "measurement needs a successful compilation of the selected candidate"
+                )
+            request["prediction"] = {
+                "compilation_id": compilation_id,
+                "root_sha256": report["root_sha256"],
+                "exit": report["exit"],
+                "events": [
+                    event
+                    for event in report["events"]
+                    if event["action"] == "candidate"
+                ],
+            }
         result = import_module(adapter["package"]).measure(request)
         return await result if inspect.isawaitable(result) else result
 

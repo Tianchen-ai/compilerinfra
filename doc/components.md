@@ -4,7 +4,7 @@
 
 节点和出口分别为每个边界登记构造 MLIR pipeline 的函数和 verifier。在边界之前执行 Contribution，使用类型、访问或目标能力决定何时改写。after 引用同一边界上的已登记贡献，afterIfPresent 允许指定缺席的贡献。启用的变换按依赖顺序执行。
 
-DecisionFamily 定义在真实 IR 上读取、验证和写入决定的合同。FamilyBinding 指定作决定的边界和兑现决定的边界。Strategy 返回候选属性、未匹配或错误。Realizer 负责改写并消费已选属性。产品在默认配置的 nodes.<node>.decisions 中为每个家族选择完整的 strategies 列表与 realizer，名称使用 unit-path::local-name。一个出口可以在 exits.<exit>.decisions 中替换该条完整选择。可选变换在相应 scope 的 optimizations 映射中启停。目标选项属于 exits.<exit>.options。边界校验和必需变换保留在所有配置里。
+DecisionFamily 定义在真实 IR 上读取、验证和写入决定的合同。FamilyBinding 指定作决定的边界和兑现决定的边界。Strategy 通过 propose 返回单个决定，通过 enumerate 返回有限的结构候选集。未匹配和提案错误有不同的返回值。Realizer 负责改写并消费已选属性。产品在默认配置的 nodes.<node>.decisions 中为每个家族选择完整的 strategies 列表与 realizer，名称使用 unit-path::local-name。一个出口可以在 exits.<exit>.decisions 中替换该条完整选择。可选变换在相应 scope 的 optimizations 映射中启停。目标选项属于 exits.<exit>.options。边界校验和必需变换保留在所有配置里。
 
 `Compiler.compile` 接受文本或 bytecode 形式的根 IR。`through` 返回该边界的检查点；设置 `text=True` 可查看 MLIR 文本。将检查点和 `after` 交给同一条合法的出口路径，可以恢复编译。出口声明有序的 boundaries 并登记对应的合法化实现，最后一个出口边界仍位于 emitter 之前。扩展在已有出口的同形目录内登记变换或策略。子节点与出口服从同一条接出规则：接出点落在决定和物化之间时，接收单元必须提供私有 realizer，在自己的第一个边界之前兑现。单一私有实现自动选中；存在多个时，在接收单元的 decisions 中按家族指定 realizer。缺少实现的分支及其后代在 layout 中带有 valid=false 和原因。正常编译返回原生产物字节。
 
