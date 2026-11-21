@@ -19,9 +19,6 @@
 #include <vector>
 
 namespace compilerinfra {
-namespace detail {
-struct ComponentIndex;
-}
 
 using RegisterDialects = std::function<void(mlir::DialectRegistry &)>;
 using Import = std::function<llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>>(
@@ -73,8 +70,6 @@ struct Stage {
   std::vector<PassGroup> groups;
   // Checks the representation and target invariants both on exit and on resume.
   BoundaryCheck verifyOutput;
-  std::shared_ptr<const char>
-      identity; // Process-local sharing across immutable derivations.
 };
 
 struct Target {
@@ -112,9 +107,6 @@ public:
   llvm::ArrayRef<Target> targets() const;
   llvm::Expected<Artifact> compile(llvm::StringRef target,
                                    llvm::MemoryBufferRef input) const;
-  bool sharesInputWith(const Compiler &other) const {
-    return definition->origin == other.definition->origin;
-  }
   const llvm::json::Object &describe() const { return definition->description; }
 
   llvm::Expected<std::unique_ptr<Session>>
@@ -128,15 +120,13 @@ public:
 private:
   friend class Session;
   friend class Assembly;
-  friend class Assembly;
-  static llvm::Expected<Compiler>
-  create(Frontend frontend, std::vector<Target> targets,
-         llvm::json::Object description);
+  static llvm::Expected<Compiler> create(Frontend frontend,
+                                         std::vector<Target> targets,
+                                         llvm::json::Object description);
   struct Definition {
     Frontend frontend;
     std::vector<Target> targets;
     llvm::json::Object description;
-    std::shared_ptr<const char> origin = std::make_shared<const char>(0);
   };
   explicit Compiler(std::shared_ptr<const Definition> definition);
   std::shared_ptr<const Definition> definition;

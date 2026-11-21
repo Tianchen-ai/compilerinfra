@@ -61,15 +61,13 @@ static llvm::Error validateTarget(const Target &target) {
   return llvm::Error::success();
 }
 
-llvm::Expected<Compiler>
-Compiler::create(Frontend frontend, std::vector<Target> targets,
-                 llvm::json::Object description) {
+llvm::Expected<Compiler> Compiler::create(Frontend frontend,
+                                          std::vector<Target> targets,
+                                          llvm::json::Object description) {
   if (!frontend.import || targets.empty())
     return createStringError("compiler needs an importer and a target");
   llvm::StringSet<> names;
   for (Target &target : targets) {
-    for (auto &stage : target.stages)
-      stage.identity = std::make_shared<const char>(0);
     if (!frontend.verifyInput && !target.verifyInput)
       return createStringError("missing input model check for target " +
                                target.name);
@@ -79,8 +77,8 @@ Compiler::create(Frontend frontend, std::vector<Target> targets,
     if (auto error = validateTarget(target))
       return error;
   }
-  return Compiler(std::make_shared<Definition>(
-      Definition{std::move(frontend), std::move(targets), std::move(description)}));
+  return Compiler(std::make_shared<Definition>(Definition{
+      std::move(frontend), std::move(targets), std::move(description)}));
 }
 
 llvm::ArrayRef<Target> Compiler::targets() const { return definition->targets; }

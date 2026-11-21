@@ -59,7 +59,6 @@ using ModelCheck =
 using ModelPasses =
     std::function<llvm::Error(mlir::OpPassManager &, const TargetProfile &)>;
 
-
 struct Boundary {
   std::string name; // local to this node
   ModelPasses lower;
@@ -78,9 +77,13 @@ struct FamilyBinding {
 struct Exit {
   ModelPasses legalize;
   Emit emit;
-  std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)> capabilities;
+  std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)>
+      capabilities;
 };
-template <typename T> struct Located { T value; SourceRef source; };
+template <typename T> struct Located {
+  T value;
+  SourceRef source;
+};
 
 // The generated registration function receives exactly its own unit.
 class Unit {
@@ -95,7 +98,9 @@ public:
   std::vector<Located<Strategy>> strategies;
   std::vector<Located<Realizer>> realizers;
   std::optional<Located<Exit>> exit;
-  std::string qualify(llvm::StringRef local) const { return id + "::" + local.str(); }
+  std::string qualify(llvm::StringRef local) const {
+    return id + "::" + local.str();
+  }
 };
 
 class Assembly {
@@ -103,6 +108,7 @@ public:
   void bind(llvm::StringRef unit, void (*registerUnit)(Unit &));
   llvm::Expected<Compiler> link(const llvm::json::Object &manifest,
                                 const llvm::json::Object &configuration) const;
+
 private:
   std::map<std::string, Unit> units;
 };
