@@ -28,6 +28,9 @@ const char *ci_compile_plain(const ci_compiler *, const char *exit_name,
                              const void *input, size_t size, const char *after,
                              const char *through, int assembly_text,
                              ci_buffer *output, ci_buffer *id);
+const char *ci_compile_measured(const ci_compiler *, const char *exit_name,
+                                const void *input, size_t size, ci_buffer *artifact,
+                                ci_buffer *report);
 void ci_close(ci_compiler *);
 // Returns a compilation ID, input identity and executed transformation events.
 // For checkpoints from another compiler supply the original root SHA-256.

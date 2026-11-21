@@ -33,10 +33,27 @@ def _top_k(values, k):
 
 def _join_batch(batch, compilations, measured):
     """Use the selected proposal in each actual compilation as the prediction side."""
+    default = compilations[0]["default_prediction"]
+    family = compilations[0]["family"]
+    def choices(report):
+        return [e["details"] for e in report["events"] if e["action"] == "candidate"
+                and e["family"] == family and e["details"]["selected"]]
+    picked = choices(default)
+    if default["product_default"] is not True or len(picked) != 1 or not default["package_sha256"]:
+        raise ValueError("batch requires an observed default compilation for this decision")
+    default_structure = picked[0]["candidate"]
     expected = {}
     for entry in compilations:
+        if entry["family"] != family or entry["default_prediction"] != default:
+            raise ValueError("inconsistent default observation or family")
         p = entry["prediction"]
-        cid, compiler = p["compilation_id"], p["compiler_candidate"]
+        cid, compiler = p["compilation_id"], p["candidate"]
+        if any(p[k] != default[k] for k in ("root_sha256","exit","fingerprint")):
+            raise ValueError("different build, exit or input in default and candidate")
+        def target_options(report):
+            return report["configuration"].get("exits", {}).get(report["exit"], {}).get("options", {})
+        if target_options(p) != target_options(default):
+            raise ValueError("candidate target differs from default compilation")
         if not all(isinstance(v, str) and v for v in (cid, compiler, p["exit"])):
             raise ValueError("missing compiler or compilation identity")
         if not re.fullmatch("[0-9a-f]{64}", p["artifact_sha256"]):
@@ -50,7 +67,7 @@ def _join_batch(batch, compilations, measured):
             ident = (choice["candidate"], str(key))
             if ident in expected:
                 raise ValueError(f"duplicate prediction {ident}")
-            expected[ident] = (cid, compiler, p["artifact_sha256"], prediction, choice["predicted_ns"])
+            expected[ident] = (p, prediction, choice["predicted_ns"])
     seen = set()
     joined = []
     for row in measured:
@@ -58,12 +75,21 @@ def _join_batch(batch, compilations, measured):
         if ident in seen or ident not in expected:
             raise ValueError(f"unexpected or repeated measured row {ident}")
         seen.add(ident)
-        cid, compiler, digest, pred, ns = expected[ident]
-        if (row["compilation_id"], row["compiler_candidate"]) != (cid, compiler):
+        p, pred, ns = expected[ident]
+        receipt = row["runtime_identity"]
+        if (receipt["compilation_id"], receipt["compiler_candidate"], receipt["package_sha256"]) != (
+                p["compilation_id"], p["candidate"], p["package_sha256"]):
+            raise ValueError(f"{ident}: measured package or native identity mismatch")
+        if (receipt["structures"].get(family), str(receipt["row_id"])) != ident:
+            raise ValueError(f"{ident}: measured structure or row differs")
+        selected = ident[0] == default_structure
+        if "selected" in row and row["selected"] is not selected:
+            raise ValueError(f"{ident}: reported selection disagrees with default compilation")
+        if (row["compilation_id"], row["compiler_candidate"]) != (p["compilation_id"], p["candidate"]):
             raise ValueError(f"{ident}: compilation or candidate identity mismatch")
-        if row["artifact_sha256"] != digest:
+        if row["artifact_sha256"] != p["artifact_sha256"]:
             raise ValueError(f"{ident}: measured artifact differs from emitted artifact")
-        joined.append(dict(row, terms=pred["terms"], predicted_ns=pred["predicted_ns"], structure_ns=ns))
+        joined.append(dict(row, selected=selected, terms=pred["terms"], predicted_ns=pred["predicted_ns"], structure_ns=ns))
     if expected.keys() - seen:
         raise ValueError(f"missing measured rows {sorted(expected.keys()-seen)}")
     return joined
@@ -71,8 +97,8 @@ def _join_batch(batch, compilations, measured):
 
 def accuracy(document, k=1):
     """Score only complete batches paired with independent compiler reports."""
-    if document.get("version") != 2:
-        raise ValueError("cost records require version 2 with compilation predictions")
+    if document.get("version") != 3:
+        raise ValueError("cost records require version 3 with measured package identities and default explain")
     if type(k) is not int or k <= 0:
         raise ValueError("k must be positive")
     grouped = defaultdict(list)

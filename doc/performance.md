@@ -26,7 +26,7 @@
 
 ## Bench 交换格式与准确度
 
-Bench 产出 UTF-8 JSON，顶层是 `{"version":2,"compilations":[...],"rows":[...]}`。compilations 的每项包含 batch、family 和 measure 收到的原始 prediction。编译器对最终发射字节串计算 SHA-256。同一产物可包含多行，通过行 ID 区分。测量端读取实际执行产物的摘要，并附 compilation_id 与 compiler_candidate。准确度动作以对应实际编译的 selected 候选行域连接 measured rows，拒绝缺行、多行、摘要或身份错配的批次；excluded 附原因。
+交换格式为 `{"version":3,"compilations":[...],"rows":[...]}`。每项编译记录包含 batch、family、原生 prediction 以及本批普通配置的 default_prediction。由同一物理输入的默认 explain 决定 selected。每行附被测调用的 runtime_identity（编译与候选 ID、产物包 SHA-256、各家族实际选择的结构与实际行号）。框架逐批核对程序、配置、产物及行域；不符的整批进入 excluded。
 
 | 字段 | 含义 |
 |---|---|
@@ -36,7 +36,7 @@ Bench 产出 UTF-8 JSON，顶层是 `{"version":2,"compilations":[...],"rows":[.
 | measured_ns、winner | Bench 实测的完整调用时间和每个结构唯一的运行时选中行。 |
 | selected、artifact_sha256 | 编译器选择的结构（同结构的所有行相同）以及实际被测的产物摘要。 |
 
-开发动作 `measure` 可传 `compilation_id`。宿主检查编译归属于当前候选，随测量请求附上根 IR 摘要、出口和这次编译的候选预测。Bench 按 `explain` 的结构和行 ID 关联试跑与完整调用测量。单行实测、完整调用、预测和候选生成规模应各自可辨。不同拓扑分别派生并测量。开发动作 `model-accuracy` 接受 `records` 文件路径和正整数 `k`。每个结构的实测值取实际 winner 的完整调用时间。优先采用显式的结构预测，否则取完整逐行预测的最小值，缺行估时视作未知。按校准和留出分别报告：
+开发宿主对最终根 IR 使用 `compile_measured` 同时得到原生解释与自描述产物。带 compilation_id 的 measure 把这份产物交给 Bench。绑定器验证根 IR、有效配置与产品指纹，运行时从实际加载的字节及 launcher 读取身份。普通未观察调用继续使用原入口。
 
 - 成对排序正确率，排除实测平局，预测平局计半分，分母是可比对数。
 - top-k 召回率，用预测与实测前 k 项的交集除以实测前 k 项数。边界同分的结构平分入选权，未预测项也参与实际排名。

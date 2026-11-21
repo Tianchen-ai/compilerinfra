@@ -143,7 +143,7 @@ static const char *compile(const ci_compiler *c, const char *exit,
                            const void *input, size_t size, const char *after,
                            const char *through, int text, ci_buffer *out,
                            ci_buffer *events, bool trace, const char *origin,
-                           ci_buffer *idOut = nullptr) {
+                           ci_buffer *idOut = nullptr, bool package = false) {
   if (!c || !exit || (!input && size) || !out)
     return ::strdup("invalid compilation arguments");
   llvm::json::Array log;
@@ -157,7 +157,25 @@ static const char *compile(const ci_compiler *c, const char *exit,
   };
   std::string inputHash = trace ? hash(input, size) : std::string{},
               root = inputHash;
-  std::string artifactHash;
+  std::string artifactHash, packageHash;
+  llvm::json::Array decisions;
+  auto configuration = [&] { return Object(*c->compiler.describe().getObject("configuration")); };
+  auto defaultPolicy = [&] {
+    auto policy = [](Object config) {
+      if (auto *exits = config.getObject("exits"))
+        for (auto &[name, local] : *exits)
+          if (auto *settings = local.getAsObject()) settings->erase("options");
+      if (auto *exits = config.getObject("exits")) {
+        Object active;
+        for (auto &[name, local] : *exits)
+          if (auto *settings = local.getAsObject(); settings && !settings->empty())
+            active[name] = Object(*settings);
+        config["exits"] = std::move(active);
+      }
+      return config;
+    };
+    return policy(configuration()) == policy(Object(*c->manifest->getObject("configuration")));
+  };
   auto finish = [&](const char *failure) {
     if (events) {
       if (trace)
@@ -169,6 +187,11 @@ static const char *compile(const ci_compiler *c, const char *exit,
                                         {"input_sha256", inputHash}, {"artifact_sha256", artifactHash},
                                         {"after", after ? after : ""},
                                         {"through", through ? through : ""},
+                                        {"package_sha256", packageHash},
+                                        {"identity", Object{{"compilation_id", id}, {"compiler_candidate", c->id},
+                                                           {"artifact_sha256", artifactHash}, {"decisions", std::move(decisions)}}},
+                                        {"product_default", defaultPolicy()}, {"configuration", configuration()},
+                                        {"fingerprint", *c->manifest->get("fingerprint")},
                                         {"events", std::move(log)}}));
       else if (!failure)
         *events = copy(serialize(std::move(log)));
@@ -206,6 +229,13 @@ static const char *compile(const ci_compiler *c, const char *exit,
     };
   if (events)
     opts.observeDecision = [&](const DecisionEvent &e) {
+      if (trace && e.action == "candidate" && e.details.getBoolean("selected").value_or(false)) {
+        llvm::json::Array rows;
+        if (auto *domain = e.details.getObject("rows"))
+          for (const auto &[row, prediction] : *domain) rows.push_back(row.str());
+        decisions.push_back(Object{{"family", e.family}, {"structure", *e.details.get("candidate")},
+                                   {"rows", std::move(rows)}});
+      }
       log.push_back(Object{{"family", e.family},
                            {"action", e.action},
                            {"implementation", e.implementation},
@@ -229,7 +259,18 @@ static const char *compile(const ci_compiler *c, const char *exit,
   if (!bytes)
     return finish(error(bytes.takeError()));
   if (trace && !through) artifactHash=hash(bytes->data(),bytes->size());
-  *out = copy({bytes->data(), bytes->size()});
+  if (package && !through) {
+    auto header = serialize(Object{{"compilation_id", id}, {"compiler_candidate", c->id},
+        {"artifact_sha256", artifactHash}, {"decisions", llvm::json::Array(decisions)},
+        {"root_sha256", root}, {"exit", exit}, {"configuration", configuration()},
+        {"fingerprint", *c->manifest->get("fingerprint")}});
+    auto contents = std::string("CIMEAS1\n") + llvm::utostr(header.size()) + "\n" + header;
+    contents.append(bytes->data(), bytes->size());
+    packageHash = hash(contents.data(), contents.size());
+    *out = copy(contents);
+  } else {
+    *out = copy({bytes->data(), bytes->size()});
+  }
   if (through && !root.empty()) {
     std::lock_guard guard(c->lock);
     if (c->checkpointRoots.size() == 128)
@@ -252,6 +293,12 @@ const char *ci_compile_plain(const ci_compiler *c, const char *exit,
                              ci_buffer *id) {
   return compile(c, exit, input, size, after, through, text, out, nullptr,
                  false, nullptr, id);
+}
+const char *ci_compile_measured(const ci_compiler *c, const char *exit,
+                               const void *input, size_t size,
+                               ci_buffer *out, ci_buffer *report) {
+  return compile(c, exit, input, size, nullptr, nullptr, false, out, report,
+                 true, nullptr, nullptr, true);
 }
 const char *ci_compile_trace(const ci_compiler *c, const char *exit,
                              const void *input, size_t size, const char *after,

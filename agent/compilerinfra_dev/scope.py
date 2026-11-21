@@ -268,11 +268,14 @@ class Scope:
             return result
         artifact, report = result
         report["native_candidate"] = report["candidate"]
-        report["candidate"] = key
+        report = dict(report, scope_candidate=key)
         cid = report["compilation_id"]
-        self.observations[cid] = (report, c.description)
+        self.observations[cid] = (report, c.description, artifact)
         if report["error"]:
             raise ValueError(f"{cid}: {report['error']}")
+        if report.get("package_sha256"):
+            from compilerinfra.measured import unpack
+            _, artifact = unpack(artifact)
         return artifact, cid
 
     def impact(self, id, component, compilation_id=None):
@@ -280,8 +283,8 @@ class Scope:
         if compilation_id is None:
             description = self.values[self.key(id or "base")].description
         else:
-            report, description = self.observations[compilation_id]
-            if id and self.key(id) != report["candidate"]:
+            report, description, _ = self.observations[compilation_id]
+            if id and self.key(id) != report["scope_candidate"]:
                 raise ValueError("compilation belongs to a different candidate")
 
         item = description["components"][component]
@@ -340,25 +343,22 @@ class Scope:
             output_dir=str(Path(output_dir).resolve()),
         )
         if compilation_id is not None:
-            report, _ = self.observations[compilation_id]
-            if report["candidate"] != key or report["error"]:
+            report, _, artifact = self.observations[compilation_id]
+            if report["scope_candidate"] != key or report["error"]:
                 raise ValueError(
                     "measurement needs a successful compilation of the selected candidate"
                 )
             if not report["artifact_sha256"]:
                 raise ValueError("measurement requires a final emitted artifact")
-            request["prediction"] = {
-                "compiler_candidate": key,
-                "artifact_sha256": report["artifact_sha256"],
-                "compilation_id": compilation_id,
-                "root_sha256": report["root_sha256"],
-                "exit": report["exit"],
-                "events": [
-                    event
-                    for event in report["events"]
-                    if event["action"] == "candidate"
-                ],
-            }
+            if not report.get("package_sha256"):
+                raise ValueError("measure a final compilation from the author's root IR")
+            from tempfile import NamedTemporaryFile
+            with NamedTemporaryFile(dir=self.private.name, suffix=".cimeas") as package:
+                package.write(artifact)
+                package.flush()
+                request["artifact_file"] = package.name
+                result = import_module(adapter["package"]).measure(request)
+                return await result if inspect.isawaitable(result) else result
         result = import_module(adapter["package"]).measure(request)
         return await result if inspect.isawaitable(result) else result
 

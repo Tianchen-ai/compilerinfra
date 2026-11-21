@@ -44,7 +44,10 @@ def serve(pipe, path, profile):
                     if args.pop("author_input", False):
                         args["source"] = handles[key].root_ir(args["source"])
                     try:
-                        result = handles[key].compile(**args)
+                        if args.get("explain") and not args.get("through") and not args.get("after"):
+                            result = handles[key].compile_measured(args["source"], exit=args["exit"])
+                        else:
+                            result = handles[key].compile(**args)
                         if not args.get("explain"):
                             result = (result, handles[key].last_compilation_id)
                     except CompilationError as exc:

@@ -36,6 +36,7 @@ class Library:
             "ci_free": (None, [ptr]),
         }
         signatures["ci_compile_plain"] = signatures["ci_compile"]
+        signatures["ci_compile_measured"] = (ptr, [ptr, string, ptr, C.c_size_t, buf, buf])
         signatures["ci_compile_trace"] = (
             ptr,
             [ptr, string, ptr, C.c_size_t, string, string, C.c_int, string, buf, buf],
@@ -154,6 +155,19 @@ class Compiler:
             raise CompilationError(report)
         artifact = self.library.take(out)
         return (artifact, report) if explain else artifact
+
+    def compile_measured(self, source: bytes, *, exit):
+        """Emit a self-identifying artifact and the independent native explain record."""
+        out, events = Buffer(), Buffer()
+        error = self.library.api.ci_compile_measured(
+            self.handle, exit.encode(), source, len(source), C.byref(out), C.byref(events)
+        )
+        report = json.loads(self.library.take(events)) if events.data else {}
+        if error:
+            self.library.check(error)
+        self.last_compilation_id = report["compilation_id"]
+        self.observations[self.last_compilation_id] = report
+        return self.library.take(out), report
 
     def explain(self, compilation_id):
         return self.observations[compilation_id]
