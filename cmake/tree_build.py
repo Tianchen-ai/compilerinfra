@@ -75,6 +75,19 @@ def generated(model, out):
         ns = ident(key)
         declarations.append(f"namespace {ns} {{ void bind(compilerinfra::Unit &); }}")
         calls.append(f'  registry.bind("{key}", {ns}::bind);')
+    calibrations = {}
+    for unit in model["units"].values():
+        if not unit["owner"].startswith("exits/"):
+            continue
+        for file in sorted(
+            (Path(unit["directory"]) / "capabilities").glob("*.calibration.json")
+        ):
+            profile = file.name.removesuffix(".calibration.json")
+            docs = calibrations.setdefault(unit["owner"].split("/")[1], {})
+            if not profile or profile in docs:
+                raise ValueError(f"{file}: duplicate or empty calibration profile")
+            docs[profile] = json.loads(file.read_text())
+    model["calibrations"] = calibrations
     model["fingerprint"] = provenance(model)
     model["library"] = (out / "library.path").read_text().strip()
     for u in model["units"].values():

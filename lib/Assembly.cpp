@@ -1,6 +1,7 @@
 #include "DecisionProgram.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/Support/Path.h"
+#include <cmath>
 #include <set>
 
 using namespace compilerinfra;
@@ -25,6 +26,7 @@ struct Components {
   std::map<std::string, Located<FamilyBinding>> families;
   std::map<std::string, Located<Strategy>> strategies;
   std::map<std::string, Located<Realizer>> realizers;
+  std::map<std::string, Located<CostModel>> costModels;
   Object catalog;
   llvm::Error record(const std::string &name, const std::string &unit,
                      const std::string &at, llvm::StringRef kind,
@@ -101,11 +103,27 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
   }
   for (auto &[v, s] : u.strategies) {
     auto id = u.qualify(v.name);
-    if (!v.propose)
-      return createStringError(id + ": missing strategy implementation");
+    if (bool(v.propose) == bool(v.enumerate))
+      return createStringError(id + ": declare exactly one proposal interface");
     if (auto e = c.record(id, u.id, "", "strategy", s))
       return e;
     c.strategies.emplace(id, Located<Strategy>{v, s});
+  }
+  for (auto &[v, s] : u.costModels) {
+    auto id = u.qualify(v.name);
+    if (!v.estimate || v.version.empty())
+      return createStringError(id + ": missing estimator or version");
+    auto owner = field(*manifest.getObject("units")->getObject(u.id), "owner");
+    bool localEstimate = llvm::StringRef(owner).starts_with("exits/");
+    if (!localEstimate && !llvm::StringRef(owner).starts_with("levels/"))
+      return createStringError(id + ": estimators belong to nodes and exits");
+    if (auto err = c.record(
+            id, u.id, "", localEstimate ? "local_estimator" : "cost_model", s))
+      return err;
+    (*c.catalog.getObject(id))["version"] = v.version;
+    auto copy = v;
+    copy.name = id;
+    c.costModels.emplace(id, Located<CostModel>{std::move(copy), s});
   }
   for (auto &[v, s] : u.realizers) {
     auto id = u.qualify(v.name);
@@ -176,6 +194,17 @@ llvm::Expected<DecisionChoice> choiceFor(const Object &settings,
     return createStringError(
         "configuration must select strategies and a realizer for " + id);
   DecisionChoice result;
+  for (auto key : {"model", "candidate"})
+    if (obj->get(key) && !obj->getString(key))
+      return createStringError(id + ": expected a component name for " + key);
+  result.model = obj->getString("model").value_or("").str();
+  result.candidate = obj->getString("candidate").value_or("").str();
+  if (obj->get("uncertainty")) {
+    auto v = obj->getNumber("uncertainty");
+    if (!v || !std::isfinite(*v) || *v < 0)
+      return createStringError(id + ": invalid relative uncertainty threshold");
+    result.uncertainty = *v;
+  }
   result.realizer = field(*obj, "realizer");
   for (auto &v : *obj->getArray("strategies")) {
     if (!v.getAsString())
@@ -350,6 +379,20 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
     }
     return llvm::Error::success();
   };
+  if (auto e = attach(c.costModels))
+    return std::move(e);
+  for (auto &[id, model] : c.costModels) {
+    auto *entry = c.catalog.getObject(id);
+    auto owner = [&](const Object &item) {
+      return field(*manifest.getObject("units")->getObject(field(item, "unit")),
+                   "owner");
+    };
+    if (field(*entry, "kind") == "cost_model" &&
+        (!c.families.count(model.value.family) ||
+         owner(*entry) != owner(*c.catalog.getObject(model.value.family))))
+      return createStringError(
+          id + ": structural model must belong to its decision node");
+  }
   if (auto e = attach(c.strategies))
     return std::move(e);
   if (auto e = attach(c.realizers))
@@ -432,6 +475,18 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         *profile = std::move(*facts);
       } else if (!options.empty())
         return createStringError(name + ": unsupported exit options");
+      if (!profile->services.calibrationProfile.empty()) {
+        auto *all = manifest.getObject("calibrations");
+        auto *profiles = all ? all->getObject(name) : nullptr;
+        auto *doc =
+            profiles ? profiles->getObject(profile->services.calibrationProfile)
+                     : nullptr;
+        if (!doc)
+          return createStringError(name + ": missing installed calibration " +
+                                   profile->services.calibrationProfile);
+        if (auto error = profile->services.facts.loadCalibration(*doc))
+          return std::move(error);
+      }
       Exit t;
       t.name = name;
       t.emit = implementation.emit;
@@ -511,6 +566,13 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
           for (auto &[rid, r] : c.realizers)
             if (r.value.family == id && available(rid))
               table->realizers.emplace(rid, r.value);
+          for (auto &[mid, m] : c.costModels)
+            if (m.value.family == id && available(mid)) {
+              bool local =
+                  field(*c.catalog.getObject(mid), "kind") == "local_estimator";
+              (local ? table->localModels : table->models)
+                  .emplace(mid, m.value);
+            }
           auto selections = mergedField(defaults, overrides, "decisions");
           auto *selection = selections.getObject(id);
           if (pathBindings.count(id)) {
@@ -531,6 +593,14 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
           if (auto privateBinding = pathBindings.find(id);
               privateBinding != pathBindings.end())
             choice->realizer = privateBinding->second;
+          if (choice->model.empty() && !table->models.empty()) {
+            if (table->models.size() != 1)
+              return createStringError(
+                  id + ": configuration must choose a cost model");
+            choice->model = table->models.begin()->first;
+          }
+          if (!choice->model.empty())
+            chosen.insert(choice->model);
           detail::DecisionProgram program{table, *choice, false};
           if (auto err = program.validate())
             return std::move(err);

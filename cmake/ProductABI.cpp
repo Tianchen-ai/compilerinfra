@@ -210,7 +210,8 @@ static const char *compile(const ci_compiler *c, const char *exit,
                            {"implementation", e.implementation},
                            {"operation", e.operation},
                            {"location", e.location},
-                           {"value", e.value}});
+                           {"value", e.value},
+                           {"details", Object(e.details)}});
     };
   auto session = c->compiler.open(exit, opts);
   if (!session)

@@ -21,6 +21,9 @@ struct SourceRef {
 // MLIR TypeID keeps interface identity independent of the exit name.
 class TargetServices {
 public:
+  MachineFacts facts;
+  // The exit selects the calibrated device/toolchain profile during discovery.
+  std::string calibrationProfile;
   template <typename Interface>
   llvm::Error provide(std::shared_ptr<const Interface> implementation) {
     if (!implementation)
@@ -90,6 +93,7 @@ public:
   std::vector<Located<FamilyBinding>> families;
   std::vector<Located<Strategy>> strategies;
   std::vector<Located<Realizer>> realizers;
+  std::vector<Located<CostModel>> costModels;
   std::optional<Located<ExitImplementation>> exit;
   std::string qualify(llvm::StringRef local) const {
     return id + "::" + local.str();

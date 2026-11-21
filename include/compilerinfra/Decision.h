@@ -1,6 +1,7 @@
 #ifndef COMPILERINFRA_DECISION_H
 #define COMPILERINFRA_DECISION_H
 
+#include "compilerinfra/Cost.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/AnalysisManager.h"
@@ -18,7 +19,8 @@ struct TargetProfile;
 struct DecisionChoice {
   std::vector<std::string>
       strategies; // Ordered; last must decide or report unsupported.
-  std::string realizer;
+  std::string realizer, model, candidate;
+  double uncertainty = 0.0; // relative to the best prediction
 };
 using DecisionChoices = std::map<std::string, DecisionChoice>;
 
@@ -32,6 +34,11 @@ struct DecisionFamily {
   std::function<llvm::Error(mlir::Operation *, mlir::Attribute,
                             const TargetProfile &)>
       verify;
+  // Optional domain check of the topology and preconditions against its typed
+  // value.
+  std::function<llvm::Error(mlir::Operation *, const StructuralCandidate &,
+                            const TargetProfile &)>
+      verifyCandidate;
 };
 struct Strategy {
   std::string name, family;
@@ -40,6 +47,9 @@ struct Strategy {
   std::function<llvm::Expected<mlir::Attribute>(
       mlir::Operation *, const TargetProfile &, mlir::AnalysisManager &)>
       propose;
+  std::function<llvm::Expected<std::vector<StructuralCandidate>>(
+      mlir::Operation *, const TargetProfile &, mlir::AnalysisManager &)>
+      enumerate;
 };
 struct Realizer {
   std::string name, family;
@@ -57,6 +67,7 @@ struct Materialize {
 };
 struct DecisionEvent {
   std::string family, action, implementation, operation, location, value;
+  llvm::json::Object details;
 };
 using DecisionObserver = std::function<void(const DecisionEvent &)>;
 

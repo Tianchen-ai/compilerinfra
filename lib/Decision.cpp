@@ -11,6 +11,9 @@ llvm::Error DecisionProgram::validate() const {
     return llvm::createStringError(
         "family " + table->family.name +
         " needs a strategy chain and a registered realizer");
+  if (!choice.model.empty() && !table->models.count(choice.model))
+    return llvm::createStringError("cost model is unavailable for " +
+                                   table->family.name + ": " + choice.model);
   std::set<std::string> seen;
   for (const auto &name : choice.strategies)
     if (!table->strategies.count(name) || !seen.insert(name).second)
@@ -64,6 +67,32 @@ private:
     auto rootAnalyses = getAnalysisManager();
     auto analyses = op == getOperation().getOperation() ? rootAnalyses
                                                         : rootAnalyses.nest(op);
+    bool ranked = bool(family().verifyCandidate) ||
+                  !program.choice.model.empty() ||
+                  !program.choice.candidate.empty() ||
+                  llvm::any_of(program.choice.strategies, [&](auto &id) {
+                    return bool(program.table->strategies.at(id).enumerate);
+                  });
+    if (ranked) {
+      CandidateObserver events;
+      if (observe)
+        events = [&](llvm::StringRef strategy, mlir::Attribute value,
+                     llvm::json::Object detail) {
+          auto event = makeEvent(op, "candidate", strategy, value);
+          event->details = std::move(detail);
+          observe(*event);
+        };
+      auto decision = rankCandidates(program, op, analyses, events);
+      if (!decision)
+        return fail(op->getLoc(), "selection", decision.takeError());
+      if (auto err = family().write(op, decision->value))
+        return fail(op->getLoc(), decision->strategy, std::move(err));
+      if (family().read(op) != decision->value)
+        return op->emitError("decision carrier lost selected candidate");
+      rootAnalyses.invalidate({});
+      report(op, "selected", decision->strategy, decision->value);
+      return mlir::success();
+    }
     for (const auto &name : program.choice.strategies) {
       auto value =
           program.table->strategies.at(name).propose(op, target(), analyses);
