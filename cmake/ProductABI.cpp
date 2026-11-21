@@ -247,7 +247,7 @@ static const char *compile(const ci_compiler *c, const char *exit,
     };
   if (receipt)
     opts.publishSelection = [&](llvm::StringRef family, llvm::StringRef structure) {
-      decisions.push_back(Object{{"family",family},{"structure",structure}});
+      decisions.push_back(Object{{"family",family.str()},{"structure",structure.str()}});
     };
   auto session = c->compiler.open(exit, opts);
   if (!session)
