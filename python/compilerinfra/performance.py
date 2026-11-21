@@ -42,6 +42,11 @@ def _join_batch(batch, compilations, measured):
     if default["product_default"] is not True or len(picked) != 1 or not default["package_sha256"]:
         raise ValueError("batch requires an observed default compilation for this decision")
     default_structure = picked[0]["candidate"]
+    published = [d for d in default["identity"]["decisions"] if d["family"] == family]
+    if len(published) != 1 or published[0]["structure"] != default_structure:
+        raise ValueError("default explain contradicts its emitted decision")
+    legal = {e["details"]["candidate"] for e in default["events"]
+             if e["action"] == "candidate" and e["family"] == family and not e["details"]["eliminated"]}
     expected = {}
     for entry in compilations:
         if entry["family"] != family or entry["default_prediction"] != default:
@@ -63,11 +68,17 @@ def _join_batch(batch, compilations, measured):
         if len(choices) != 1 or not choices[0]["rows"]:
             raise ValueError("expected one realized candidate and its complete prediction row domain")
         choice = choices[0]
+        declared = [d for d in p["identity"]["decisions"] if d["family"] == family]
+        if (len(declared) != 1 or declared[0]["structure"] != choice["candidate"]
+                or set(declared[0]["rows"]) != choice["rows"].keys()):
+            raise ValueError("prediction differs from the emitted structure or row domain")
         for key, prediction in choice["rows"].items():
             ident = (choice["candidate"], str(key))
             if ident in expected:
                 raise ValueError(f"duplicate prediction {ident}")
             expected[ident] = (p, prediction, choice["predicted_ns"])
+    if {structure for structure, row_id in expected} != legal:
+        raise ValueError("missing or extra structure in measured candidate set")
     seen = set()
     joined = []
     for row in measured:
