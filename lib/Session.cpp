@@ -3,7 +3,6 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace compilerinfra;
@@ -57,7 +56,6 @@ struct Session::Impl {
   std::unique_ptr<mlir::MLIRContext> ownedContext;
   mlir::MLIRContext *context;
   std::vector<ExecutableStage> stages;
-  std::vector<std::pair<std::string, size_t>> overrides;
 
   llvm::Expected<size_t> past(llvm::StringRef name) const {
     if (!name.contains('@'))
@@ -142,18 +140,6 @@ Session::Session(std::unique_ptr<Impl> impl) : impl(std::move(impl)) {}
 Session::~Session() = default;
 mlir::MLIRContext &Session::context() { return *impl->context; }
 
-llvm::Error Session::checkOptimizationRange(const StageRange &range) const {
-  auto bounds = impl->bounds(range);
-  if (!bounds)
-    return bounds.takeError();
-  for (const auto &[slot, stage] : impl->overrides)
-    if (stage < bounds->begin || stage >= bounds->end)
-      return createStringError("override '" + slot + "' belongs to stage '" +
-                               impl->stages[stage].spec.name +
-                               "' outside the requested range");
-  return llvm::Error::success();
-}
-
 void Session::printPipeline(llvm::raw_ostream &output) const {
   for (const ExecutableStage &stage : impl->stages) {
     output << stage.spec.name << ": ";
@@ -166,42 +152,6 @@ llvm::Expected<std::unique_ptr<Session>>
 Session::create(std::shared_ptr<const Compiler::Definition> definition,
                 const Target &target, mlir::MLIRContext *external,
                 const SessionOptions &options) {
-  struct Slot {
-    const Stage *stage;
-    const PassGroup *group;
-  };
-  llvm::StringMap<Slot> known;
-  for (const Stage &stage : target.stages)
-    for (const PassGroup &group : stage.groups)
-      if (!group.isRequired())
-        known.try_emplace(group.name(), Slot{&stage, &group});
-  auto edits = options.optimizations;
-  for (const auto &[name, option] : options.optimizations) {
-    if (!known.contains(name))
-      return createStringError("unknown optional optimization '" + name +
-                               "' for target " + target.name);
-    if (!option.enabled &&
-        (option.replacement || !option.useContribution.empty()))
-      return createStringError("disabled optimization has a replacement: " +
-                               name);
-    if (!option.useContribution.empty()) {
-      auto source = known.find(option.useContribution);
-      auto dest = known.find(name);
-      if (source == known.end() || option.replacement ||
-          dest->second.stage != source->second.stage ||
-          dest->second.group->extensionPoint().empty() ||
-          dest->second.group->extensionPoint() !=
-              source->second.group->extensionPoint())
-        return createStringError(
-            "replacement " + option.useContribution +
-            " must be an eligible contribution at the same point as " + name);
-      if (!edits.emplace(option.useContribution, Optimization{}).second)
-        return createStringError("conflicting overrides for " +
-                                 option.useContribution);
-      edits.at(name) = Optimization{false, {}, {}};
-    }
-  }
-
   auto state = std::make_unique<Impl>(std::move(definition), target);
   const Frontend &frontend = state->definition->frontend;
   mlir::DialectRegistry dialects;
@@ -227,23 +177,12 @@ Session::create(std::shared_ptr<const Compiler::Definition> definition,
         observed = group.decision()->builder(options.observeDecision);
         build = &observed;
       }
-      bool enabled = group.defaultEnabled();
-      auto override = edits.find(group.name().str());
-      if (override != edits.end()) {
-        state->overrides.emplace_back(override->first, state->stages.size());
-        enabled = override->second.enabled;
-        if (override->second.replacement)
-          build = &override->second.replacement;
-      }
-      if (enabled)
+      if (group.defaultEnabled())
         if (auto error = (*build)(*passes))
           return createStringError(target.name + "/" + stage.name + " " +
                                    group.name() + ": " +
                                    llvm::toString(std::move(error)));
     }
-    if (options.configureStage)
-      if (auto error = options.configureStage(stage.name, *passes))
-        return error;
     state->stages.push_back({stage, std::move(passes)});
   }
   return std::unique_ptr<Session>(new Session(std::move(state)));

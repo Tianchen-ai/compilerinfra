@@ -56,7 +56,9 @@ class Scope:
         self.private = TemporaryDirectory(dir=self.outputs, prefix=".compiler-")
         self.root = Path(self.private.name)
         self.profile = profile
-        self.library = Path(library).resolve(strict=True) if library else None
+        self.library = (
+            Path(library).parent.resolve() / Path(library).name if library else None
+        )
         self.values = {}
         self.owned = {}
         self.base_key = None
@@ -192,7 +194,7 @@ class Scope:
                     raise ValueError(
                         "installed library does not match product install entry"
                     )
-                with publish(stage, prefix, folder / "backup"):
+                with publish(stage, prefix, folder / "backup", rel):
                     if lib.relative_to(stage) != rel:
                         raise ValueError(
                             "install did not produce expected compiler library"

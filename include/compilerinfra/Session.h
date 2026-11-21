@@ -26,9 +26,6 @@ public:
   ~Session();
   mlir::MLIRContext &context();
   void printPipeline(llvm::raw_ostream &output) const;
-  // For comparisons: diagnose explicitly selected edits outside the measured
-  // range.
-  llvm::Error checkOptimizationRange(const StageRange &range) const;
   // Compile source, or parse a checkpoint for range.after. A range.through
   // returns serialized IR; otherwise emit the target artifact. No file I/O.
   llvm::Expected<Artifact> compile(llvm::MemoryBufferRef input,

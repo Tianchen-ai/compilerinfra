@@ -161,7 +161,7 @@ def host_config(host: str, library: str, workspace: str, output_dir: str):
         command="compilerinfra-agent",
         args=[
             "--library",
-            str(Path(library).resolve()),
+            str(Path(library).parent.resolve() / Path(library).name),
             "--workspace",
             str(Path(workspace).resolve()),
             "--output-dir",

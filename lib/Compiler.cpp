@@ -25,10 +25,8 @@ PassGroup PassGroup::required(BuildPasses build) {
 }
 
 PassGroup PassGroup::optimization(std::string name, BuildPasses build,
-                                  bool enabledByDefault, std::string point) {
-  PassGroup group(false, std::move(name), std::move(build), enabledByDefault);
-  group.point = std::move(point);
-  return group;
+                                  bool enabledByDefault) {
+  return PassGroup(false, std::move(name), std::move(build), enabledByDefault);
 }
 
 Compiler::Compiler(std::shared_ptr<const Definition> definition)

@@ -41,14 +41,12 @@ class PassGroup {
 public:
   static PassGroup required(BuildPasses build);
   static PassGroup optimization(std::string name, BuildPasses build,
-                                bool enabledByDefault = true,
-                                std::string point = {});
+                                bool enabledByDefault = true);
 
   bool isRequired() const { return requiredGroup; }
   llvm::StringRef name() const { return slot; }
   bool defaultEnabled() const { return enabled; }
   const BuildPasses &builder() const { return build; }
-  llvm::StringRef extensionPoint() const { return point; }
   const detail::DecisionProgram *decision() const { return program.get(); }
 
 private:
@@ -62,7 +60,6 @@ private:
   std::string slot;
   BuildPasses build;
   bool enabled;
-  std::string point;
 };
 
 struct Stage {
@@ -80,21 +77,8 @@ struct Target {
   BoundaryCheck verifyInput;
 };
 
-struct Optimization {
-  bool enabled = true;
-  BuildPasses replacement;
-  // Select this eligible sibling instead, at its own declared ordering
-  // position.
-  std::string useContribution;
-};
-using Optimizations = std::map<std::string, Optimization>;
-
 struct SessionOptions {
-  Optimizations optimizations;
   DecisionObserver observeDecision;
-  // Install native MLIR instrumentation/options at session construction.
-  std::function<llvm::Error(llvm::StringRef, mlir::PassManager &)>
-      configureStage;
 };
 
 class Session;

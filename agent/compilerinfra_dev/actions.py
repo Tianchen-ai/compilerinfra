@@ -146,6 +146,7 @@ class Catalog:
 
     def schemas(self):
         result = self.builtins.describe()["actions"]
+        variants = {}
         for key in self.scope.values:
             for name, entry in self.plugins(key)["actions"].items():
                 if name in self.builtins.actions:
@@ -157,10 +158,26 @@ class Catalog:
                     raise ValueError(
                         f"{name}: compiler is reserved for candidate selection"
                     )
-                schema["properties"]["compiler"] = {"type": "string", "default": "base"}
-                if name in result and result[name] != entry:
-                    raise ValueError(f"candidate action schemas differ for {name}")
-                result[name] = entry
+                selection = {"type": "string", "enum": [key]}
+                if key == self.scope.base_key:
+                    selection["enum"].append("base")
+                    selection["default"] = "base"
+                else:
+                    schema.setdefault("required", []).append("compiler")
+                schema["properties"]["compiler"] = selection
+                variants.setdefault(name, []).append(entry)
+        for name, entries in variants.items():
+            result[name] = (
+                entries[0]
+                if len(entries) == 1
+                else {
+                    "description": entries[0]["description"],
+                    "parameters": {
+                        "type": "object",
+                        "oneOf": [e["parameters"] for e in entries],
+                    },
+                }
+            )
         return result
 
     async def invoke(self, name, args):

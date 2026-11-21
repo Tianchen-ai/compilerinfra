@@ -338,7 +338,7 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         if (enabled)
           chosen.insert(id);
         stage.groups.push_back(
-            PassGroup::optimization(id, wrap(v.build), enabled, at));
+            PassGroup::optimization(id, wrap(v.build), enabled));
       }
       for (auto &[id, v] : c.families) {
         if (v.value.decideAt != at)

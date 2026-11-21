@@ -47,6 +47,7 @@ async def host(mcp):
             )
         elif mcp:
             from mcp.server import Server
+            from mcp.server.lowlevel.server import NotificationOptions
             from mcp.server.stdio import stdio_server
             from mcp.types import TextContent, Tool
 
@@ -66,12 +67,20 @@ async def host(mcp):
             @server.call_tool()
             async def call(name, arguments):
                 value = await invoke(name, arguments)
+                if name in {"derive", "adopt", "discard"}:
+                    await server.request_context.session.send_tool_list_changed()
                 return [
                     TextContent(type="text", text=json.dumps(value, ensure_ascii=False))
                 ]
 
             async with stdio_server() as (reader, writer):
-                await server.run(reader, writer, server.create_initialization_options())
+                await server.run(
+                    reader,
+                    writer,
+                    server.create_initialization_options(
+                        notification_options=NotificationOptions(tools_changed=True)
+                    ),
+                )
         else:
             for line in sys.stdin:
                 try:

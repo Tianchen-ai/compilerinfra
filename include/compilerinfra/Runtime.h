@@ -1,6 +1,9 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#if defined(__GNUC__)
+#pragma GCC visibility push(default)
+#endif
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +25,9 @@ const char *ci_compile(const ci_compiler *, const char *exit_name,
                        ci_buffer *output, ci_buffer *events_json);
 void ci_close(ci_compiler *);
 void ci_free(const void *);
+#if defined(__GNUC__)
+#pragma GCC visibility pop
+#endif
 #ifdef __cplusplus
 }
 #endif

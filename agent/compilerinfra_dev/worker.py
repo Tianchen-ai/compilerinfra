@@ -2,11 +2,15 @@
 
 import asyncio
 import multiprocessing
+import os
+import sys
 from compilerinfra import Compiler
 from .plugins import installed
 
 
 def serve(pipe, path, profile):
+    # Keep product diagnostics off the host's stdio protocol.
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     handles, catalogs = {}, {}
     try:
         while True:

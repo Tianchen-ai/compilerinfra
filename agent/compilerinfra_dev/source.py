@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from compilerinfra.tree import read, relative, write
 
 
@@ -139,9 +140,11 @@ def applied(roots, patches):
 
 
 @contextmanager
-def publish(stage, prefix, backup):
+def publish(stage, prefix, backup, library):
     """Replace installed files atomically and restore them if activation fails."""
     done = []
+    generation = None
+    previous_generation = None
     try:
         for src in sorted(stage.rglob("*")):
             if not src.is_file():
@@ -153,13 +156,22 @@ def publish(stage, prefix, backup):
             exists = dest.exists()
             if exists:
                 old.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, old)
-            import tempfile
+                shutil.copy2(dest, old, follow_symlinks=False)
 
             with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as tmp:
                 path = Path(tmp.name)
             try:
                 shutil.copy2(src, path)
+                if rel == library:
+                    # A previously dlopen'ed pathname can still resolve to the
+                    # old mapping in a long-lived JIT. Publish a fresh realpath.
+                    generation = path.with_name(f".{dest.name}.build-{path.name}")
+                    if dest.is_symlink() and dest.resolve().name.startswith(
+                        f".{dest.name}.build-"
+                    ):
+                        previous_generation = dest.resolve()
+                    os.replace(path, generation)
+                    path.symlink_to(generation.name)
                 os.replace(path, dest)
             finally:
                 path.unlink(missing_ok=True)
@@ -168,7 +180,12 @@ def publish(stage, prefix, backup):
     except BaseException:
         for dest, old in reversed(done):
             if old:
-                shutil.copy2(old, dest)
+                dest.unlink()
+                shutil.copy2(old, dest, follow_symlinks=False)
             else:
                 dest.unlink()
+        if generation:
+            generation.unlink(missing_ok=True)
         raise
+    if previous_generation:
+        previous_generation.unlink(missing_ok=True)
