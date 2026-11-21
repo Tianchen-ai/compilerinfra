@@ -1,5 +1,7 @@
 # 宿主与开发资产
 
+运行时代码随所属候选安装并逐文件核对摘要。Python JIT 与 worker 都可以调用 `compiler.runtime("owner", "binding.entry")` 取得模块。产品代码可用 `runtime.<owner>.<module>` 访问当前候选中的依赖。运行时之间的导入遵守与原生单元相同的祖先关系。
+
 runtime 宿主档提供 inspect、layout、compile。development 增加派生、解释、对比、影响查询、测量、采用与撤回，并提供脚手架、host-config、read-skill。compilerinfra-dev 的 actions 打印实际 JSON schema。未指定动作时，每行输入形如 `{"action":"layout","arguments":{"compiler":"base"}}`，响应带 result 或 error。开发会话持有返回的候选 ID。
 
 MCP 服务器为 compilerinfra-agent。host-config 接受 host、library、workspace、output_dir，返回 Codex 或 Claude 的 stdio 配置结构。DSH 适配位于 hosts/dsh，通过 MCP 读取同一目录与 skill。安装产品前，可以仅指定工作目录使用开发脚手架。

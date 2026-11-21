@@ -69,17 +69,17 @@ int main(int argc, char **argv) {
             ? ci_compile_trace(c.get(), get("--exit"), data.data(), data.size(),
                                get("--after"), get("--through"), text,
                                get("--root-sha256"), &output, &events)
-            : ci_compile(c.get(), get("--exit"), data.data(), data.size(),
-                         get("--after"), get("--through"), text, &output,
-                         nullptr);
+            : ci_compile_plain(c.get(), get("--exit"), data.data(), data.size(),
+                               get("--after"), get("--through"), text, &output,
+                               &events);
     if (failed(error)) {
-      if (explain && events.data)
+      if (events.data)
         std::cerr.write(static_cast<char *>(events.data), events.size) << '\n';
       ci_free(events.data);
       return 1;
     }
   }
-  if (explain && events.data)
+  if (events.data)
     std::cerr.write(static_cast<char *>(events.data), events.size) << '\n';
   ci_free(events.data);
   std::ofstream file;

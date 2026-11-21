@@ -45,6 +45,8 @@ def serve(pipe, path, profile):
                         args["source"] = handles[key].root_ir(args["source"])
                     try:
                         result = handles[key].compile(**args)
+                        if not args.get("explain"):
+                            result = (result, handles[key].last_compilation_id)
                     except CompilationError as exc:
                         result = (None, exc.report)
                 elif op == "catalog":

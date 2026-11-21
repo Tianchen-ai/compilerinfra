@@ -13,6 +13,7 @@ from compilerinfra.tree import provenance, relative, tree
 from .source import Snapshot, adoption_lock, applied, build
 from compilerinfra.installation import publish
 from .worker import Worker
+from compilerinfra.observations import Observations
 
 
 @dataclass
@@ -47,7 +48,7 @@ class Scope:
         self.library = (
             Path(library).parent.resolve() / Path(library).name if library else None
         )
-        self.observations = {}
+        self.observations = Observations()
         self.values = {}
         self.owned = {}
         self.base_key = None
@@ -96,16 +97,16 @@ class Scope:
     def check_fingerprint(desc, model):
         actual = provenance(model)
 
-        def frontend(layout):
+        def python_assets(layout):
             return {
                 a["path"]: a["sha256"]
                 for a in layout["assets"]
-                if a.get("kind") == "frontend"
+                if a.get("kind") in {"frontend", "runtime"}
             }
 
-        if frontend(desc) != frontend(model):
+        if python_assets(desc) != python_assets(model):
             raise ValueError(
-                "workspace frontend differs from the installed frontend manifest"
+                "workspace product modules differ from the installed manifest"
             )
         if actual != desc["fingerprint"]:
             raise ValueError(
@@ -136,6 +137,13 @@ class Scope:
         for name, registration in layout["components"].items():
             unit = layout["units"][registration["unit"]]
             package = unit["package"]
+            if registration["file"].startswith("@generated/"):
+                locations[name] = {
+                    "generated": True,
+                    "file": registration["file"],
+                    "line": registration["line"],
+                }
+                continue
             local = os.path.relpath(registration["file"], layout["packages"][package])
             locations[name] = {
                 "file": str(roots[package] / local),
@@ -252,10 +260,12 @@ class Scope:
             through=through,
             after=after,
             text=bool(through),
-            explain=True,
+            explain=self.profile == "development",
             root_sha256=root_sha256,
             author_input=author_input,
         )
+        if self.profile != "development":
+            return result
         artifact, report = result
         report["native_candidate"] = report["candidate"]
         report["candidate"] = key

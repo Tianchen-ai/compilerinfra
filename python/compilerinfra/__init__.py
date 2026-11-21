@@ -2,7 +2,8 @@
 
 import ctypes as C
 import json
-from .frontend import Frontend
+from .modules import ProductModules
+from .observations import Observations
 from pathlib import Path
 
 
@@ -34,6 +35,7 @@ class Library:
             "ci_close": (None, [ptr]),
             "ci_free": (None, [ptr]),
         }
+        signatures["ci_compile_plain"] = signatures["ci_compile"]
         signatures["ci_compile_trace"] = (
             ptr,
             [ptr, string, ptr, C.c_size_t, string, string, C.c_int, string, buf, buf],
@@ -45,8 +47,8 @@ class Library:
             raise ValueError(f"unsupported compiler ABI: {path}")
 
     def __del__(self):
-        if getattr(self, "frontend", None):
-            self.frontend.close()
+        if getattr(self, "modules", None):
+            self.modules.close()
 
     def check(self, error):
         if error:
@@ -65,7 +67,7 @@ class Library:
 class Compiler:
     def __init__(self, library, configuration=None):
         self.library = Library(library)
-        self.observations = {}
+        self.observations = Observations()
         self.last_compilation_id = None
         self.handle = C.c_void_p()
         self.library.check(
@@ -74,11 +76,11 @@ class Compiler:
             )
         )
 
-        self.library.frontend = Frontend(self.library.path, self.describe())
+        self.library.modules = ProductModules(self.library.path, self.describe())
 
     def derive(self, configuration):
         child = object.__new__(Compiler)
-        child.observations = {}
+        child.observations = Observations()
         child.last_compilation_id = None
         child.library, child.handle = self.library, C.c_void_p()
         self.library.check(
@@ -95,7 +97,11 @@ class Compiler:
 
     def root_ir(self, author_input):
         """Run the installed product's frontend and return root IR bytes."""
-        return self.library.frontend(author_input)
+        return self.library.modules(author_input)
+
+    def runtime(self, owner, module=""):
+        """Import a runtime module from this compiler installation."""
+        return self.library.modules.runtime(owner, module)
 
     def compile(
         self,
@@ -109,6 +115,23 @@ class Compiler:
         root_sha256=None,
     ):
         out, events = Buffer(), Buffer()
+        if not explain:
+            error = self.library.api.ci_compile_plain(
+                self.handle,
+                exit.encode(),
+                source,
+                len(source),
+                after and after.encode(),
+                through and through.encode(),
+                text,
+                C.byref(out),
+                C.byref(events),
+            )
+            self.last_compilation_id = (
+                self.library.take(events).decode() if events.data else None
+            )
+            self.library.check(error)
+            return self.library.take(out)
         error = self.library.api.ci_compile_trace(
             self.handle,
             exit.encode(),

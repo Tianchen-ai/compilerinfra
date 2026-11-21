@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <random>
@@ -26,8 +27,10 @@ struct ci_compiler {
   Compiler compiler;
   const std::string id = nextId();
   mutable std::mutex lock;
-  mutable std::map<std::pair<std::string, std::string>, std::set<std::string>>
-      checkpointRoots;
+  struct Checkpoint {
+    std::string boundary, digest, root;
+  };
+  mutable std::deque<Checkpoint> checkpointRoots;
 };
 
 static const char *error(llvm::Error e) {
@@ -139,17 +142,21 @@ const char *ci_describe(const ci_compiler *c, ci_buffer *out) {
 static const char *compile(const ci_compiler *c, const char *exit,
                            const void *input, size_t size, const char *after,
                            const char *through, int text, ci_buffer *out,
-                           ci_buffer *events, bool trace, const char *origin) {
+                           ci_buffer *events, bool trace, const char *origin,
+                           ci_buffer *idOut = nullptr) {
   if (!c || !exit || (!input && size) || !out)
     return ::strdup("invalid compilation arguments");
   llvm::json::Array log;
   auto id = nextId();
+  if (idOut)
+    *idOut = copy(id);
   auto hash = [](const void *p, size_t n) {
     return llvm::toHex(
         llvm::SHA256::hash(llvm::ArrayRef(static_cast<const uint8_t *>(p), n)),
         true);
   };
-  std::string inputHash = hash(input, size), root = inputHash;
+  std::string inputHash = trace ? hash(input, size) : std::string{},
+              root = inputHash;
   auto finish = [&](const char *failure) {
     if (events) {
       if (trace)
@@ -167,18 +174,21 @@ static const char *compile(const ci_compiler *c, const char *exit,
     }
     return failure;
   };
-  if (after) {
+  if (trace && after) {
     root.clear();
     std::lock_guard guard(c->lock);
-    auto it = c->checkpointRoots.find({after, inputHash});
+    std::set<std::string> known;
+    for (auto &cp : c->checkpointRoots)
+      if (cp.boundary == after && cp.digest == inputHash)
+        known.insert(cp.root);
     if (origin) {
       auto provided = llvm::StringRef(origin).lower();
       if (provided.size() != 64 || !llvm::all_of(provided, llvm::isHexDigit) ||
-          (it != c->checkpointRoots.end() && !it->second.count(provided)))
+          (!known.empty() && !known.count(provided)))
         return finish(::strdup("invalid root SHA-256 for checkpoint"));
       root = std::move(provided);
-    } else if (it != c->checkpointRoots.end() && it->second.size() == 1)
-      root = *it->second.begin();
+    } else if (known.size() == 1)
+      root = *known.begin();
     else if (trace)
       return finish(
           ::strdup("supply root_sha256 for external or ambiguous checkpoint"));
@@ -219,8 +229,10 @@ static const char *compile(const ci_compiler *c, const char *exit,
   *out = copy({bytes->data(), bytes->size()});
   if (through && !root.empty()) {
     std::lock_guard guard(c->lock);
-    c->checkpointRoots[{through, hash(bytes->data(), bytes->size())}].insert(
-        root);
+    if (c->checkpointRoots.size() == 128)
+      c->checkpointRoots.pop_front();
+    c->checkpointRoots.push_back(
+        {through, hash(bytes->data(), bytes->size()), root});
   }
   return finish(nullptr);
 }
@@ -230,6 +242,13 @@ const char *ci_compile(const ci_compiler *c, const char *exit,
                        ci_buffer *events) {
   return compile(c, exit, input, size, after, through, text, out, events, false,
                  nullptr);
+}
+const char *ci_compile_plain(const ci_compiler *c, const char *exit,
+                             const void *input, size_t size, const char *after,
+                             const char *through, int text, ci_buffer *out,
+                             ci_buffer *id) {
+  return compile(c, exit, input, size, after, through, text, out, nullptr,
+                 false, nullptr, id);
 }
 const char *ci_compile_trace(const ci_compiler *c, const char *exit,
                              const void *input, size_t size, const char *after,
