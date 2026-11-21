@@ -157,6 +157,7 @@ static const char *compile(const ci_compiler *c, const char *exit,
   };
   std::string inputHash = trace ? hash(input, size) : std::string{},
               root = inputHash;
+  std::string artifactHash;
   auto finish = [&](const char *failure) {
     if (events) {
       if (trace)
@@ -165,7 +166,7 @@ static const char *compile(const ci_compiler *c, const char *exit,
                                         {"error", failure ? failure : ""},
                                         {"exit", exit},
                                         {"root_sha256", root},
-                                        {"input_sha256", inputHash},
+                                        {"input_sha256", inputHash}, {"artifact_sha256", artifactHash},
                                         {"after", after ? after : ""},
                                         {"through", through ? through : ""},
                                         {"events", std::move(log)}}));
@@ -227,6 +228,7 @@ static const char *compile(const ci_compiler *c, const char *exit,
       range, text ? IRFormat::Assembly : IRFormat::Bytecode);
   if (!bytes)
     return finish(error(bytes.takeError()));
+  if (trace && !through) artifactHash=hash(bytes->data(),bytes->size());
   *out = copy({bytes->data(), bytes->size()});
   if (through && !root.empty()) {
     std::lock_guard guard(c->lock);

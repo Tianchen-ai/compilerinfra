@@ -34,11 +34,15 @@ public:
   const MachineFact *find(llvm::StringRef name) const;
 
 private:
+  llvm::Error insert(std::string name, MachineFact fact, llvm::StringRef kind);
   std::map<std::string, MachineFact> values;
 };
+struct TimeBound {
+  double ns;
+  std::string scope, comparison, proof;
+};
 struct ProvenInterval {
-  std::optional<double> lowerNs, upperNs;
-  std::string proof;
+  std::optional<TimeBound> lower, upper;
 };
 struct RowPrediction {
   std::map<std::string, Quantity> terms;
@@ -60,6 +64,7 @@ public:
   const MachineFact *fact(llvm::StringRef name, llvm::StringRef unit);
   llvm::Expected<CostEstimate> local(llvm::StringRef implementation);
   const std::map<std::string, std::string> &versions() const { return used; }
+  const llvm::json::Array &unitMismatches() const { return mismatches; }
   const std::vector<std::string> &missingFacts() const { return missing; }
   using Local = std::function<llvm::Expected<CostEstimate>(llvm::StringRef,
                                                            CostContext &)>;
@@ -70,6 +75,7 @@ private:
   Local callback;
   std::map<std::string, std::string> used;
   std::vector<std::string> missing;
+  llvm::json::Array mismatches;
   bool inLocal = false;
 };
 struct CostModel {

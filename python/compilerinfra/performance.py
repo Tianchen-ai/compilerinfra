@@ -31,15 +31,85 @@ def _top_k(values, k):
     }
 
 
+def _join_batch(batch, compilations, measured):
+    """Use the selected proposal in each actual compilation as the prediction side."""
+    expected = {}
+    for entry in compilations:
+        p = entry["prediction"]
+        cid, compiler = p["compilation_id"], p["compiler_candidate"]
+        if not all(isinstance(v, str) and v for v in (cid, compiler, p["exit"])):
+            raise ValueError("missing compiler or compilation identity")
+        if not re.fullmatch("[0-9a-f]{64}", p["artifact_sha256"]):
+            raise ValueError("invalid emitted artifact identity")
+        choices = [event["details"] for event in p["events"]
+                   if event["action"] == "candidate" and event["family"] == entry["family"] and event["details"]["selected"]]
+        if len(choices) != 1 or not choices[0]["rows"]:
+            raise ValueError("expected one realized candidate and its complete prediction row domain")
+        choice = choices[0]
+        for key, prediction in choice["rows"].items():
+            ident = (choice["candidate"], str(key))
+            if ident in expected:
+                raise ValueError(f"duplicate prediction {ident}")
+            expected[ident] = (cid, compiler, p["artifact_sha256"], prediction, choice["predicted_ns"])
+    seen = set()
+    joined = []
+    for row in measured:
+        ident = (row["candidate"], str(row["row_id"]))
+        if ident in seen or ident not in expected:
+            raise ValueError(f"unexpected or repeated measured row {ident}")
+        seen.add(ident)
+        cid, compiler, digest, pred, ns = expected[ident]
+        if (row["compilation_id"], row["compiler_candidate"]) != (cid, compiler):
+            raise ValueError(f"{ident}: compilation or candidate identity mismatch")
+        if row["artifact_sha256"] != digest:
+            raise ValueError(f"{ident}: measured artifact differs from emitted artifact")
+        joined.append(dict(row, terms=pred["terms"], predicted_ns=pred["predicted_ns"], structure_ns=ns))
+    if expected.keys() - seen:
+        raise ValueError(f"missing measured rows {sorted(expected.keys()-seen)}")
+    return joined
+
+
 def accuracy(document, k=1):
-    """Evaluate per-structure batch latency. Bench supplies every row and its winner."""
-    if document.get("version") != 1 or not isinstance(document.get("rows"), list):
-        raise ValueError("expected version 1 of the cost record with a rows array")
+    """Score only complete batches paired with independent compiler reports."""
+    if document.get("version") != 2:
+        raise ValueError("cost records require version 2 with compilation predictions")
     if type(k) is not int or k <= 0:
-        raise ValueError("k must be a positive integer")
+        raise ValueError("k must be positive")
+    grouped = defaultdict(list)
+    predictions = defaultdict(list)
+    ids = {}
+    conflicts = set()
+    for e in document["compilations"]:
+        predictions[e["batch"]].append(e)
+        p = e["prediction"]
+        cid = p.get("compilation_id")
+        if cid in ids and ids[cid] != p:
+            conflicts.add(cid)
+        ids[cid] = p
+    for row in document["rows"]:
+        grouped[row["batch"]].append(row)
+    accepted, excluded = [], []
+    for batch in sorted(predictions.keys() | grouped.keys()):
+        try:
+            if not predictions[batch] or not grouped[batch]:
+                raise ValueError("batch lacks predictions or measurements")
+            if any(e["prediction"].get("compilation_id") in conflicts for e in predictions[batch]):
+                raise ValueError("conflicting records for compilation ID")
+            inputs = {(e["prediction"]["root_sha256"], e["prediction"]["exit"]) for e in predictions[batch]}
+            if len(inputs)!=1:
+                raise ValueError("batch mixes inputs or exits")
+            rows = _join_batch(batch, predictions[batch], grouped[batch])
+            _score(rows, k)
+            accepted.extend(rows)
+        except (ValueError, TypeError, KeyError) as error:
+            excluded.append({"batch":batch, "reason":str(error)})
+    return dict(_score(accepted, k), excluded=excluded)
+
+
+def _score(measurements, k):
     batches = defaultdict(lambda: defaultdict(dict))
     batch_splits = {}
-    for row in document["rows"]:
+    for row in measurements:
         batch, split, candidate, row_id = (
             row[n] for n in ("batch", "split", "candidate", "row_id")
         )

@@ -345,7 +345,11 @@ class Scope:
                 raise ValueError(
                     "measurement needs a successful compilation of the selected candidate"
                 )
+            if not report["artifact_sha256"]:
+                raise ValueError("measurement requires a final emitted artifact")
             request["prediction"] = {
+                "compiler_candidate": key,
+                "artifact_sha256": report["artifact_sha256"],
                 "compilation_id": compilation_id,
                 "root_sha256": report["root_sha256"],
                 "exit": report["exit"],

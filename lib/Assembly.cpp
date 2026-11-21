@@ -110,6 +110,10 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
     c.strategies.emplace(id, Located<Strategy>{v, s});
   }
   for (auto &[v, s] : u.costModels) {
+    auto prefix=field(*units.getObject(u.id),"directory")+"/cost/";
+    llvm::SmallString<128> path(s.file);
+    llvm::sys::path::remove_dots(path,true);
+    if(!llvm::StringRef(path).starts_with(prefix))return createStringError(u.id+": cost model must register from "+prefix+"; got "+s.file);
     auto id = u.qualify(v.name);
     if (!v.estimate || v.version.empty())
       return createStringError(id + ": missing estimator or version");
@@ -392,6 +396,11 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
          owner(*entry) != owner(*c.catalog.getObject(model.value.family))))
       return createStringError(
           id + ": structural model must belong to its decision node");
+  }
+  for(const auto &[id,s]:c.strategies) {
+    auto f=c.families.find(s.value.family);
+    if(s.value.enumerate && f!=c.families.end() && !f->second.value.family.verifyCandidate)
+      return createStringError(id+": enumerating strategies require verifyCandidate on "+s.value.family);
   }
   if (auto e = attach(c.strategies))
     return std::move(e);
