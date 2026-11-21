@@ -143,7 +143,8 @@ static const char *compile(const ci_compiler *c, const char *exit,
                            const void *input, size_t size, const char *after,
                            const char *through, int text, ci_buffer *out,
                            ci_buffer *events, bool trace, const char *origin,
-                           ci_buffer *idOut = nullptr, bool package = false) {
+                           ci_buffer *idOut = nullptr, bool package = false,
+                           ci_buffer *receipt = nullptr) {
   if (!c || !exit || (!input && size) || !out)
     return ::strdup("invalid compilation arguments");
   llvm::json::Array log;
@@ -244,6 +245,10 @@ static const char *compile(const ci_compiler *c, const char *exit,
                            {"value", e.value},
                            {"details", Object(e.details)}});
     };
+  if (receipt)
+    opts.publishSelection = [&](llvm::StringRef family, llvm::StringRef structure) {
+      decisions.push_back(Object{{"family",family},{"structure",structure}});
+    };
   auto session = c->compiler.open(exit, opts);
   if (!session)
     return finish(error(session.takeError()));
@@ -258,6 +263,8 @@ static const char *compile(const ci_compiler *c, const char *exit,
       range, text ? IRFormat::Assembly : IRFormat::Bytecode);
   if (!bytes)
     return finish(error(bytes.takeError()));
+  if (receipt) *receipt = copy(serialize(Object{{"compilation_id", id}, {"compiler_candidate", c->id},
+                                                {"decisions", llvm::json::Array(decisions)}}));
   if (trace && !through) artifactHash=hash(bytes->data(),bytes->size());
   if (package && !through) {
     auto header = serialize(Object{{"compilation_id", id}, {"compiler_candidate", c->id},
@@ -293,6 +300,10 @@ const char *ci_compile_plain(const ci_compiler *c, const char *exit,
                              ci_buffer *id) {
   return compile(c, exit, input, size, after, through, text, out, nullptr,
                  false, nullptr, id);
+}
+const char *ci_compile_runtime(const ci_compiler *c, const char *exit,
+                               const void *input, size_t size, ci_buffer *out, ci_buffer *receipt) {
+  return compile(c,exit,input,size,nullptr,nullptr,false,out,nullptr,false,nullptr,nullptr,false,receipt);
 }
 const char *ci_compile_measured(const ci_compiler *c, const char *exit,
                                const void *input, size_t size,

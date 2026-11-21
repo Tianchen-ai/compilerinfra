@@ -70,6 +70,8 @@ struct DecisionEvent {
   llvm::json::Object details;
 };
 using DecisionObserver = std::function<void(const DecisionEvent &)>;
+// Publish the chosen structural ID without constructing explain events.
+using SelectionSink = std::function<void(llvm::StringRef, llvm::StringRef)>;
 
 namespace detail {
 struct DecisionProgram;

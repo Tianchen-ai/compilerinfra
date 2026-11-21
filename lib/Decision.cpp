@@ -28,8 +28,8 @@ class DecisionPass final
                                mlir::OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DecisionPass)
-  DecisionPass(DecisionProgram program, DecisionObserver observe)
-      : program(std::move(program)), observe(std::move(observe)) {}
+  DecisionPass(DecisionProgram program, DecisionObserver observe, SelectionSink publish)
+      : program(std::move(program)), observe(std::move(observe)), publish(std::move(publish)) {}
   llvm::StringRef getArgument() const final {
     return program.materialize ? "ci-materialize" : "ci-decide";
   }
@@ -90,6 +90,7 @@ private:
       if (family().read(op) != decision->value)
         return op->emitError("decision carrier lost selected candidate");
       rootAnalyses.invalidate({});
+      if (publish) publish(family().name, decision->structure);
       report(op, "selected", decision->strategy, decision->value);
       return mlir::success();
     }
@@ -202,13 +203,14 @@ private:
   }
   DecisionProgram program;
   DecisionObserver observe;
+  SelectionSink publish;
 };
 } // namespace
 
-BuildPasses DecisionProgram::builder(DecisionObserver observe) const {
-  return [program = *this, observe = std::move(observe)](
+BuildPasses DecisionProgram::builder(DecisionObserver observe, SelectionSink publish) const {
+  return [program = *this, observe = std::move(observe), publish = std::move(publish)](
              mlir::OpPassManager &pm) -> llvm::Error {
-    pm.addPass(std::make_unique<DecisionPass>(program, observe));
+    pm.addPass(std::make_unique<DecisionPass>(program, observe, publish));
     return llvm::Error::success();
   };
 }

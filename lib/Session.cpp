@@ -196,8 +196,8 @@ Session::create(std::shared_ptr<const Compiler::Definition> definition,
       }
       const BuildPasses *build = &group.builder();
       BuildPasses observed;
-      if (group.decision() && options.observeDecision) {
-        observed = group.decision()->builder(options.observeDecision);
+      if (group.decision() && (options.observeDecision || options.publishSelection)) {
+        observed = group.decision()->builder(options.observeDecision, options.publishSelection);
         build = &observed;
       }
       if (group.defaultEnabled())

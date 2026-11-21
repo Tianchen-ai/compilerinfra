@@ -80,6 +80,7 @@ struct Exit {
 
 struct SessionOptions {
   DecisionObserver observeDecision;
+  SelectionSink publishSelection;
   std::function<void(llvm::StringRef, llvm::StringRef, bool, bool)>
       observeContribution;
 };

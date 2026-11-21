@@ -13,11 +13,12 @@ struct DecisionProgram {
   DecisionChoice choice;
   bool materialize;
   llvm::Error validate() const;
-  BuildPasses builder(DecisionObserver observe = {}) const;
+  BuildPasses builder(DecisionObserver observe = {}, SelectionSink publish = {}) const;
 };
 struct RankedDecision {
   std::string strategy;
   mlir::Attribute value;
+  std::string structure;
 };
 using CandidateObserver =
     std::function<void(llvm::StringRef, mlir::Attribute, llvm::json::Object)>;

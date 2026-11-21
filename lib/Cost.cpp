@@ -315,5 +315,6 @@ compilerinfra::detail::rankCandidates(const DecisionProgram &p,
         why += "; " + r.proposal.id + ": " + r.reason;
     return createStringError(table.family.name + ": " + why);
   }
-  return RankedDecision{rows[selected].strategy, rows[selected].proposal.value};
+  return RankedDecision{rows[selected].strategy, rows[selected].proposal.value,
+                        rows[selected].proposal.id};
 }
