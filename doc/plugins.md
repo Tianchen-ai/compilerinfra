@@ -27,7 +27,8 @@ Linux 的原生研发工具可以链接 `CompilerInfra::Development`，通过 `D
 
 ```json
 {
-  "plugins": ["plugins/blocks/plugin.json"],
+  "compilerinfra": "0.2",
+  "plugins": ["dialect/blocks/plugin.json"],
   "build": {
     "target": "product-opt",
     "driver": "bin/product-opt",

@@ -1,4 +1,4 @@
-# compilerinfra
+# CompilerInfra v0.2
 
 compilerinfra 是为 coding agent 设计的可派生 MLIR 编译器框架。给一台已链接的 `Compiler` 一个作者程序，它生成目标产物。给同一台编译器一项策略、实现或源码改动，它派生出另一台完整的编译器。父、子可以同时编译同一输入，也可以继续派生。接受的改动进入产品源码和默认组合，后续普通 JIT 会使用它。
 
@@ -27,7 +27,8 @@ cmake --install build
 | --- | --- |
 | [框架设计](doc/foundation.md) | 加法式扩展、框架掌握的生命周期、agent 与 Bench 的合作方式 |
 | [框架接口](doc/framework.md) | 产品装配、JIT、阶段边界、优化控制、驱动参数和对象寿命 |
+| [v0.2 产品目录与依赖](doc/organization.md) | 产品源码分层、MLIR 交接和结构查询 |
 | [仓库组织](doc/workspace.md) | 母仓代码、四个独立子仓、文档和临时工作区 |
 | [开发原则](AGENTS.md) | 代码结构、错误处理、少量针对性验证及性能口径 |
 
-IntentDSL 是首个接入产品。在其独立子仓中，`product.json` 将 KIR、Block、CPU、DSA 和 provider 组件链接到命令行与 Python JIT。Triton–Weft 作为另一台编译器独立接入。两者分别使用 IntentDSL Bench 和 Triton–Weft Bench 检查数值与测量性能。[工作区约定](doc/workspace.md)
+IntentDSL 在独立产品仓采用 v0.2 目录合同。实际启用的模型、转换和目标由该产品的 driver 查询。[工作区约定](doc/workspace.md)

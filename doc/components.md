@@ -26,7 +26,7 @@
 
 产品通过 `find_package(CompilerInfra CONFIG REQUIRED)` 或 `add_subdirectory` 获得以下 CMake 函数。
 
-1. `compilerinfra_add_component(TARGET ENTRY FUNCTION SOURCES ... [LINK_LIBRARIES ...] [REGISTER_PASSES FUNCTION])`。组件实现 `void compilerinfra_components::FUNCTION(compilerinfra::Assembly &)`，声明与依赖留在对应源码旁。可选的原生 pass 登记函数签名为 `void compilerinfra_components::FUNCTION()`，供文本替换等 MLIR 操作使用。
+1. `compilerinfra_add_component(TARGET LAYER dialect ENTRY FUNCTION SOURCES ... [LINK_LIBRARIES ...] [REGISTER_PASSES FUNCTION])`。组件实现 `void compilerinfra_components::FUNCTION(compilerinfra::Assembly &)`，声明与依赖留在对应源码旁。可选的原生 pass 登记函数签名为 `void compilerinfra_components::FUNCTION()`，供文本替换等 MLIR 操作使用。
 2. `compilerinfra_assemble(BUNDLE PRODUCT product.json COMPONENTS ...)` 读取产品插件选择和默认 preset，生成静态强引用与头文件 `<BUNDLE/Components.h>`。也可直接指定 `PLUGINS` 和 `PRESET`。产品 JIT 调用 `BUNDLE::registerComponents(assembly)`，再由 `BUNDLE::link(assembly, importer, inputModel)` 应用与产品驱动相同的内置默认值。需要 MLIR 全局 pass 名称时调用 `BUNDLE::registerPasses()`。打包为产品 SDK 时可将 bundle 的 `PUBLIC_HEADER` 安装到 `include/BUNDLE/`。
 3. 原生 MLIR 输入的工具可以直接使用 `compilerinfra_add_driver(TOOL ASSEMBLY BUNDLE INPUT_MODEL MODEL)`。使用自有语言前端或产品专用命令行选项时，由产品提供 importer，仍使用同一个 bundle、`Assembly::link` 和 `driverMain`。组件需要运行时配置时，可在 JIT 装配组合时用普通 C++ 注册捕获产品配置的 provider。
 

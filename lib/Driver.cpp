@@ -24,6 +24,7 @@ struct DriverOptions {
   cl::list<std::string> against{
       "against-preset",
       cl::desc("Compare this compiler with its derived preset (repeatable)")};
+  cl::opt<bool> layout{"layout", cl::desc("Show linked source layers, units and dependencies")};
   cl::opt<bool> explain{
       "explain",
       cl::desc("Report observed IR decisions for this compilation as JSON")};
@@ -184,7 +185,7 @@ llvm::Expected<Compiler> deriveFile(const Compiler &compiler,
 }
 llvm::Error run(const DriverOptions &cmd, const Compiler &compiler,
                 const Compiler &root) {
-  unsigned queries = unsigned(cmd.list) + unsigned(cmd.components) +
+  unsigned queries = unsigned(cmd.layout) + unsigned(cmd.list) + unsigned(cmd.components) +
                      cmd.impact.getNumOccurrences() +
                      cmd.plan.getNumOccurrences();
   if (queries) {
@@ -196,7 +197,9 @@ llvm::Error run(const DriverOptions &cmd, const Compiler &compiler,
         !cmd.disable.empty() || !cmd.replace.empty())
       return createStringError(
           "use a single declaration query without execution options");
-    if (cmd.list) {
+    if (cmd.layout) {
+      llvm::outs() << llvm::formatv("{0:2}\n", compiler.layout());
+    } else if (cmd.list) {
       printCatalog(compiler);
     } else if (cmd.components) {
       llvm::outs() << llvm::formatv("{0:2}\n", compiler.components());

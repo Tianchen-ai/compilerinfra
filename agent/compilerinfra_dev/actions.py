@@ -62,6 +62,12 @@ def catalog(scope):
         ]
 
     @actions.action
+    async def layout(compiler: str = "base") -> dict[str, Any]:
+        """Locate linked units and their permitted dependency directions."""
+        async with scope.use(compiler) as bound:
+            return await bound.query("--layout")
+
+    @actions.action
     async def plan(target: str, compiler: str = "base") -> dict[str, Any]:
         """Inspect the actual route, strategies, realizers and optimization slots."""
         async with scope.use(compiler) as c:

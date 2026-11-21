@@ -117,7 +117,20 @@ AssemblyLinker::collect(llvm::StringRef kind,
           "component needs a name and a source location: " + id);
     if (!names.emplace(name, &item.value).second)
       return invalid(id, "also declared at " + location(item.source));
-    index->entries.emplace(id, detail::Entry{item.source, {}, {}});
+    std::string layer;
+    if (auto *units = index->layout.getObject("components")) {
+      auto *owner = units->getObject(item.source.component);
+      if (!owner)
+        return createStringError(id + ": no build component owns " + location(item.source));
+      layer = owner->getString("layer")->str();
+      if ((kind == "model" && layer != "dialect") ||
+          (kind == "lowering" && layer != "conversion") ||
+          (kind == "optimization" && layer != "strategy") ||
+          ((kind == "provider" || kind == "route") && layer != "target") ||
+          layer == "runtime")
+        return createStringError(id + ": invalid registration in " + layer + " at " + location(item.source));
+    }
+    index->entries.emplace(id, detail::Entry{item.source, std::move(layer), {}, {}});
   }
   return llvm::Error::success();
 }
@@ -424,6 +437,7 @@ llvm::Expected<Target> AssemblyLinker::makeTarget(const Provider &provider,
 
 llvm::Expected<Compiler> AssemblyLinker::run(Import importer,
                                              llvm::StringRef input) {
+  index->layout = llvm::json::Object(assembly.layout);
   if (auto error = validate(input.str()))
     return error;
   std::vector<Target> targets;

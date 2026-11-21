@@ -26,4 +26,4 @@ compilerinfra/                     基座主仓
 
 **本地工作与入库内容分开。** 基座设计的草案和审阅可以在 `.work/<任务>/` 反复修改。决定保留的内容，按归属进入母仓的 `doc/` 或相应子仓。Bench 运行产生的 IR、日志、性能数据留在发起运行的 Bench 输出目录。
 
-IntentDSL 的迁移源码位于独立子仓 `projects/intentdsl/`。其 `product.json` 选择插件，`plugins/default.json` 选择产品默认策略。测量使用执行机上已有的 IntentDSL Bench。母仓 Git 忽略 `projects/` 和 `.work/`，单独克隆母仓只会取得基座文件。
+子仓的目录层级、模型交接与依赖规则见 [v0.2 产品组织](organization.md)。母仓 Git 忽略 `projects/` 和 `.work/`。

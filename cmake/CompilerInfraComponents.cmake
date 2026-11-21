@@ -1,15 +1,22 @@
 include_guard(GLOBAL)
 include(GNUInstallDirs)
+include("${CMAKE_CURRENT_LIST_DIR}/CompilerInfraLayout.cmake")
 
 # Entry functions have the signature void compilerinfra_components::NAME(Assembly&).
 function(compilerinfra_add_component name)
-  cmake_parse_arguments(PARSE_ARGV 1 ARG "" "ENTRY;REGISTER_PASSES" "SOURCES;LINK_LIBRARIES")
+  cmake_parse_arguments(PARSE_ARGV 1 ARG "" "ENTRY;REGISTER_PASSES;LAYER" "SOURCES;LINK_LIBRARIES")
+  if(ARG_LAYER STREQUAL "runtime" AND NOT ARG_ENTRY)
+    set(ARG_ENTRY "_")
+  endif()
   if(ARG_UNPARSED_ARGUMENTS OR NOT ARG_SOURCES OR NOT ARG_ENTRY MATCHES "^[A-Za-z_][A-Za-z_0-9]*$")
     message(FATAL_ERROR "compilerinfra_add_component needs ENTRY <C++ identifier> and SOURCES")
   endif()
+  _compilerinfra_owner("${name}" "${ARG_LAYER}" owner)
+  _compilerinfra_check_sources("${name}" "${owner}" ${ARG_SOURCES})
   add_library(${name} STATIC ${ARG_SOURCES})
   set_target_properties(${name} PROPERTIES COMPILERINFRA_ENTRY "${ARG_ENTRY}"
-    EXPORT_PROPERTIES COMPILERINFRA_ENTRY
+    COMPILERINFRA_LAYER "${ARG_LAYER}" COMPILERINFRA_DIRECTORY "${owner}"
+    EXPORT_PROPERTIES "COMPILERINFRA_ENTRY;COMPILERINFRA_LAYER;COMPILERINFRA_DIRECTORY"
     POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(${name} PUBLIC CompilerInfra::Core PRIVATE ${ARG_LINK_LIBRARIES})
   target_compile_definitions(${name} PRIVATE "COMPILERINFRA_COMPONENT_NAME=\"${name}\"")
@@ -69,6 +76,12 @@ function(compilerinfra_assemble name)
     get_filename_component(product_dir "${product}" DIRECTORY)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${product}")
     file(READ "${product}" config)
+    _compilerinfra_policy(policy)
+    string(JSON expected GET "${policy}" version)
+    string(JSON version ERROR_VARIABLE missing_version GET "${config}" compilerinfra)
+    if(missing_version OR NOT version STREQUAL expected)
+      message(FATAL_ERROR "${product}: expected compilerinfra=${expected}; see doc/organization.md")
+    endif()
     string(JSON count ERROR_VARIABLE error LENGTH "${config}" plugins)
     if(NOT error AND count GREATER 0)
       math(EXPR last "${count}-1")
@@ -95,7 +108,9 @@ function(compilerinfra_assemble name)
     list(APPEND plugins "${id}")
     _compilerinfra_plugin_strings(deps "${plugin_json}" dependencies "${descriptor}")
     set("deps_${id}" "${deps}")
+    set("descriptor_${id}" "${descriptor}")
     _compilerinfra_plugin_strings(native_components "${plugin_json}" native "${descriptor}")
+    set("native_${id}" "${native_components}")
     list(APPEND ARG_COMPONENTS ${native_components})
   endforeach()
   set(pending "${plugins}")
@@ -116,6 +131,26 @@ function(compilerinfra_assemble name)
         endif()
       endforeach()
       if(NOT deps)
+        if(native_${id})
+          get_filename_component(unit_dir "${descriptor_${id}}" DIRECTORY)
+          file(RELATIVE_PATH unit "${PROJECT_SOURCE_DIR}" "${unit_dir}")
+          if(NOT unit MATCHES "^[a-z]+/[a-z][a-z0-9_-]*$")
+            message(FATAL_ERROR "${descriptor_${id}}: native descriptor must live at <layer>/<unit>/plugin.json")
+          endif()
+          list(GET native_${id} 0 first_target)
+          if(NOT TARGET "${first_target}")
+            add_subdirectory("${unit_dir}" "${PROJECT_BINARY_DIR}/${unit}")
+          endif()
+          foreach(member IN LISTS native_${id})
+            if(NOT TARGET "${member}")
+              message(FATAL_ERROR "${descriptor_${id}}: missing native component ${member}")
+            endif()
+            get_target_property(directory "${member}" COMPILERINFRA_DIRECTORY)
+            if(NOT unit STREQUAL directory)
+              message(FATAL_ERROR "${descriptor_${id}}: ${member} belongs to ${directory}")
+            endif()
+          endforeach()
+        endif()
         list(REMOVE_ITEM pending "${id}")
       endif()
     endforeach()
@@ -126,6 +161,8 @@ function(compilerinfra_assemble name)
   if(ARG_UNPARSED_ARGUMENTS OR NOT ARG_COMPONENTS OR NOT name MATCHES "^[A-Za-z_][A-Za-z_0-9]*$")
     message(FATAL_ERROR "compilerinfra_assemble needs a C++ identifier and COMPONENTS")
   endif()
+  _compilerinfra_policy(layout)
+  string(JSON layout SET "${layout}" components "{}")
   set(entries "")
   set(declarations "")
   set(calls "")
@@ -134,7 +171,23 @@ function(compilerinfra_assemble name)
     if(NOT TARGET ${component})
       message(FATAL_ERROR "Unknown compilerinfra component ${component}")
     endif()
+    get_target_property(layer ${component} COMPILERINFRA_LAYER)
+    get_target_property(owner ${component} COMPILERINFRA_DIRECTORY)
+    if(NOT layer OR NOT owner)
+      message(FATAL_ERROR "${component}: missing v0.2 component ownership")
+    endif()
+    _compilerinfra_dependencies("${component}" "${ARG_COMPONENTS}" dependencies)
+    set(edges "[]")
+    foreach(dep IN LISTS dependencies)
+      string(JSON n LENGTH "${edges}")
+      string(JSON edges SET "${edges}" ${n} "\"${dep}\"")
+    endforeach()
+    string(JSON layout SET "${layout}" components "${component}"
+      "{\"layer\":\"${layer}\",\"directory\":\"${owner}\",\"dependencies\":${edges}}")
     get_target_property(entry ${component} COMPILERINFRA_ENTRY)
+    if(entry STREQUAL "_" AND layer STREQUAL "runtime")
+      continue()
+    endif()
     if(NOT entry OR entry IN_LIST entries)
       message(FATAL_ERROR "Missing or duplicate entry for component ${component}: ${entry}")
     endif()
@@ -167,6 +220,8 @@ void registerPasses();
 llvm::Expected<compilerinfra::Compiler> link(compilerinfra::Assembly &, compilerinfra::Import, llvm::StringRef);
 }
 ")
+  string(HEX "${layout}" layout_hex)
+  string(REGEX REPLACE "(..)" "0x\\1," layout_bytes "${layout_hex}")
   file(GENERATE OUTPUT "${root}/Components.cpp" CONTENT
 "#include \"${header}\"
 #include <compilerinfra/Assembly.h>
@@ -177,6 +232,10 @@ ${calls}}
 void ${name}::registerPasses() {
 ${pass_calls}}
 llvm::Expected<compilerinfra::Compiler> ${name}::link(compilerinfra::Assembly &a, compilerinfra::Import importer, llvm::StringRef model) {
+  static const unsigned char organization[] = {${layout_bytes}0};
+  auto layout = llvm::json::parse(llvm::StringRef(reinterpret_cast<const char*>(organization),sizeof(organization)-1));
+  if (!layout) return layout.takeError();
+  a.setLayout(std::move(*layout->getAsObject()));
   static const unsigned char defaults[] = {${preset_bytes}0};
   auto v=llvm::json::parse(llvm::StringRef(reinterpret_cast<const char*>(defaults),sizeof(defaults)-1));
   if(!v)return v.takeError();

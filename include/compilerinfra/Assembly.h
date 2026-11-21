@@ -120,6 +120,7 @@ struct Provider {
 // no device discovery, pass construction, compilation, or artifact I/O.
 class Assembly {
 public:
+  void setLayout(llvm::json::Object owners) { layout = std::move(owners); }
   void add(Model model, SourceRef source);
   void add(Lowering lowering, SourceRef source);
   void add(Route route, SourceRef source);
@@ -135,6 +136,7 @@ public:
                                 const CompilerPreset &preset) const;
 
 private:
+  llvm::json::Object layout;
   template <typename T> struct Located {
     T value;
     SourceRef source;

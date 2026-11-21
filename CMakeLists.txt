@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CompilerInfra LANGUAGES C CXX)
+project(CompilerInfra VERSION 0.2.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -59,5 +59,9 @@ install(TARGETS CompilerInfraCore CompilerInfraDriver ${development_target} EXPO
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(DIRECTORY include/compilerinfra DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/CompilerInfraConfigVersion.cmake"
+  VERSION "${PROJECT_VERSION}" COMPATIBILITY SameMinorVersion)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/CompilerInfraConfigVersion.cmake"
+  cmake/CompilerInfraLayout.cmake cmake/product-layout.json DESTINATION "${config_dir}")
 install(EXPORT CompilerInfraTargets NAMESPACE CompilerInfra:: DESTINATION "${config_dir}")
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/CompilerInfraConfig.cmake" cmake/CompilerInfraComponents.cmake DESTINATION "${config_dir}")

@@ -5,13 +5,17 @@ using namespace compilerinfra;
 namespace {
 llvm::json::Object describe(const std::string &id, const detail::Entry &entry) {
   return llvm::json::Object{
-      {"id", id},
+      {"id", id}, {"layer", entry.layer},
       {"source", llvm::json::Object{{"file", entry.source.file},
                                     {"component", entry.source.component},
                                     {"line", entry.source.line}}},
       {"declaration", llvm::json::Object(entry.declaration)}};
 }
 } // namespace
+
+llvm::json::Value Compiler::layout() const {
+  return definition->index ? llvm::json::Object(definition->index->layout) : llvm::json::Object{};
+}
 
 llvm::json::Value Compiler::components() const {
   llvm::json::Array components;

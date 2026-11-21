@@ -60,6 +60,10 @@ def main():
 def cli():
     """Persistent JSON-lines CLI. Each request names one of the MCP actions."""
 
+    if sys.argv[1:2] == ["check"]:
+        from compilerinfra_dev.check import main as check
+        return check(sys.argv[2:])
+
     async def run():
         scope = Scope(*options())
         try:

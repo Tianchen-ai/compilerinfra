@@ -120,6 +120,7 @@ public:
   }
   // Static queries use the very same routes and optional slots as open().
   llvm::json::Value components() const;
+  llvm::json::Value layout() const;
   llvm::Expected<llvm::json::Value> impact(llvm::StringRef component) const;
   llvm::Expected<llvm::json::Value> plan(llvm::StringRef target) const;
   // Assembly-linked products name the model carried by each boundary.
