@@ -60,8 +60,8 @@ struct Session::Impl {
   std::vector<std::pair<std::string, size_t>> overrides;
 
   llvm::Expected<size_t> past(llvm::StringRef name) const {
-    if (name == "input")
-      return 0;
+    if (!name.contains('@'))
+      return createStringError("expected node@boundary, got " + name);
     for (size_t i = 0; i < stages.size(); ++i)
       if (stages[i].spec.name == name)
         return i + 1;

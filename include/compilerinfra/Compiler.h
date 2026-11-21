@@ -55,7 +55,7 @@ public:
   const detail::DecisionProgram *decision() const { return program.get(); }
 
 private:
-  friend class AssemblyLinker;
+  friend class Assembly;
   friend class Compiler;
   static PassGroup forDecision(detail::DecisionProgram program);
   std::shared_ptr<const detail::DecisionProgram> program;
@@ -109,23 +109,13 @@ using Artifact = llvm::SmallVector<char, 0>;
 // Construct once per product configuration. Callbacks own their captures.
 class Compiler {
 public:
-  static llvm::Expected<Compiler> create(Frontend frontend,
-                                         std::vector<Target> targets);
   llvm::ArrayRef<Target> targets() const;
-  llvm::Expected<Compiler> derive(const CompilerPreset &changes) const;
   llvm::Expected<Artifact> compile(llvm::StringRef target,
                                    llvm::MemoryBufferRef input) const;
   bool sharesInputWith(const Compiler &other) const {
     return definition->origin == other.definition->origin;
   }
-  // Static queries use the very same routes and optional slots as open().
-  llvm::json::Value components() const;
-  llvm::json::Value layout() const;
-  llvm::Expected<llvm::json::Value> impact(llvm::StringRef component) const;
-  llvm::Expected<llvm::json::Value> plan(llvm::StringRef target) const;
-  // Assembly-linked products name the model carried by each boundary.
-  llvm::Expected<llvm::StringRef> boundaryModel(llvm::StringRef target,
-                                                llvm::StringRef boundary) const;
+  const llvm::json::Object &describe() const { return definition->description; }
 
   llvm::Expected<std::unique_ptr<Session>>
   open(llvm::StringRef target, const SessionOptions &options = {}) const;
@@ -138,17 +128,14 @@ public:
 private:
   friend class Session;
   friend class Assembly;
-  friend class AssemblyLinker;
+  friend class Assembly;
   static llvm::Expected<Compiler>
   create(Frontend frontend, std::vector<Target> targets,
-         std::shared_ptr<const detail::ComponentIndex> index);
+         llvm::json::Object description);
   struct Definition {
     Frontend frontend;
     std::vector<Target> targets;
-    std::shared_ptr<const detail::ComponentIndex> index;
-    std::shared_ptr<const Assembly> assembly;
-    std::string inputModel;
-    CompilerPreset preset;
+    llvm::json::Object description;
     std::shared_ptr<const char> origin = std::make_shared<const char>(0);
   };
   explicit Compiler(std::shared_ptr<const Definition> definition);

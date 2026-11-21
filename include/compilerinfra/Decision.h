@@ -22,16 +22,6 @@ struct DecisionChoice {
 };
 using DecisionChoices = std::map<std::string, DecisionChoice>;
 
-struct TargetPreset {
-  std::map<std::string, bool> optimizations;
-  DecisionChoices decisions;
-  std::optional<std::string> route;
-  llvm::json::Object
-      options; // Product-owned numerical options and target bindings.
-};
-using CompilerPreset = std::map<std::string, TargetPreset>;
-llvm::Expected<CompilerPreset> parsePreset(const llvm::json::Value &);
-
 struct DecisionFamily {
   std::string name;
   std::function<bool(mlir::Operation *)> applies;

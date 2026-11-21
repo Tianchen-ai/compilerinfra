@@ -1,465 +1,296 @@
-#include "compilerinfra/Assembly.h"
-#include "ComponentIndex.h"
 #include "DecisionProgram.h"
-#include <algorithm>
+#include "mlir/IR/Verifier.h"
+#include <set>
 
 using namespace compilerinfra;
 using llvm::createStringError;
+using llvm::json::Object;
+using llvm::json::Array;
 
-void Assembly::add(Model v, SourceRef s) {
-  models.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(Lowering v, SourceRef s) {
-  lowerings.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(Route v, SourceRef s) {
-  routes.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(Contribution v, SourceRef s) {
-  contributions.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(Provider v, SourceRef s) {
-  providers.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(DecisionFamily v, SourceRef s) {
-  families.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(Strategy v, SourceRef s) {
-  strategies.push_back({std::move(v), std::move(s)});
-}
-void Assembly::add(Realizer v, SourceRef s) {
-  realizers.push_back({std::move(v), std::move(s)});
+void Assembly::bind(llvm::StringRef id, void (*registerUnit)(Unit &)) {
+  auto entry = units.try_emplace(id.str(), id.str());
+  registerUnit(entry.first->second);
 }
 
 namespace {
-using Point = std::pair<std::string, std::string>;
-using Chain = std::vector<const Lowering *>;
-
-template <typename Items> llvm::json::Array strings(const Items &items) {
-  llvm::json::Array result;
-  for (const auto &item : items)
-    result.push_back(item);
-  return result;
+std::string field(const Object &obj, llvm::StringRef key) {
+  return obj.getString(key)->str();
 }
 
-std::string location(const SourceRef &s) {
-  return s.file + ":" + std::to_string(s.line);
-}
-
-template <typename T> const std::string &nameOf(const T &v) { return v.name; }
-const std::string &nameOf(const Provider &v) { return v.profile.name; }
-
-BuildPasses bindPasses(ModelPasses build,
-                       const std::shared_ptr<const TargetProfile> &profile) {
-  return [build = std::move(build), profile](mlir::OpPassManager &pm) {
-    return build(pm, *profile);
-  };
-}
-BoundaryCheck bindCheck(ModelCheck check,
-                        const std::shared_ptr<const TargetProfile> &profile) {
-  return [check = std::move(check), profile](mlir::ModuleOp m) {
-    return check(m, *profile);
-  };
-}
-} // namespace
-
-namespace compilerinfra {
-class AssemblyLinker {
-public:
-  explicit AssemblyLinker(const Assembly &assembly) : assembly(assembly) {}
-
-  llvm::Expected<Compiler> run(Import importer, llvm::StringRef input);
-
-private:
-  const Assembly &assembly;
-  std::shared_ptr<detail::ComponentIndex> index =
-      std::make_shared<detail::ComponentIndex>();
-  template <typename T> using Names = std::map<std::string, const T *>;
-  Names<Model> models;
-  Names<Lowering> lowerings;
-  Names<Route> routes;
-  Names<Contribution> contributions;
-  Names<Provider> providers;
-  Names<DecisionFamily> families;
-  Names<Strategy> strategies;
-  Names<Realizer> realizers;
-  std::map<Point, std::vector<const Contribution *>> points;
-  std::map<std::string, Chain> chains;
-  std::map<std::string, std::set<std::string>> includedRoutes;
-  std::set<std::string> visiting;
-
-  template <typename T>
-  llvm::Error collect(llvm::StringRef kind,
-                      const std::vector<Assembly::Located<T>> &items,
-                      Names<T> &names);
-  llvm::Error resolvePoint(const Point &point,
-                           std::vector<const Contribution *> &members);
-  llvm::Error validate(const std::string &input);
-  llvm::Error resolveRoute(const Route &route);
-  llvm::Expected<Target> makeTarget(const Provider &provider,
-                                    const Model &input);
-  llvm::Error invalid(const std::string &id, const llvm::Twine &reason) const {
-    return createStringError(
-        id + " at " + location(index->entries.at(id).source) + ": " + reason);
+struct Components {
+  std::map<std::string, const Located<Boundary> *> boundaries;
+  std::map<std::string, const Located<Exit> *> exits;
+  std::map<std::string, Located<Contribution>> contributions;
+  std::map<std::string, Located<FamilyBinding>> families;
+  std::map<std::string, Located<Strategy>> strategies;
+  std::map<std::string, Located<Realizer>> realizers;
+  Object catalog;
+  llvm::Error record(const std::string &name, const std::string &unit,
+                     const std::string &at, llvm::StringRef kind, const SourceRef &source) {
+    if (catalog.get(name))
+      return createStringError("duplicate registration " + name + " in " + unit);
+    catalog[name] = Object{{"unit", unit}, {"at", at}, {"kind",kind},
+                           {"file",source.file},{"line",source.line}};
+    return llvm::Error::success();
   }
 };
 
-template <typename T>
-llvm::Error
-AssemblyLinker::collect(llvm::StringRef kind,
-                        const std::vector<Assembly::Located<T>> &items,
-                        Names<T> &names) {
-  for (const auto &item : items) {
-    const std::string &name = nameOf(item.value);
-    std::string id = (kind + ":" + name).str();
-    if (name.empty() || item.source.file.empty() || !item.source.line)
-      return createStringError(
-          "component needs a name and a source location: " + id);
-    if (!names.emplace(name, &item.value).second)
-      return invalid(id, "also declared at " + location(item.source));
-    std::string layer;
-    if (auto *units = index->layout.getObject("components")) {
-      auto *owner = units->getObject(item.source.component);
-      if (!owner)
-        return createStringError(id + ": no build component owns " + location(item.source));
-      layer = owner->getString("layer")->str();
-      if ((kind == "model" && layer != "dialect") ||
-          (kind == "lowering" && layer != "conversion") ||
-          (kind == "optimization" && layer != "strategy") ||
-          ((kind == "provider" || kind == "route") && layer != "target") ||
-          layer == "runtime")
-        return createStringError(id + ": invalid registration in " + layer + " at " + location(item.source));
-    }
-    index->entries.emplace(id, detail::Entry{item.source, std::move(layer), {}, {}});
+llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
+  const Object &units = *manifest.getObject("units");
+  auto owner = field(*units.getObject(u.id), "owner");
+  auto node = llvm::StringRef(owner).rsplit('/').second.str();
+  auto *n = manifest.getObject("nodes")->getObject(node);
+  auto local = [&](llvm::StringRef at) {
+    if (!n || owner != field(*units.getObject(field(*n,"unit")),"owner"))
+      return false;
+    for (auto &b : *n->getArray("boundaries"))
+      if (at == node + "@" + b.getAsString()->str())
+        return true;
+    return false;
+  };
+  for (auto &b : u.boundaries) {
+    auto at = node + "@" + b.value.name;
+    if (!local(at) || !b.value.lower || !b.value.verify)
+      return createStringError(u.id + ": invalid boundary implementation " + at);
+    if (auto e = c.record(at,u.id,at,"boundary",b.source)) return e;
+    c.boundaries[at] = &b;
+  }
+  if (u.exit) {
+    if (owner != "exits/" + node || !u.exit->value.emit || !u.exit->value.legalize)
+      return createStringError(u.id + ": invalid exit implementation");
+    auto at = field(*manifest.getObject("exits")->getObject(node),"at");
+    if (auto e = c.record(owner,u.id,at,"exit",u.exit->source)) return e;
+    c.exits[node] = &*u.exit;
+  }
+  for (auto &[v,s] : u.contributions) {
+    auto id = u.qualify(v.name);
+    if (!local(v.at) || !v.build) return createStringError(id + ": invalid attachment " + v.at);
+    if (auto e = c.record(id,u.id,v.at,"contribution",s)) return e;
+    c.contributions.emplace(id, Located<Contribution>{v,s});
+  }
+  for (auto &[v,s] : u.families) {
+    auto id = u.qualify(v.family.name);
+    if (!local(v.decideAt) || !local(v.materializeAt) || !v.family.applies ||
+        !v.family.read || !v.family.write || !v.family.verify)
+      return createStringError(id + ": invalid decision family");
+    if (auto e = c.record(id,u.id,v.decideAt,"family",s)) return e;
+    auto copy = v;
+    copy.family.name = id;
+    c.families.emplace(id, Located<FamilyBinding>{copy,s});
+  }
+  for (auto &[v,s] : u.strategies) {
+    auto id = u.qualify(v.name);
+    if (!v.propose) return createStringError(id + ": missing strategy implementation");
+    if (auto e = c.record(id,u.id,"","strategy",s)) return e;
+    c.strategies.emplace(id,Located<Strategy>{v,s});
+  }
+  for (auto &[v,s] : u.realizers) {
+    auto id = u.qualify(v.name);
+    if (!v.apply) return createStringError(id + ": missing realizer implementation");
+    if (auto e = c.record(id,u.id,"","realizer",s)) return e;
+    c.realizers.emplace(id,Located<Realizer>{v,s});
   }
   return llvm::Error::success();
 }
 
-// Validate and sort once for the whole point. 'after' expresses precedence
-// when both contributions are present, including after target filtering.
-llvm::Error
-AssemblyLinker::resolvePoint(const Point &point,
-                             std::vector<const Contribution *> &members) {
-  std::map<std::string, std::set<std::string>> followers;
-  std::map<std::string, size_t> pending;
-  std::set<std::string> ready;
-  for (const Contribution *member : members) {
-    auto &count = pending[member->name];
-    auto predecessors = member->after;
-    for (const auto &name : member->afterIfPresent)
-      if (contributions.count(name))
-        predecessors.push_back(name);
-    for (const auto &dependency : predecessors) {
-      auto found = contributions.find(dependency);
-      if (found == contributions.end() ||
-          found->second->lowering != point.first ||
-          found->second->point != point.second)
-        return invalid("optimization:" + member->name,
-                       "unknown predecessor at this point: " + dependency);
-      if (followers[dependency].insert(member->name).second)
-        ++count;
+Object settings(const Object &config, llvm::StringRef scope, llvm::StringRef name) {
+  if (auto *group = config.getObject(scope))
+    if (auto *entry = group->getObject(name)) return *entry;
+  return {};
+}
+Object mergedField(const Object &base,const Object &over, llvm::StringRef name) {
+  Object result;
+  for (auto *scope : {&base,&over})
+    if (auto *items = scope->getObject(name))
+      for (auto &[key,val] : *items) result[key] = val;
+  return result;
+}
+
+llvm::Error orderContributions(const Components &c, const std::string &at,
+                               std::vector<std::string> &ordered) {
+  std::set<std::string> todo;
+  for (auto &[id,reg] : c.contributions)
+    if (reg.value.at == at) todo.insert(id);
+  while (!todo.empty()) {
+    auto ready = todo.end();
+    for (auto it = todo.begin(); it != todo.end(); ++it) {
+      const auto &v = c.contributions.at(*it).value;
+      bool wait = false;
+      for (auto *deps : {&v.after,&v.afterIfPresent})
+        for (auto &dep : *deps) {
+          auto other = c.contributions.find(dep);
+          if (other == c.contributions.end() && deps == &v.afterIfPresent) continue;
+          if (other == c.contributions.end() || other->second.value.at != at)
+            return createStringError(*it + ": invalid ordering dependency " + dep);
+          wait |= todo.count(dep) != 0;
+        }
+      if (!wait) { ready = it; break; }
     }
-    if (!count)
-      ready.insert(member->name);
-  }
-  members.clear();
-  while (!ready.empty()) {
-    auto next = ready.extract(ready.begin()).value();
-    members.push_back(contributions.at(next));
-    for (const auto &dependent : followers[next])
-      if (!--pending[dependent])
-        ready.insert(dependent);
-  }
-  if (members.size() != pending.size()) {
-    std::string blocked;
-    for (const auto &[name, count] : pending)
-      if (count)
-        blocked += " " + name + "@" +
-                   location(index->entries.at("optimization:" + name).source);
-    return createStringError("cyclic precedence at " + point.first + "/" +
-                             point.second + ":" + blocked);
+    if (ready == todo.end()) return createStringError("contribution order cycle at " + at);
+    ordered.push_back(*ready);
+    todo.erase(ready);
   }
   return llvm::Error::success();
 }
 
-llvm::Error AssemblyLinker::resolveRoute(const Route &route) {
-  if (chains.count(route.name))
-    return llvm::Error::success();
-  const std::string id = "route:" + route.name;
-  if (!visiting.insert(route.name).second)
-    return invalid(id, "cyclic route reference");
-  Chain chain;
-  auto &included = includedRoutes[route.name];
-  included.insert(route.name);
-  std::set<std::string> used;
-  auto append = [&](const Lowering *edge) -> llvm::Error {
-    if (!chain.empty() && edge->from != chain.back()->to)
-      return invalid(id, edge->name + " consumes " + edge->from +
-                             ", previous boundary produces " +
-                             chain.back()->to);
-    if (!used.insert(edge->name).second)
-      return invalid(id, "repeated lowering boundary " + edge->name);
-    chain.push_back(edge);
+llvm::Expected<DecisionChoice> choiceFor(const Object &settings, const std::string &id) {
+  auto *obj = settings.getObject(id);
+  if (!obj || !obj->getArray("strategies") || !obj->getString("realizer"))
+    return createStringError("configuration must select strategies and a realizer for " + id);
+  DecisionChoice result;
+  result.realizer = field(*obj,"realizer");
+  for (auto &v : *obj->getArray("strategies")) {
+    if (!v.getAsString()) return createStringError("expected a strategy name for " + id);
+    result.strategies.push_back(v.getAsString()->str());
+  }
+  return result;
+}
+
+llvm::Error checkConfiguration(const Object &config, const Object &manifest,
+                               const Components &c) {
+  for (auto &[group, entries] : config) {
+    if ((group != "nodes" && group != "exits") || !entries.getAsObject())
+      return createStringError("unknown configuration section " + group.str());
+    for (auto &[key,value] : *entries.getAsObject()) {
+      auto *declaration = manifest.getObject(group)->getObject(key);
+      if (!declaration || !value.getAsObject()) return createStringError("invalid scope " + key.str());
+      for (auto &[kind,items] : *value.getAsObject()) {
+        if (!items.getAsObject() || (kind != "optimizations" && kind != "decisions" &&
+                                    (kind != "options" || group != "exits")))
+          return createStringError("invalid configuration field " + key.str() + "/" + kind.str());
+        if (kind == "options") continue;
+        for (auto &[id,item] : *items.getAsObject()) {
+          auto *component = c.catalog.getObject(id);
+          if (!component || field(*component,"kind") != (kind=="decisions"?"family":"contribution") ||
+              (kind=="optimizations" && !item.getAsBoolean()))
+            return createStringError("invalid configuration for " + id.str());
+          auto at = field(*component,"at");
+          if (group == "nodes" ? !llvm::StringRef(at).starts_with(key.str()+"@") :
+              !llvm::any_of(*declaration->getArray("boundaries"),[&](const auto &v){return v.getAsString()==at;}))
+            return createStringError(id.str() + " is outside " + key.str());
+        }
+      }
+    }
+  }
+  return llvm::Error::success();
+}
+} // namespace
+
+llvm::Expected<Compiler> Assembly::link(const Object &manifest, const Object &config) const {
+  Components components;
+  for (auto &[_,unit] : units)
+    if (auto e = collect(manifest,unit,components)) return std::move(e);
+  auto &c = components;
+  auto attach = [&](const auto &entries) -> llvm::Error {
+    for (auto &[id,v] : entries) {
+      auto f = c.families.find(v.value.family);
+      if (f == c.families.end()) return createStringError(id + ": unknown family " + v.value.family);
+      (*c.catalog.getObject(id))["at"] = f->second.value.decideAt;
+    }
     return llvm::Error::success();
   };
-  llvm::json::Array steps;
-  for (const auto &step : route.steps) {
-    if (const auto *lowering = std::get_if<UseLowering>(&step)) {
-      auto found = lowerings.find(lowering->name);
-      if (found == lowerings.end())
-        return invalid(id, "unknown lowering " + lowering->name);
-      if (auto error = append(found->second))
-        return error;
-      steps.push_back("lowering:" + lowering->name);
-    } else {
-      const auto &name = std::get<UseRoute>(step).name;
-      auto child = routes.find(name);
-      if (child == routes.end())
-        return invalid(id, "unknown route " + name);
-      if (auto error = resolveRoute(*child->second))
-        return error;
-      for (const auto *edge : chains.at(name))
-        if (auto error = append(edge))
-          return error;
-      const auto &children = includedRoutes.at(name);
-      included.insert(children.begin(), children.end());
-      steps.push_back("route:" + name);
-    }
-  }
-  index->entries.at(id).declaration =
-      llvm::json::Object{{"steps", std::move(steps)}};
-  chains.emplace(route.name, std::move(chain));
-  visiting.erase(route.name);
-  return llvm::Error::success();
-}
-
-llvm::Error AssemblyLinker::validate(const std::string &input) {
-  if (auto e = collect("model", assembly.models, models))
-    return e;
-  if (auto e = collect("lowering", assembly.lowerings, lowerings))
-    return e;
-  if (auto e = collect("route", assembly.routes, routes))
-    return e;
-  if (auto e = collect("optimization", assembly.contributions, contributions))
-    return e;
-  if (auto e = collect("provider", assembly.providers, providers))
-    return e;
-  if (auto e = collect("family", assembly.families, families))
-    return e;
-  if (auto e = collect("strategy", assembly.strategies, strategies))
-    return e;
-  if (auto e = collect("realizer", assembly.realizers, realizers))
-    return e;
-  for (auto &[name, f] : families)
-    if (!f->applies || !f->read || !f->write || !f->verify)
-      return invalid("family:" + name, "incomplete IR carrier interface");
-  for (auto &[name, s] : strategies) {
-    if (!s->propose || !families.count(s->family))
-      return invalid("strategy:" + name,
-                     "missing strategy callback or unknown family " +
-                         s->family);
-    index->entries.at("strategy:" + name).declaration["family"] = s->family;
-  }
-  for (auto &[name, r] : realizers) {
-    if (!r->apply || !families.count(r->family))
-      return invalid("realizer:" + name,
-                     "missing realizer callback or unknown family " +
-                         r->family);
-    index->entries.at("realizer:" + name).declaration["family"] = r->family;
-  }
-  if (!models.count(input))
-    return createStringError("unknown frontend model: " + input);
-  for (const auto &[name, model] : models)
-    if (!model->verify)
-      return invalid("model:" + name, "missing model verifier");
-  for (const auto &[name, edge] : lowerings) {
-    const std::string id = "lowering:" + name;
-    if (name == "input" || !models.count(edge->from) || !models.count(edge->to))
-      return invalid(id,
-                     "reserved boundary name or unknown input/output model");
-    llvm::json::Array declared;
-    for (const auto &step : edge->steps) {
-      if (const auto *hook = std::get_if<ExtensionPoint>(&step)) {
-        if (hook->name.empty() ||
-            !points.try_emplace({name, hook->name}).second)
-          return invalid(id,
-                         "empty or repeated extension point: " + hook->name);
-        declared.push_back(hook->name);
-      } else if (auto *select = std::get_if<Decide>(&step)) {
-        if (!families.count(select->family))
-          return invalid(id, "unknown decision family " + select->family);
-      } else if (auto *consume = std::get_if<Materialize>(&step)) {
-        if (!families.count(consume->family))
-          return invalid(id, "unknown decision family " + consume->family);
-      } else if (!std::get<ModelPasses>(step))
-        return invalid(id, "empty required pass builder");
-    }
-    index->entries.at(id).declaration =
-        llvm::json::Object{{"from", edge->from},
-                           {"to", edge->to},
-                           {"points", std::move(declared)}};
-  }
-  for (const auto &[name, member] : contributions) {
-    const std::string id = "optimization:" + name;
-    auto point = points.find({member->lowering, member->point});
-    if (point == points.end() || !member->build)
-      return invalid(id, "missing builder or unknown point " +
-                             member->lowering + "/" + member->point);
-    point->second.push_back(member);
-    index->entries.at(id).declaration = llvm::json::Object{
-        {"lowering", member->lowering},
-        {"point", member->point},
-        {"requires", strings(member->requiresFeatures)},
-        {"after", strings(member->after)},
-        {"after_if_present", strings(member->afterIfPresent)},
-        {"default", member->enabledByDefault}};
-  }
-  for (auto &[point, members] : points)
-    if (auto error = resolvePoint(point, members))
-      return error;
-  for (const auto &[name, route] : routes)
-    if (auto error = resolveRoute(*route))
-      return error;
-  return llvm::Error::success();
-}
-
-llvm::Expected<Target> AssemblyLinker::makeTarget(const Provider &provider,
-                                                  const Model &input) {
-  const auto &name = provider.profile.name;
-  const std::string id = "provider:" + name;
-  auto chain = chains.find(provider.route);
-  if (chain == chains.end())
-    return invalid(id, "unknown route " + provider.route);
-  if (!chain->second.empty() && chain->second.front()->from != input.name)
-    return invalid(id, "route starts at " + chain->second.front()->from +
-                           ", expected " + input.name);
-  const auto &last =
-      chain->second.empty() ? input.name : chain->second.back()->to;
-  if (last != provider.accepts || !provider.emit)
-    return invalid(id, "expected an emitter for " + last + ", declared " +
-                           provider.accepts);
-
-  auto profile = std::make_shared<const TargetProfile>(provider.profile);
-  Target target{name, {}, {}, provider.emit, bindCheck(input.verify, profile)};
-  for (const auto &r : includedRoutes.at(provider.route))
-    index->entries.at("route:" + r).uses[name] = {};
-  auto &entry = index->entries.at(id);
-  entry.uses[name] = {};
-  entry.declaration =
-      llvm::json::Object{{"route", provider.route},
-                         {"accepts", provider.accepts},
-                         {"features", strings(profile->features)}};
-  index->targetRoutes.emplace(name, provider.route);
-  std::vector<RegisterDialects> registrations;
-  std::set<std::string> visited;
-  auto useModel = [&](const Model &model) {
-    index->entries.at("model:" + model.name).uses[name] = {};
-    if (visited.insert(model.name).second && model.registerDialects)
-      registrations.push_back(model.registerDialects);
-  };
-  useModel(input);
-  std::set<std::string> pending, decided;
-  for (const Lowering *edge : chain->second) {
-    index->entries.at("lowering:" + edge->name).uses[name] = {};
-    const Model &output = *models.at(edge->to);
-    useModel(output);
-    Stage stage{edge->name, {}, bindCheck(output.verify, profile)};
-    for (const auto &step : edge->steps) {
-      if (const auto *required = std::get_if<ModelPasses>(&step)) {
-        stage.groups.push_back(
-            PassGroup::required(bindPasses(*required, profile)));
-        continue;
-      }
-      if (std::holds_alternative<Decide>(step) ||
-          std::holds_alternative<Materialize>(step)) {
-        const bool consume = std::holds_alternative<Materialize>(step);
-        const auto &family = consume ? std::get<Materialize>(step).family
-                                     : std::get<Decide>(step).family;
-        if (consume ? !pending.erase(family) : !decided.insert(family).second)
-          return invalid(id, "unpaired or repeated decision boundary for " +
-                                 family);
-        if (!consume)
-          pending.insert(family);
-        auto choice = provider.decisions.find(family);
-        if (choice == provider.decisions.end())
-          return invalid(id, "missing decision preset for " + family);
-        auto table = std::make_shared<detail::DecisionTable>();
-        table->family = *families.at(family);
-        table->target = profile;
-        for (auto &[n, s] : strategies)
-          if (s->family == family) {
-            table->strategies.emplace(n, *s);
-            index->entries.at("strategy:" + n).uses[name] = {};
-          }
-        for (auto &[n, r] : realizers)
-          if (r->family == family) {
-            table->realizers.emplace(n, *r);
-            index->entries.at("realizer:" + n).uses[name] = {};
-          }
-        index->entries.at("family:" + family).uses[name] = {};
-        detail::DecisionProgram program{std::move(table), choice->second,
-                                        consume};
-        if (auto error = program.validate())
-          return invalid(id, llvm::toString(std::move(error)));
-        stage.groups.push_back(PassGroup::forDecision(std::move(program)));
-        continue;
-      }
-      for (const auto *member :
-           points.at({edge->name, std::get<ExtensionPoint>(step).name})) {
-        auto &missing =
-            index->entries.at("optimization:" + member->name).uses[name];
-        for (const auto &feature : member->requiresFeatures)
-          if (!profile->features.count(feature))
-            missing.push_back(feature);
-        if (missing.empty())
-          stage.groups.push_back(PassGroup::optimization(
-              member->name, bindPasses(member->build, profile),
-              member->enabledByDefault, member->point));
-      }
-    }
-    target.stages.push_back(std::move(stage));
-  }
-  if (!pending.empty())
-    return invalid(id, "missing materializer boundary for " + *pending.begin());
-  for (const auto &binding : provider.decisions)
-    if (!families.count(binding.first))
-      return invalid(id,
-                     "unknown family in provider defaults " + binding.first);
-  if (provider.registerDialects)
-    registrations.push_back(provider.registerDialects);
-  target.registerDialects =
-      [callbacks = std::move(registrations)](mlir::DialectRegistry &registry) {
-        for (const auto &registerDialects : callbacks)
-          registerDialects(registry);
-      };
-  return target;
-}
-
-llvm::Expected<Compiler> AssemblyLinker::run(Import importer,
-                                             llvm::StringRef input) {
-  index->layout = llvm::json::Object(assembly.layout);
-  if (auto error = validate(input.str()))
-    return error;
+  if (auto e=attach(c.strategies)) return std::move(e);
+  if (auto e=attach(c.realizers)) return std::move(e);
+  if (auto e=checkConfiguration(config,manifest,c)) return std::move(e);
+  Frontend front;
+  front.import = importMLIR;
+  front.verifyInput = [](mlir::ModuleOp op){return mlir::verify(op);};
+  auto frontId = "frontend/"+field(*manifest.getObject("product")->getObject("frontend"),"language");
+  front.registerDialects = units.at(frontId).dialects;
+  if (units.at(frontId).input) front.verifyInput = units.at(frontId).input;
+  Object selected;
   std::vector<Target> targets;
-  for (const auto &[name, provider] : providers) {
-    auto target = makeTarget(*provider, *models.at(input.str()));
-    if (!target)
-      return target.takeError();
-    targets.push_back(std::move(*target));
+  for (auto &[key,value] : *manifest.getObject("exits")) {
+    std::string name = key.str();
+    auto &e = *value.getAsObject();
+    if (!c.exits.count(name)) return createStringError("missing emitter for " + name);
+    auto &provider = c.exits.at(name)->value;
+    auto overrides = settings(config,"exits",name);
+    auto profile = std::make_shared<TargetProfile>();
+    profile->name = name;
+    auto options = mergedField({},overrides,"options");
+    if (provider.capabilities) {
+      auto facts = provider.capabilities(options);
+      if (!facts) return facts.takeError();
+      *profile = std::move(*facts);
+    } else if (!options.empty()) return createStringError(name + ": unsupported exit options");
+    Target t;
+    t.name = name;
+    t.emit = provider.emit;
+    std::set<std::string> owners{"exits/"+name};
+    std::map<std::string,detail::DecisionProgram> pending;
+    std::set<std::string> chosen;
+    for (auto &b : *e.getArray("boundaries")) {
+      auto at = b.getAsString()->str();
+      auto node = at.substr(0,at.find('@'));
+      auto nodeUnit = field(*manifest.getObject("nodes")->getObject(node),"unit");
+      owners.insert(field(*manifest.getObject("units")->getObject(nodeUnit),"owner"));
+      if (!c.boundaries.count(at)) return createStringError("missing implementation of " + at);
+      auto spec = c.boundaries.at(at)->value;
+      auto wrap = [profile](ModelPasses build) -> BuildPasses {
+        return [profile,build](mlir::OpPassManager &pm){return build(pm,*profile);};
+      };
+      Stage stage;
+      stage.name = at;
+      stage.verifyOutput = [spec,profile](mlir::ModuleOp m){return spec.verify(m,*profile);};
+      stage.groups.push_back(PassGroup::required(wrap(spec.lower)));
+      auto defaults = settings(config,"nodes",node);
+      auto opts = mergedField(defaults,overrides,"optimizations");
+      std::vector<std::string> ordered;
+      if (auto err=orderContributions(c,at,ordered)) return std::move(err);
+      for (auto &id : ordered) {
+        auto &v = c.contributions.at(id).value;
+        bool enabled = opts.getBoolean(id).value_or(v.enabled);
+        if (enabled) chosen.insert(id);
+        stage.groups.push_back(PassGroup::optimization(id,wrap(v.build),enabled,at));
+      }
+      for (auto &[id,v] : c.families) {
+        if (v.value.decideAt != at) continue;
+        auto table = std::make_shared<detail::DecisionTable>();
+        table->family = v.value.family;
+        table->target = profile;
+        for (auto &[sid,s] : c.strategies)
+          if (s.value.family==id) table->strategies.emplace(sid,s.value);
+        for (auto &[rid,r] : c.realizers)
+          if (r.value.family==id) table->realizers.emplace(rid,r.value);
+        auto choice = choiceFor(mergedField(defaults,overrides,"decisions"),id);
+        if (!choice) return choice.takeError();
+        detail::DecisionProgram program{table,*choice,false};
+        if (auto err=program.validate()) return std::move(err);
+        chosen.insert(id);
+        chosen.insert(choice->strategies.begin(),choice->strategies.end());
+        chosen.insert(choice->realizer);
+        stage.groups.push_back(PassGroup::forDecision(program));
+        pending.emplace(id,std::move(program));
+      }
+      for (auto &[id,v] : c.families) {
+        if (v.value.materializeAt != at) continue;
+        if (!pending.count(id)) return createStringError("materialization precedes decision for " + id);
+        auto program = pending.at(id);
+        program.materialize = true;
+        stage.groups.push_back(PassGroup::forDecision(std::move(program)));
+        pending.erase(id);
+      }
+      t.stages.push_back(std::move(stage));
+    }
+    if (!pending.empty()) return createStringError(name + ": exit before materialization of " + pending.begin()->first);
+    auto legalize = provider.legalize;
+    Stage final;
+    final.name = "exits/" + name;
+    final.groups.push_back(PassGroup::required([legalize,profile](mlir::OpPassManager &pm){return legalize(pm,*profile);}));
+    final.verifyOutput = [](mlir::ModuleOp m){return mlir::verify(m);};
+    t.stages.push_back(std::move(final));
+    std::vector<RegisterDialects> dialects;
+    for (auto &[id,unit] : units)
+      if (unit.dialects && owners.count(field(*manifest.getObject("units")->getObject(id),"owner")))
+        dialects.push_back(unit.dialects);
+    t.registerDialects = [dialects](mlir::DialectRegistry &r){for (auto &add:dialects) add(r);};
+    selected[name] = Array(chosen);
+    targets.push_back(std::move(t));
   }
-  auto compiler = Compiler::create(Frontend{{}, std::move(importer), {}},
-                                   std::move(targets), std::move(index));
-  if (!compiler)
-    return compiler.takeError();
-  auto definition =
-      std::make_shared<Compiler::Definition>(*compiler->definition);
-  definition->assembly = std::make_shared<Assembly>(assembly);
-  definition->inputModel = input.str();
-  return Compiler(std::move(definition));
+  Object description = manifest;
+  description["configuration"] = Object(config);
+  description["components"] = std::move(c.catalog);
+  description["selected"] = std::move(selected);
+  return Compiler::create(std::move(front),std::move(targets),std::move(description));
 }
-
-llvm::Expected<Compiler> Assembly::link(Import importer,
-                                        llvm::StringRef inputModel) const {
-  return AssemblyLinker(*this).run(std::move(importer), inputModel);
-}
-} // namespace compilerinfra

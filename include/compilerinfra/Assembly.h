@@ -59,99 +59,52 @@ using ModelCheck =
 using ModelPasses =
     std::function<llvm::Error(mlir::OpPassManager &, const TargetProfile &)>;
 
-struct Model {
-  std::string name;
+
+struct Boundary {
+  std::string name; // local to this node
+  ModelPasses lower;
   ModelCheck verify;
-  RegisterDialects registerDialects;
 };
-
-// A lowering owns program order. It can expose a point exactly where
-// independently contributed optimizations may operate on its representation.
-struct ExtensionPoint {
-  std::string name;
-};
-using LoweringStep =
-    std::variant<ModelPasses, ExtensionPoint, Decide, Materialize>;
-struct Lowering {
-  std::string name;
-  std::string from;
-  std::string to;
-  std::vector<LoweringStep> steps;
-};
-
-struct UseRoute {
-  std::string name;
-};
-struct UseLowering {
-  std::string name;
-};
-struct Route {
-  std::string name;
-  std::vector<std::variant<UseRoute, UseLowering>> steps;
-};
-
 struct Contribution {
-  std::string name;
-  std::string lowering;
-  std::string point;
+  std::string name, at;
   ModelPasses build;
-  // Named capabilities of the product's selected device/toolchain.
-  std::vector<std::string> requiresFeatures;
-  // Local ordering only, not a semantic dependency on an enabled sibling.
-  std::vector<std::string> after;
-  bool enabledByDefault = true;
-  // Precedence relative to other independently distributed components.
-  std::vector<std::string> afterIfPresent;
+  std::vector<std::string> after, afterIfPresent;
+  bool enabled = true;
 };
-
-struct Provider {
-  TargetProfile profile;
-  std::string route;
-  std::string accepts; // Model required by the emitter.
-  RegisterDialects registerDialects;
+struct FamilyBinding {
+  DecisionFamily family;
+  std::string decideAt, materializeAt;
+};
+struct Exit {
+  ModelPasses legalize;
   Emit emit;
-  DecisionChoices decisions;
-  std::function<llvm::Expected<TargetProfile>(const TargetProfile &,
-                                              const llvm::json::Object &)>
-      configurePreset;
+  std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)> capabilities;
 };
+template <typename T> struct Located { T value; SourceRef source; };
 
-// Registration order is immaterial. Linking is pure declaration work:
-// no device discovery, pass construction, compilation, or artifact I/O.
-class Assembly {
+// The generated registration function receives exactly its own unit.
+class Unit {
 public:
-  void setLayout(llvm::json::Object owners) { layout = std::move(owners); }
-  void add(Model model, SourceRef source);
-  void add(Lowering lowering, SourceRef source);
-  void add(Route route, SourceRef source);
-  void add(Contribution contribution, SourceRef source);
-  void add(Provider provider, SourceRef source);
-  void add(DecisionFamily value, SourceRef source);
-  void add(Strategy value, SourceRef source);
-  void add(Realizer value, SourceRef source);
-
-  llvm::Expected<Compiler> link(Import importer,
-                                llvm::StringRef inputModel) const;
-  llvm::Expected<Compiler> link(Import importer, llvm::StringRef inputModel,
-                                const CompilerPreset &preset) const;
-
-private:
-  llvm::json::Object layout;
-  template <typename T> struct Located {
-    T value;
-    SourceRef source;
-  };
-  std::vector<Located<Model>> models;
-  std::vector<Located<Lowering>> lowerings;
-  std::vector<Located<Route>> routes;
+  explicit Unit(std::string id) : id(std::move(id)) {}
+  const std::string id;
+  RegisterDialects dialects;
+  BoundaryCheck input;
+  std::vector<Located<Boundary>> boundaries;
   std::vector<Located<Contribution>> contributions;
-  std::vector<Located<Provider>> providers;
-  std::vector<Located<DecisionFamily>> families;
+  std::vector<Located<FamilyBinding>> families;
   std::vector<Located<Strategy>> strategies;
   std::vector<Located<Realizer>> realizers;
-  friend class AssemblyLinker;
-  friend class Compiler;
+  std::optional<Located<Exit>> exit;
+  std::string qualify(llvm::StringRef local) const { return id + "::" + local.str(); }
 };
 
+class Assembly {
+public:
+  void bind(llvm::StringRef unit, void (*registerUnit)(Unit &));
+  llvm::Expected<Compiler> link(const llvm::json::Object &manifest,
+                                const llvm::json::Object &configuration) const;
+private:
+  std::map<std::string, Unit> units;
+};
 } // namespace compilerinfra
 #endif

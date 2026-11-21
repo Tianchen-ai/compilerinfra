@@ -61,14 +61,9 @@ static llvm::Error validateTarget(const Target &target) {
   return llvm::Error::success();
 }
 
-llvm::Expected<Compiler> Compiler::create(Frontend frontend,
-                                          std::vector<Target> targets) {
-  return create(std::move(frontend), std::move(targets), nullptr);
-}
-
 llvm::Expected<Compiler>
 Compiler::create(Frontend frontend, std::vector<Target> targets,
-                 std::shared_ptr<const detail::ComponentIndex> index) {
+                 llvm::json::Object description) {
   if (!frontend.import || targets.empty())
     return createStringError("compiler needs an importer and a target");
   llvm::StringSet<> names;
@@ -85,7 +80,7 @@ Compiler::create(Frontend frontend, std::vector<Target> targets,
       return error;
   }
   return Compiler(std::make_shared<Definition>(
-      Definition{std::move(frontend), std::move(targets), std::move(index)}));
+      Definition{std::move(frontend), std::move(targets), std::move(description)}));
 }
 
 llvm::ArrayRef<Target> Compiler::targets() const { return definition->targets; }
