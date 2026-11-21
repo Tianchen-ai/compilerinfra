@@ -9,7 +9,7 @@ from pathlib import Path
 
 SDK_VERSION = "0.2.0"
 AREAS = {
-    "levels": {"ir", "lowering", "analysis", "transforms", "decisions", "agent"},
+    "levels": {"abi", "ir", "lowering", "analysis", "transforms", "decisions", "agent"},
     "exits": {
         "ir",
         "legalize",
@@ -180,41 +180,65 @@ def tree(root, complete=True, extension_roots=None):
     if (nodes or complete) and len(roots) != 1:
         raise ValueError("expected one root with parent 'entry'")
 
-    def ancestors(k):
-        chain = []
-        while k != "entry":
-            if k in chain or k not in nodes:
-                raise ValueError(f"invalid parent {k} in {chain}")
-            chain.append(k)
-            k = nodes[k]["parent"]
-        return chain[::-1]
+    if nodes.keys() & exits.keys():
+        raise ValueError(
+            f"node and exit names overlap: {sorted(nodes.keys() & exits.keys())}"
+        )
+    if (
+        set(runtimes) - (nodes.keys() | exits.keys())
+        or complete
+        and (not exits or not exits.keys() <= runtimes.keys())
+    ):
+        raise ValueError(
+            "runtime requires a node or exit owner, and every exit requires a runtime"
+        )
 
-    for k, n in nodes.items():
-        chain = ancestors(k)
-        indices = [list(levels).index(nodes[i]["level"]) for i in chain]
-        if indices != sorted(set(indices)) or indices[0] != 0:
-            raise ValueError(f"{k}: parent must precede child in level order")
-        units[n["unit"]]["allowed"] = [nodes[i]["unit"] for i in chain]
+    chains = {}
+
+    def attach(key, declaration, parent, node):
+        before = []
+        ancestors = []
+        if parent != "entry":
+            owner, sep, point = parent.partition("@")
+            if owner not in chains:
+                raise ValueError(
+                    f"{key}: parent {owner} must be a node on an earlier level"
+                )
+            source = nodes[owner]
+            if node and source["level"] == declaration["level"]:
+                raise ValueError(f"{key}: parent must precede child in level order")
+            if not sep and node:
+                point = source["boundaries"][-1]
+            if point not in source["boundaries"]:
+                raise ValueError(f"{key}: unknown attachment {parent}")
+            parent = owner + "@" + point
+            ancestors = chains[owner]
+            before = source["path"][: source["path"].index(parent) + 1]
+        elif not node or declaration["level"] != next(iter(levels)):
+            raise ValueError(f"{key}: only a first-level root may attach at entry")
+        declaration["at"] = parent
+        declaration["path"] = before + [
+            key + "@" + b for b in declaration["boundaries"]
+        ]
+        chain = [*ancestors, key] if node else ancestors
+        if node:
+            chains[key] = chain
+        units[declaration["unit"]]["allowed"] = [nodes[a]["unit"] for a in chain]
+        if key in runtimes:
+            runtime = units[runtimes[key]]
+            runtime["allowed"] = [runtimes[a] for a in ancestors if a in runtimes]
+            runtime["abi"] = [nodes[a]["unit"] for a in ancestors] + [
+                declaration["unit"]
+            ]
+
+    for level in levels:
+        for key, n in nodes.items():
+            if n["level"] == level:
+                attach(key, n, n["parent"], True)
     if roots:
         units[front]["allowed"] = [nodes[roots[0]]["unit"]]
-    for k, e in exits.items():
-        node, sep, stop = e["at"].partition("@")
-        if not sep or node not in nodes or stop not in nodes[node]["boundaries"]:
-            raise ValueError(f"{k}: unknown attachment {e['at']}")
-        chain = ancestors(node)
-        chain_boundaries = [i + "@" + b for i in chain for b in nodes[i]["boundaries"]]
-        if k in nodes and set(e["boundaries"]).intersection(nodes[k]["boundaries"]):
-            raise ValueError(f"{k}: node and exit declare the same qualified boundary")
-        e["path"] = chain_boundaries[: chain_boundaries.index(e["at"]) + 1] + [
-            k + "@" + b for b in e["boundaries"]
-        ]
-        units[e["unit"]]["allowed"] = [nodes[i]["unit"] for i in chain]
-    if (
-        not set(runtimes) <= set(exits)
-        or complete
-        and (not exits or runtimes.keys() != exits.keys())
-    ):
-        raise ValueError("expected one runtime for each declared exit")
+    for key, e in exits.items():
+        attach(key, e, e["at"], False)
     for alias, package, decl in parts:
         prefix = f"extensions/{alias}/" if alias else ""
         for pattern in ("levels/*/*", "exits/*", "runtime/*", "frontend/*", "tools/*"):
@@ -266,6 +290,21 @@ def tree(root, complete=True, extension_roots=None):
                 dict(
                     path=f"{front}/{rel}",
                     kind="frontend",
+                    source=str(f),
+                    sha256=hashlib.sha256(f.read_bytes()).hexdigest(),
+                )
+            )
+    for owner, key in runtimes.items():
+        directory = Path(units[key]["directory"])
+        for f in sorted(directory.rglob("*.py")):
+            if "__pycache__" in f.parts:
+                continue
+            rel = f.relative_to(directory)
+            assets.append(
+                dict(
+                    path=key + "/" + str(rel),
+                    kind="runtime",
+                    unit=key,
                     source=str(f),
                     sha256=hashlib.sha256(f.read_bytes()).hexdigest(),
                 )

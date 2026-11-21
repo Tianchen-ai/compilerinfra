@@ -1,4 +1,13 @@
 @PACKAGE_INIT@
+function(compilerinfra_project_name out)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/product.json" declaration)
+  string(JSON name GET "${declaration}" name)
+  set(${out} "${name}" PARENT_SCOPE)
+endfunction()
+if(CompilerInfra_FIND_COMPONENTS STREQUAL "Project")
+  set(CompilerInfra_Project_FOUND TRUE)
+  return()
+endif()
 include(CMakeFindDependencyMacro)
 find_dependency(MLIR @LLVM_VERSION@ EXACT CONFIG)
 if(NOT TARGET CompilerInfra::Core)

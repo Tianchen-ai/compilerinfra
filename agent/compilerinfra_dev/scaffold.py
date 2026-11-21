@@ -55,7 +55,9 @@ def init(directory: str, name: str, version: str = "0.1.0", language: str = "mli
         ),
     )
     (root / "CMakeLists.txt").write_text(
-        f"cmake_minimum_required(VERSION 3.22)\nproject({name} LANGUAGES C CXX)\n"
+        "cmake_minimum_required(VERSION 3.22)\n"
+        "find_package(CompilerInfra 0.2.0 EXACT REQUIRED CONFIG COMPONENTS Project)\n"
+        "compilerinfra_project_name(product_name)\nproject(${product_name} LANGUAGES C CXX)\n"
         "find_package(CompilerInfra 0.2.0 EXACT REQUIRED CONFIG)\ncompilerinfra_product()\n"
     )
     (root / "AGENTS.md").write_text(
@@ -104,7 +106,7 @@ def add_node(
     boundaries: list[str],
 ):
     """Create a representation with its incoming lowering and ordered boundaries."""
-    for key in [level, name, parent, *boundaries]:
+    for key in [level, name, *parent.split("@"), *boundaries]:
         identifier(key)
     body = (
         "  auto lower = [](mlir::OpPassManager &, const TargetProfile &) { return llvm::Error::success(); };\n"
@@ -162,13 +164,16 @@ def add_exit(
     )
 
 
-def add_runtime(directory: str, exit: str):
-    """Create the ABI consumer for one exit."""
+def add_runtime(directory: str, owner: str | None = None, exit: str | None = None):
+    """Add runtime code owned by a node or an exit."""
+    if (owner is None) == (exit is None):
+        raise ValueError("supply one runtime owner")
+    owner = identifier(owner or exit)
     return update(
         directory,
         "runtimes",
-        identifier(exit),
-        f"runtime/{exit}",
+        owner,
+        f"runtime/{owner}",
         "binding/Binding.cpp",
         '#include "compilerinfra/Runtime.h"\nnamespace CI_UNIT_NAMESPACE {}\n',
     )

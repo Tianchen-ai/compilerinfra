@@ -138,6 +138,38 @@ def audit(model):
             if f.parent != folder:
                 raise ValueError(f"{key}: nested registration at {f}")
 
+    abi_files = {}
+    for key, u in units.items():
+        if not u["path"].startswith(("levels/", "exits/")):
+            continue
+        source = Path(u["directory"]) / "abi"
+        published = Path(u["package"]) / "include" / product / u["path"] / "abi"
+        for area in (source, published):
+            for f in area.rglob("*"):
+                if not f.is_file():
+                    continue
+                if f.suffix not in {
+                    ".h",
+                    ".hh",
+                    ".hpp",
+                    ".hxx",
+                    ".inc",
+                    ".json",
+                    ".yaml",
+                    ".yml",
+                    ".td",
+                    ".def",
+                    ".proto",
+                }:
+                    raise ValueError(
+                        f"{key}: ABI must be a header or data description: {f}"
+                    )
+                ref = Path(product) / u["path"] / "abi" / f.relative_to(area)
+                if ref in abi_files:
+                    raise ValueError(f"{key}: duplicate public ABI path {ref}")
+                abi_files[ref] = f.resolve()
+    abi_sources = set(abi_files.values())
+
     def owner(file, roots):
         return next((roots[p] for p in file.parents if p in roots), None)
 
@@ -161,9 +193,12 @@ def audit(model):
         for f in folder.rglob("*"):
             if not f.is_file() or f.suffix not in {
                 ".h",
+                ".hh",
+                ".hxx",
                 ".hpp",
                 ".cpp",
                 ".cc",
+                ".cxx",
                 ".c",
                 ".inc",
                 ".td",
@@ -178,26 +213,40 @@ def audit(model):
                     (Path(p) / "include" / inc).resolve()
                     for p in model["packages"].values()
                 ]
-                path = next((p for p in candidates if p.is_file()), None)
-                public_abi = (
-                    folder in public
-                    and u["path"].startswith("exits/")
-                    and f.is_relative_to(folder / "abi")
-                )
+                path = next((p for p in candidates if p.is_file()), abi_files.get(inc))
+                public_abi = u["path"].startswith(
+                    ("levels/", "exits/")
+                ) and f.is_relative_to(folder / "abi")
+                runtime = u["path"].startswith("runtime/")
                 if path is None:
                     if (
-                        (public_abi or u["path"].startswith("runtime/"))
-                        and str(inc).startswith("compilerinfra/")
+                        (public_abi or runtime)
+                        and inc.parts[:1] == (product,)
+                        and inc.parts[1:2] in {("levels",), ("exits",)}
+                    ):
+                        raise ValueError(
+                            f"{key}: {f}:{line_no}: undeclared ABI header {inc}"
+                        )
+                    if (
+                        (public_abi or runtime)
+                        and str(inc).startswith(("compilerinfra/", "mlir/", "llvm/"))
                         and str(inc) != "compilerinfra/Runtime.h"
                     ):
                         raise ValueError(
-                            f"{key}: {f}:{line_no}: forbidden runtime dependency {inc}"
+                            f"{key}: {f}:{line_no}: forbidden compiler dependency {inc}"
                         )
                     continue
                 pub, private = owner(path, public), owner(path, dirs)
-                if public_abi and not path.is_relative_to(folder / "abi"):
+                dest = pub or private
+                if dest and path in abi_sources:
+                    allowed = u.get("abi", []) if runtime else [key, *u["allowed"]]
+                    if units[dest]["owner"] in {
+                        units[k]["owner"] for k in allowed
+                    } or u["path"].startswith("tools/"):
+                        continue
+                if public_abi:
                     raise ValueError(
-                        f"{key}: {f}:{line_no}: public exit ABI imports compiler implementation {inc}"
+                        f"{key}: {f}:{line_no}: ABI imports implementation {inc}"
                     )
                 if (
                     pub == key
@@ -206,16 +255,6 @@ def audit(model):
                     or u["path"].startswith("tools/")
                 ):
                     continue
-                if u["path"].startswith("runtime/") and pub:
-                    exit_path = u["path"].replace("runtime/", "exits/", 1)
-                    if units[pub]["path"] == exit_path and path.is_relative_to(
-                        Path(units[pub]["package"])
-                        / "include"
-                        / product
-                        / exit_path
-                        / "abi"
-                    ):
-                        continue
                 if (
                     pub
                     or private

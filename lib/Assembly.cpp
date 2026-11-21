@@ -1,5 +1,6 @@
 #include "DecisionProgram.h"
 #include "mlir/IR/Verifier.h"
+#include "llvm/Support/Path.h"
 #include <set>
 
 using namespace compilerinfra;
@@ -28,6 +29,12 @@ struct Components {
   llvm::Error record(const std::string &name, const std::string &unit,
                      const std::string &at, llvm::StringRef kind,
                      const SourceRef &source) {
+    if (llvm::sys::path::is_absolute(source.file) ||
+        llvm::sys::path::is_absolute(source.file,
+                                     llvm::sys::path::Style::windows_backslash))
+      return createStringError(
+          unit +
+          ": registration needs a source-relative or @generated location");
     if (catalog.get(name))
       return createStringError("duplicate registration " + name + " in " +
                                unit);
@@ -203,6 +210,22 @@ llvm::Error checkConfiguration(const Object &config, const Object &manifest,
               (kind == "optimizations" && !item.getAsBoolean()))
             return createStringError("invalid configuration for " + id.str());
           auto at = field(*component, "at");
+          bool inherited = group == "nodes" && kind == "decisions" &&
+                           !llvm::StringRef(at).starts_with(key.str() + "@");
+          if (inherited) {
+            auto *choice = item.getAsObject();
+            auto source = llvm::StringRef(at).split('@').first;
+            auto attachment = declaration->getString("at").value();
+            auto onPath = [&](llvm::StringRef boundary) {
+              return llvm::any_of(
+                  *declaration->getArray("path"),
+                  [&](const auto &v) { return v.getAsString() == boundary; });
+            };
+            if (attachment.split('@').first == source && onPath(at) &&
+                !onPath(field(*component, "materialize_at")) && choice &&
+                choice->size() == 1 && choice->getString("realizer"))
+              continue;
+          }
           if (group == "nodes"
                   ? !llvm::StringRef(at).starts_with(key.str() + "@")
                   : !llvm::any_of(
@@ -214,6 +237,52 @@ llvm::Error checkConfiguration(const Object &config, const Object &manifest,
     }
   }
   return llvm::Error::success();
+}
+
+using FamilyBindings = std::map<std::string, std::string>;
+// One attachment contract for both child representations and exits. Compute it
+// independently of exit traversal so unused nodes have meaningful status too.
+llvm::Expected<FamilyBindings> bindAttachment(const Components &c,
+                                              const Object &units,
+                                              const Object &branch,
+                                              const Object &options) {
+  FamilyBindings result;
+  auto attachment = field(branch, "at");
+  if (attachment == "entry")
+    return result;
+  auto owner = field(*units.getObject(field(branch, "unit")), "owner");
+  auto path = branch.getArray("path");
+  auto includes = [&](const std::string &b) {
+    return llvm::any_of(*path,
+                        [&](const auto &v) { return v.getAsString() == b; });
+  };
+  for (const auto &[id, f] : c.families) {
+    if (llvm::StringRef(f.value.decideAt).split('@').first !=
+            llvm::StringRef(attachment).split('@').first ||
+        !includes(f.value.decideAt) || includes(f.value.materializeAt))
+      continue;
+    std::vector<std::string> choices;
+    for (const auto &[rid, r] : c.realizers) {
+      if (r.value.family == id &&
+          field(*units.getObject(field(*c.catalog.getObject(rid), "unit")),
+                "owner") == owner)
+        choices.push_back(rid);
+    }
+    auto *decisions = options.getObject("decisions");
+    auto *explicitChoice = decisions ? decisions->getObject(id) : nullptr;
+    if (explicitChoice && explicitChoice->getString("realizer") &&
+        llvm::is_contained(choices, field(*explicitChoice, "realizer")))
+      result[id] = field(*explicitChoice, "realizer");
+    else if (!explicitChoice && choices.size() == 1)
+      result[id] = choices.front();
+    else
+      return createStringError(owner + " at " + attachment +
+                               (llvm::StringRef(owner).starts_with("exits/")
+                                    ? ": needs an exit-private realizer for "
+                                    : ": needs a node-private realizer for ") +
+                               id);
+  }
+  return result;
 }
 } // namespace
 
@@ -312,10 +381,41 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
   Object selected;
   std::vector<Exit> exits;
   Object description = manifest;
+  std::map<std::string, FamilyBindings> handoffs;
+  auto bindBranch = [&](const std::string &name, Object &branch,
+                        llvm::StringRef group) {
+    auto at = field(branch, "at");
+    if (at != "entry") {
+      auto parent = llvm::StringRef(at).split('@').first;
+      auto *declaration = description.getObject("nodes")->getObject(parent);
+      if (auto failure = declaration->getString("error")) {
+        branch["valid"] = false;
+        branch["error"] = failure->str();
+        return;
+      }
+    }
+    auto result = bindAttachment(c, *manifest.getObject("units"), branch,
+                                 settings(config, group, name));
+    branch["valid"] = bool(result);
+    if (result)
+      handoffs[name] = std::move(*result);
+    else
+      branch["error"] = llvm::toString(result.takeError());
+  };
+  for (auto &level : *manifest.getArray("levels")) {
+    for (auto &[name, n] : *description.getObject("nodes"))
+      if (n.getAsObject()->getString("level") ==
+          level.getAsObject()->getString("name"))
+        bindBranch(name.str(), *n.getAsObject(), "nodes");
+  }
   for (auto &[key, value] : *manifest.getObject("exits")) {
     std::string name = key.str();
     auto &e = *value.getAsObject();
+    auto *status = description.getObject("exits")->getObject(key);
+    bindBranch(name, *status, "exits");
     auto buildExit = [&]() -> llvm::Expected<Exit> {
+      if (auto failure = status->getString("error"))
+        return createStringError(failure->str());
       if (invalidExits.count(name))
         return createStringError(invalidExits.at(name));
       if (!c.exits.count(name))
@@ -349,6 +449,13 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       };
       std::map<std::string, detail::DecisionProgram> pending;
       std::set<std::string> chosen;
+      FamilyBindings pathBindings;
+      for (auto &b : *e.getArray("path")) {
+        const auto &bindings =
+            handoffs.at(b.getAsString()->split('@').first.str());
+        pathBindings.insert(bindings.begin(), bindings.end());
+      }
+      std::string previousOwner;
       for (auto &b : *e.getArray("path")) {
         auto at = b.getAsString()->str();
         auto node = at.substr(0, at.find('@'));
@@ -365,9 +472,8 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         stage.verifyOutput = [spec, profile](mlir::ModuleOp m) {
           return spec.verify(m, *profile);
         };
-        if (node == name &&
-            at == name + "@" +
-                      e.getArray("boundaries")->front().getAsString()->str()) {
+        if (node != previousOwner) {
+          previousOwner = node;
           for (auto &[id, program] : pending) {
             program.materialize = true;
             stage.groups.push_back(PassGroup::forDecision(program));
@@ -405,33 +511,26 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
           for (auto &[rid, r] : c.realizers)
             if (r.value.family == id && available(rid))
               table->realizers.emplace(rid, r.value);
-          auto choice =
-              choiceFor(mergedField(defaults, overrides, "decisions"), id);
+          auto selections = mergedField(defaults, overrides, "decisions");
+          auto *selection = selections.getObject(id);
+          if (pathBindings.count(id)) {
+            if (auto *explicitChoices = overrides.getObject("decisions"))
+              if (auto *requested = explicitChoices->getObject(id))
+                if (requested->getString("realizer") != pathBindings.at(id))
+                  return createStringError(
+                      name + ": realizer for " + id +
+                      " is fixed by the branch attachment");
+            if (selection && selection->size() == 1 &&
+                selection->getString("realizer") &&
+                defaults.getObject("decisions"))
+              selections = *defaults.getObject("decisions");
+          }
+          auto choice = choiceFor(selections, id);
           if (!choice)
             return choice.takeError();
-          auto path = e.getArray("path");
-          if (!llvm::any_of(*path, [&](const auto &p) {
-                return p.getAsString() == v.value.materializeAt;
-              })) {
-            std::vector<std::string> local;
-            for (auto &[rid, r] : table->realizers) {
-              auto unit = field(*c.catalog.getObject(rid), "unit");
-              if (field(*manifest.getObject("units")->getObject(unit),
-                        "owner") == "exits/" + name)
-                local.push_back(rid);
-            }
-            if (!llvm::is_contained(local, choice->realizer)) {
-              auto *explicitChoices = overrides.getObject("decisions");
-              if (local.size() != 1 ||
-                  (explicitChoices && explicitChoices->get(id)))
-                return createStringError(
-                    name +
-                    ": early exit needs a unique or explicitly selected "
-                    "exit-private realizer for " +
-                    id);
-              choice->realizer = local.front();
-            }
-          }
+          if (auto privateBinding = pathBindings.find(id);
+              privateBinding != pathBindings.end())
+            choice->realizer = privateBinding->second;
           detail::DecisionProgram program{table, *choice, false};
           if (auto err = program.validate())
             return std::move(err);
@@ -471,7 +570,6 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       return t;
     };
     auto made = buildExit();
-    auto *status = description.getObject("exits")->getObject(key);
     (*status)["valid"] = bool(made);
     if (made)
       exits.push_back(std::move(*made));
