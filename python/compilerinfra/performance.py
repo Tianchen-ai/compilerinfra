@@ -1,10 +1,12 @@
 """Prediction/measurement interchange used by external Bench implementations."""
 
 from collections import defaultdict
+import hashlib
+import json
 from itertools import combinations
 from math import isfinite
 from numbers import Real
-from statistics import mean
+from statistics import mean, median
 import re
 
 
@@ -29,6 +31,41 @@ def _top_k(values, k):
         key: (1 if value < cutoff else share if value == cutoff else 0)
         for key, value in values.items()
     }
+
+
+def timed_receipt(invocation_id, selection, samples_ms):
+    """Seal the timer's samples together with the bound launch it just measured."""
+    record = dict(invocation_id=invocation_id, runtime_identity=selection["runtime_identity"],
+                  artifact_sha256=selection["artifact_sha256"], samples_ms=list(samples_ms))
+    record["digest"] = _receipt_digest(record)
+    return record
+
+
+def _receipt_digest(record):
+    fields = {k:record[k] for k in ("invocation_id","runtime_identity","artifact_sha256","samples_ms")}
+    encoded = json.dumps(fields, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def measurement_rows(batch, split, family, receipts):
+    """Select the actual automatic run and the forced runs of all other rows."""
+    grouped = defaultdict(list)
+    for rec in receipts:
+        grouped[rec["runtime_identity"]["structures"][family]].append(rec)
+    rows = []
+    for structure, runs in grouped.items():
+        automatic = [r for r in runs if r["runtime_identity"]["row_selection"] == "automatic"]
+        if len(automatic) != 1:
+            raise ValueError(f"{structure}: expected one automatic run")
+        winner = automatic[0]["runtime_identity"]["row_id"]
+        for rec in runs:
+            identity = rec["runtime_identity"]
+            if identity["row_selection"] == "forced" and identity["row_id"] == winner:
+                continue
+            rows.append(dict(batch=batch, split=split, candidate=structure,
+                compilation_id=identity["compilation_id"], compiler_candidate=identity["compiler_candidate"],
+                row_id=identity["row_id"], artifact_sha256=rec["artifact_sha256"], measurement_receipt=rec))
+    return rows
 
 
 def _join_batch(batch, compilations, measured):
@@ -87,7 +124,28 @@ def _join_batch(batch, compilations, measured):
             raise ValueError(f"unexpected or repeated measured row {ident}")
         seen.add(ident)
         p, pred, ns = expected[ident]
-        receipt = row["runtime_identity"]
+        run = row.get("measurement_receipt")
+        if not isinstance(run, dict):
+            raise ValueError(f"{ident}: missing timed invocation receipt")
+        if not run.get("invocation_id") or run.get("digest") != _receipt_digest(run):
+            raise ValueError(f"{ident}: timed invocation contents changed")
+        receipt = run["runtime_identity"]
+        if receipt != row.get("runtime_identity", receipt):
+            raise ValueError(f"{ident}: timed invocation differs from reported execution")
+        mode = receipt.get("row_selection")
+        if mode not in ("automatic", "forced"):
+            raise ValueError(f"{ident}: missing native row selection mode")
+        if run["artifact_sha256"] != p["artifact_sha256"]:
+            raise ValueError(f"{ident}: timed invocation measured a different artifact")
+        samples = run["samples_ms"]
+        if not isinstance(samples, list) or not samples or not all(_number(x, positive=True) for x in samples):
+            raise ValueError(f"{ident}: invalid timed invocation samples")
+        measured_ns = median(samples) * 1e6
+        if "measured_ns" in row and row["measured_ns"] != measured_ns:
+            raise ValueError(f"{ident}: external duration differs from timed invocation")
+        winner = mode == "automatic"
+        if "winner" in row and row["winner"] is not winner:
+            raise ValueError(f"{ident}: winner contradicts native row selection")
         if (receipt["compilation_id"], receipt["compiler_candidate"], receipt["package_sha256"]) != (
                 p["compilation_id"], p["candidate"], p["package_sha256"]):
             raise ValueError(f"{ident}: measured package or native identity mismatch")
@@ -100,7 +158,8 @@ def _join_batch(batch, compilations, measured):
             raise ValueError(f"{ident}: compilation or candidate identity mismatch")
         if row["artifact_sha256"] != p["artifact_sha256"]:
             raise ValueError(f"{ident}: measured artifact differs from emitted artifact")
-        joined.append(dict(row, selected=selected, terms=pred["terms"], predicted_ns=pred["predicted_ns"], structure_ns=ns))
+        joined.append(dict(row, winner=winner, measured_ns=measured_ns, selected=selected,
+                           terms=pred["terms"], predicted_ns=pred["predicted_ns"], structure_ns=ns))
     if expected.keys() - seen:
         raise ValueError(f"missing measured rows {sorted(expected.keys()-seen)}")
     return joined
@@ -115,6 +174,7 @@ def accuracy(document, k=1):
     grouped = defaultdict(list)
     predictions = defaultdict(list)
     ids = {}
+    run_batches = defaultdict(list)
     conflicts = set()
     for e in document["compilations"]:
         predictions[e["batch"]].append(e)
@@ -125,9 +185,15 @@ def accuracy(document, k=1):
         ids[cid] = p
     for row in document["rows"]:
         grouped[row["batch"]].append(row)
+        run = row.get("measurement_receipt")
+        if isinstance(run, dict) and isinstance(run.get("invocation_id"),str):
+            run_batches[run["invocation_id"]].append(row["batch"])
+    reused = {b for batches in run_batches.values() if len(batches)>1 for b in batches}
     accepted, excluded = [], []
     for batch in sorted(predictions.keys() | grouped.keys()):
         try:
+            if batch in reused:
+                raise ValueError("timed invocation reused by multiple measurements")
             if not predictions[batch] or not grouped[batch]:
                 raise ValueError("batch lacks predictions or measurements")
             if any(e["prediction"].get("compilation_id") in conflicts for e in predictions[batch]):

@@ -28,6 +28,13 @@
 
 交换格式为 `{"version":3,"compilations":[...],"rows":[...]}`。每项编译记录包含 batch、family、原生 prediction 以及本批普通配置的 default_prediction。由同一物理输入的默认 explain 决定 selected。每行附被测调用的 runtime_identity（编译与候选 ID、产物包 SHA-256、各家族实际选择的结构与实际行号）。框架逐批核对程序、配置、产物及行域；不符的整批进入 excluded。
 
+从 SDK 0.3.3 起，采样方对实际计时的 prepared call 取运行回执，
+用 `compilerinfra.performance.timed_receipt` 把本次调用 ID、原生选择模式、
+行号、产物身份及同次完整调用的毫秒样本封在一起。每结构只用一次 automatic
+回执计入 winner；其余合法行各提供一次 forced 回执。诊断时单独测量同一行的
+forced 样本可以保存在 Bench，不参与该结构 winner 的耗时计算。计分器从
+自动回执样本取中位数；冲突标注、跨批复用、缺回执或样本被替换均排除整批。
+
 | 字段 | 含义 |
 |---|---|
 | batch、split | 同设备、编译环境、工作负载、实际输入和测量协议的一次可比批次。独立划为 calibration 或 holdout。 |
