@@ -27,7 +27,7 @@ public:
   mlir::MLIRContext &context();
   void printPipeline(llvm::raw_ostream &output) const;
   // Compile source, or parse a checkpoint for range.after. A range.through
-  // returns serialized IR; otherwise emit the target artifact. No file I/O.
+  // returns serialized IR; otherwise emit the exit artifact. No file I/O.
   llvm::Expected<Artifact> compile(llvm::MemoryBufferRef input,
                                    const StageRange &range = {},
                                    IRFormat format = IRFormat::Bytecode,
@@ -52,7 +52,7 @@ private:
   explicit Session(std::unique_ptr<Impl> impl);
   static llvm::Expected<std::unique_ptr<Session>>
   create(std::shared_ptr<const Compiler::Definition> definition,
-         const Target &target, mlir::MLIRContext *external,
+         const Exit &exit, mlir::MLIRContext *external,
          const SessionOptions &options);
   std::unique_ptr<Impl> impl;
 };

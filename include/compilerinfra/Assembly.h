@@ -13,18 +13,12 @@ namespace compilerinfra {
 struct SourceRef {
   std::string file;
   unsigned line;
-  std::string component;
 };
-#ifndef COMPILERINFRA_COMPONENT_NAME
-#define COMPILERINFRA_COMPONENT_NAME ""
-#endif
 #define COMPILERINFRA_SOURCE                                                   \
-  ::compilerinfra::SourceRef {                                                 \
-    __FILE__, __LINE__, COMPILERINFRA_COMPONENT_NAME                           \
-  }
+  ::compilerinfra::SourceRef { __FILE__, __LINE__ }
 
-// Providers supply typed product interfaces used by shared lowering code.
-// MLIR TypeID keeps interface identity independent of the provider name.
+// Exit implementations bind typed hardware and toolchain services.
+// MLIR TypeID keeps interface identity independent of the exit name.
 class TargetServices {
 public:
   template <typename Interface>
@@ -60,7 +54,7 @@ using ModelPasses =
     std::function<llvm::Error(mlir::OpPassManager &, const TargetProfile &)>;
 
 struct Boundary {
-  std::string name; // local to this node
+  std::string name; // local to the registering node or exit
   ModelPasses lower;
   ModelCheck verify;
 };
@@ -74,8 +68,7 @@ struct FamilyBinding {
   DecisionFamily family;
   std::string decideAt, materializeAt;
 };
-struct Exit {
-  ModelPasses legalize;
+struct ExitImplementation {
   Emit emit;
   std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)>
       capabilities;
@@ -97,19 +90,22 @@ public:
   std::vector<Located<FamilyBinding>> families;
   std::vector<Located<Strategy>> strategies;
   std::vector<Located<Realizer>> realizers;
-  std::optional<Located<Exit>> exit;
+  std::optional<Located<ExitImplementation>> exit;
   std::string qualify(llvm::StringRef local) const {
     return id + "::" + local.str();
   }
 };
 
+class InstalledProduct;
 class Assembly {
 public:
   void bind(llvm::StringRef unit, void (*registerUnit)(Unit &));
+
+private:
+  friend class InstalledProduct;
   llvm::Expected<Compiler> link(const llvm::json::Object &manifest,
                                 const llvm::json::Object &configuration) const;
 
-private:
   std::map<std::string, Unit> units;
 };
 } // namespace compilerinfra

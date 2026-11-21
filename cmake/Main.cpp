@@ -26,7 +26,7 @@ int main(int argc, char **argv) {
       explain = true;
     else if ((opt == "--exit" || opt == "--after" || opt == "--through" ||
               opt == "--configuration" || opt == "--input" ||
-              opt == "--output") &&
+              opt == "--output" || opt == "--root-sha256") &&
              i + 1 < argc)
       args[opt] = argv[++i];
     else {
@@ -64,10 +64,20 @@ int main(int argc, char **argv) {
     auto get = [&](const char *k) {
       return args.count(k) ? args[k].c_str() : nullptr;
     };
-    if (failed(ci_compile(c.get(), get("--exit"), data.data(), data.size(),
-                          get("--after"), get("--through"), text, &output,
-                          explain ? &events : nullptr)))
+    auto error =
+        explain
+            ? ci_compile_trace(c.get(), get("--exit"), data.data(), data.size(),
+                               get("--after"), get("--through"), text,
+                               get("--root-sha256"), &output, &events)
+            : ci_compile(c.get(), get("--exit"), data.data(), data.size(),
+                         get("--after"), get("--through"), text, &output,
+                         nullptr);
+    if (failed(error)) {
+      if (explain && events.data)
+        std::cerr.write(static_cast<char *>(events.data), events.size) << '\n';
+      ci_free(events.data);
       return 1;
+    }
   }
   if (explain && events.data)
     std::cerr.write(static_cast<char *>(events.data), events.size) << '\n';

@@ -3,13 +3,15 @@
 from dataclasses import dataclass
 from importlib import import_module
 import inspect
+import os
 from pathlib import Path
 import shutil
 import subprocess
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 from compilerinfra.tree import provenance, relative, tree
-from .source import Snapshot, adoption_lock, applied, build, publish
+from .source import Snapshot, adoption_lock, applied, build
+from compilerinfra.installation import publish
 from .worker import Worker
 
 
@@ -19,21 +21,7 @@ class Candidate:
     snapshot: Snapshot | None
     description: dict
     parent: str | None
-    configuration: dict
-    events: list | None = None
-    measured_exit: str | None = None
-
-
-def overlay(base, delta):
-    import copy
-
-    result = copy.deepcopy(base)
-    for section, scopes in delta.items():
-        for scope, settings in scopes.items():
-            current = result.setdefault(section, {}).setdefault(scope, {})
-            for group, items in settings.items():
-                current.setdefault(group, {}).update(items)
-    return result
+    changes: list
 
 
 class Scope:
@@ -59,6 +47,7 @@ class Scope:
         self.library = (
             Path(library).parent.resolve() / Path(library).name if library else None
         )
+        self.observations = {}
         self.values = {}
         self.owned = {}
         self.base_key = None
@@ -76,7 +65,7 @@ class Scope:
         pinned = self.root / key / "baseline" / self.library.parent.name
         pinned.mkdir(parents=True)
         for file in self.library.parent.iterdir():
-            if file == self.library:
+            if file == self.library or file.name == self.library.name + ".python":
                 shutil.copy2(file, pinned / file.name)
             elif (
                 file.name
@@ -96,7 +85,7 @@ class Scope:
                 snap = Snapshot(self.root / key, roots)
                 self.check_fingerprint(desc, model)
                 worker.call("activate", key)
-            self.values[key] = Candidate(worker, snap, desc, None, {})
+            self.values[key] = Candidate(worker, snap, desc, None, [])
             self.owned[worker] = self.root / key
             self.base_key = key
         except BaseException:
@@ -106,6 +95,18 @@ class Scope:
     @staticmethod
     def check_fingerprint(desc, model):
         actual = provenance(model)
+
+        def frontend(layout):
+            return {
+                a["path"]: a["sha256"]
+                for a in layout["assets"]
+                if a.get("kind") == "frontend"
+            }
+
+        if frontend(desc) != frontend(model):
+            raise ValueError(
+                "workspace frontend differs from the installed frontend manifest"
+            )
         if actual != desc["fingerprint"]:
             raise ValueError(
                 f"workspace differs from installation: installed={desc['fingerprint']} workspace={actual}"
@@ -119,12 +120,35 @@ class Scope:
             )
         return k
 
+    def source_locations(self, id):
+        candidate = self.values[self.key(id)]
+        layout = candidate.description
+        roots = {
+            k: (self.workspace / path).resolve()
+            for k, path in layout["packages"].items()
+        }
+        if (
+            candidate.snapshot
+            and candidate.snapshot is not self.values[self.base_key].snapshot
+        ):
+            roots = candidate.snapshot.roots
+        locations = {}
+        for name, registration in layout["components"].items():
+            unit = layout["units"][registration["unit"]]
+            package = unit["package"]
+            local = os.path.relpath(registration["file"], layout["packages"][package])
+            locations[name] = {
+                "file": str(roots[package] / local),
+                "line": registration["line"],
+            }
+        return locations
+
     def derive(self, parent, configuration, patch, extensions):
         base_key = self.key(parent)
         base = self.values[base_key]
         key = uuid4().hex
         folder = self.root / key
-        changes = overlay(base.configuration, configuration)
+        changes = [*base.changes, configuration]
         worker, snap = base.worker, base.snapshot
         patches = dict(extensions or {})
         if patch:
@@ -134,7 +158,7 @@ class Scope:
                 snap = snap.derive(folder, patches)
                 lib = build(snap.roots, folder / "build", folder / "install")
                 worker = Worker(lib, self.profile)
-                desc = worker.call("open", key, configuration=changes)
+                desc = worker.call("open", key, changes=changes)
                 self.owned[worker] = folder
             else:
                 desc = worker.call(
@@ -188,7 +212,7 @@ class Scope:
             with applied(roots, patches):
                 stage = folder / "install"
                 lib = build(roots, folder / "build", stage)
-                rel = relative(c.description["product"]["install"]["library"])
+                rel = relative(c.description["library"])
                 prefix = self.library.parents[len(rel.parts) - 1]
                 if (prefix / rel) != self.library:
                     raise ValueError(
@@ -214,12 +238,12 @@ class Scope:
         exit,
         through=None,
         after=None,
-        observe=False,
+        root_sha256=None,
         author_input=False,
     ):
         key = self.key(id)
         c = self.values[key]
-        c.events, c.measured_exit = None, None
+
         result = c.worker.call(
             "compile",
             key,
@@ -228,23 +252,32 @@ class Scope:
             through=through,
             after=after,
             text=bool(through),
-            explain=observe,
+            explain=True,
+            root_sha256=root_sha256,
             author_input=author_input,
         )
-        if observe:
-            artifact, c.events = result
-            c.measured_exit = exit
-            return artifact
-        return result
+        artifact, report = result
+        report["native_candidate"] = report["candidate"]
+        report["candidate"] = key
+        cid = report["compilation_id"]
+        self.observations[cid] = (report, c.description)
+        if report["error"]:
+            raise ValueError(f"{cid}: {report['error']}")
+        return artifact, cid
 
-    def impact(self, id, component):
-        c = self.values[self.key(id)]
-        item = c.description["components"][component]
+    def impact(self, id, component, compilation_id=None):
+        report = None
+        if compilation_id is None:
+            description = self.values[self.key(id or "base")].description
+        else:
+            report, description = self.observations[compilation_id]
+            if id and self.key(id) != report["candidate"]:
+                raise ValueError("compilation belongs to a different candidate")
+
+        item = description["components"][component]
         at = item["at"]
-        reachable = [
-            k for k, v in c.description["exits"].items() if at in v["boundaries"]
-        ]
-        owner = c.description["units"][item["unit"]]["owner"]
+        reachable = [k for k, v in description["exits"].items() if at in v["path"]]
+        owner = description["units"][item["unit"]]["owner"]
         if owner.startswith("exits/"):
             reachable = [e for e in reachable if owner == "exits/" + e]
         elif owner.startswith("levels/"):
@@ -252,24 +285,23 @@ class Scope:
             reachable = [
                 e
                 for e in reachable
-                if any(
-                    b.startswith(node) for b in c.description["exits"][e]["boundaries"]
-                )
+                if any(b.startswith(node) for b in description["exits"][e]["path"])
             ]
-        events = c.events
+        events = report["events"] if report else None
         return dict(
             reachable=reachable,
-            selected=[
-                e for e in reachable if component in c.description["selected"][e]
-            ],
-            observed_exit=c.measured_exit,
+            selected=[e for e in reachable if component in description["selected"][e]],
+            compilation_id=compilation_id,
+            observed_exit=report["exit"] if report else None,
+            root_sha256=report["root_sha256"] if report else None,
             hits=None
             if events is None
             else [
                 v
                 for v in events
                 if v["action"] != "no_match"
-                and component in (v["implementation"], v["family"])
+                and (v["action"] != "contribution" or v["changed"])
+                and component in (v["implementation"], v.get("family"))
             ],
         )
 
@@ -284,7 +316,7 @@ class Scope:
             candidate=key,
             library=str(c.worker.library),
             configuration=c.description["configuration"],
-            python=p["install"]["python"],
+            python=c.worker.interpreter,
             workload=workload,
             output_dir=str(Path(output_dir).resolve()),
         )

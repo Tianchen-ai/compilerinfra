@@ -23,7 +23,11 @@ class Catalog:
 
         def inspect_compiler(compiler: str = "base"):
             """Inspect the installed compiler and its scoped development assets."""
-            return dict(layout(compiler), **self.plugins(compiler))
+            return dict(
+                layout(compiler),
+                source_locations=scope.source_locations(compiler),
+                **self.plugins(compiler),
+            )
 
         def compile_ir(
             input: str,
@@ -33,20 +37,25 @@ class Catalog:
             after: str | None = None,
             output: str | None = None,
             author_input: bool = False,
+            root_sha256: str | None = None,
         ):
             """Compile root IR or resume bytecode at a named boundary."""
-            artifact = scope.compile(
+            artifact, cid = scope.compile(
                 compiler,
                 Path(input).read_bytes(),
                 exit,
                 through,
                 after,
                 author_input=author_input,
+                root_sha256=root_sha256,
             )
             if output:
                 Path(output).write_bytes(artifact)
-                return {"output": output, "bytes": len(artifact)}
-            return {"base64": base64.b64encode(artifact).decode()}
+                return {"compilation_id": cid, "output": output, "bytes": len(artifact)}
+            return {
+                "compilation_id": cid,
+                "base64": base64.b64encode(artifact).decode(),
+            }
 
         action("layout", layout)
         action("inspect", inspect_compiler)
@@ -63,40 +72,48 @@ class Catalog:
             """Derive a compiler configuration or build an independent patched source candidate."""
             return scope.derive(compiler, configuration or {}, patch, extension_patches)
 
-        def explain(
-            input: str, exit: str, compiler: str = "base", through: str | None = None
-        ):
-            """Collect the strategy and realization events produced by this input."""
-            scope.compile(
-                compiler, Path(input).read_bytes(), exit, through, observe=True
-            )
-            return scope.values[scope.key(compiler)].events
+        def explain(compilation_id: str):
+            """Read the transformation events for this compilation."""
+            return scope.observations[compilation_id][0]
 
         def compare(
             input: str, exit: str, through: str, compiler: str, baseline: str = "base"
         ):
             """Compare two candidates at the same representation boundary."""
-            node = through.partition("@")[0]
-            if (
-                layout(compiler)["nodes"][node]["contract"]
-                != layout(baseline)["nodes"][node]["contract"]
-            ):
+
+            def contract(id):
+                desc = layout(id)
+                owner = through.partition("@")[0]
+                if owner in desc["nodes"]:
+                    return ("node", desc["nodes"][owner]["contract"])
+                return (
+                    "exit",
+                    desc["exits"][owner]["at"],
+                    desc["exits"][owner]["description"],
+                )
+
+            if contract(compiler) != contract(baseline):
                 raise ValueError(f"different representation contracts at {through}")
             data = Path(input).read_bytes()
+            results = [
+                scope.compile(id, data, exit, through) for id in (baseline, compiler)
+            ]
             a, b = [
-                scope.compile(id, data, exit, through)
-                .decode()
-                .splitlines(keepends=True)
-                for id in (baseline, compiler)
+                artifact.decode().splitlines(keepends=True) for artifact, _ in results
             ]
             return {
+                "compilation_ids": [cid for _, cid in results],
                 "changed": a != b,
                 "diff": "".join(difflib.unified_diff(a, b, baseline, compiler)),
             }
 
-        def impact(component: str, compiler: str = "base"):
-            """Inspect reachability, configuration selection and hits in the last observed input."""
-            return scope.impact(compiler, component)
+        def impact(
+            component: str,
+            compiler: str | None = None,
+            compilation_id: str | None = None,
+        ):
+            """Inspect reachability, configuration selection and hits for a compilation ID."""
+            return scope.impact(compiler, component, compilation_id)
 
         def read_skill(name: str, compiler: str = "base"):
             """Read a framework or installed product skill."""

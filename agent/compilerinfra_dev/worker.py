@@ -1,10 +1,13 @@
 """One spawned process owns one native build and all its configuration handles."""
 
 import asyncio
-import multiprocessing
+from multiprocessing import Pipe
+from multiprocessing.connection import Connection
+from pathlib import Path
+import subprocess
 import os
 import sys
-from compilerinfra import Compiler
+from compilerinfra import CompilationError, Compiler
 from .plugins import installed
 
 
@@ -20,10 +23,14 @@ def serve(pipe, path, profile):
                     return
                 if op in {"open", "derive"}:
                     handles[key] = (
-                        Compiler(path, args["configuration"])
+                        Compiler(path, args.get("configuration"))
                         if op == "open"
                         else handles[args["parent"]].derive(args["configuration"])
                     )
+                    for delta in args.get("changes", []):
+                        current = handles[key]
+                        handles[key] = current.derive(delta)
+                        current.close()
                     result = handles[key].describe()
                 elif op == "activate" and profile == "development":
                     catalogs[key] = installed(handles[key])
@@ -36,7 +43,10 @@ def serve(pipe, path, profile):
                 elif op == "compile":
                     if args.pop("author_input", False):
                         args["source"] = handles[key].root_ir(args["source"])
-                    result = handles[key].compile(**args)
+                    try:
+                        result = handles[key].compile(**args)
+                    except CompilationError as exc:
+                        result = (None, exc.report)
                 elif op == "catalog":
                     result = (
                         catalogs[key].describe()
@@ -67,26 +77,57 @@ def serve(pipe, path, profile):
 class Worker:
     def __init__(self, library, profile):
         self.library = library
-        ctx = multiprocessing.get_context("spawn")
-        self.pipe, child = ctx.Pipe()
-        self.process = ctx.Process(
-            target=serve, args=(child, str(library), profile), daemon=True
-        )
-        self.process.start()
-        child.close()
+        interpreter = Path(str(library) + ".python").read_text().strip()
+        self.interpreter = interpreter
+        env = os.environ.copy()
+        env.pop("PYTHONHOME", None)
+        env.pop("PYTHONPATH", None)
+        bin_dir = Path(interpreter).parent
+        if (bin_dir.parent / "pyvenv.cfg").is_file():
+            env["VIRTUAL_ENV"] = str(bin_dir.parent)
+            env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+        self.pipe, child = Pipe()
+        try:
+            self.process = subprocess.Popen(
+                [
+                    interpreter,
+                    "-m",
+                    __name__,
+                    str(child.fileno()),
+                    str(library),
+                    profile,
+                ],
+                pass_fds=(child.fileno(),),
+                stdin=subprocess.DEVNULL,
+                stdout=sys.stderr,
+                env=env,
+                cwd=Path(library).parent,
+            )
+        finally:
+            child.close()
 
     def call(self, op, key, **args):
-        self.pipe.send((op, key, args))
         try:
+            self.pipe.send((op, key, args))
             ok, result = self.pipe.recv()
-        except EOFError as exc:
-            raise RuntimeError(f"compiler worker for {self.library} exited") from exc
+        except (EOFError, ConnectionError) as exc:
+            raise RuntimeError(
+                f"compiler worker for {self.library} exited using {self.interpreter}"
+            ) from exc
         if not ok:
             raise ValueError(result)
         return result
 
     def close(self):
-        if self.process.is_alive():
-            self.pipe.send(("close", "", {}))
-        self.pipe.close()
-        self.process.join()
+        try:
+            if self.process.poll() is None:
+                self.pipe.send(("close", "", {}))
+        except BrokenPipeError:
+            pass
+        finally:
+            self.pipe.close()
+            self.process.wait()
+
+
+if __name__ == "__main__":
+    serve(Connection(int(sys.argv[1])), sys.argv[2], sys.argv[3])

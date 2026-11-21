@@ -91,6 +91,8 @@ def installed(compiler):
     root = compiler.library.path.parent / (description["product"]["name"] + ".assets")
     try:
         for entry in description["assets"]:
+            if entry.get("kind") == "frontend":
+                continue
             rel = relative(entry["path"])
             src = (root / rel).resolve(strict=True)
             if (

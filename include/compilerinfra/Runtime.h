@@ -24,6 +24,13 @@ const char *ci_compile(const ci_compiler *, const char *exit_name,
                        const char *through, int assembly_text,
                        ci_buffer *output, ci_buffer *events_json);
 void ci_close(ci_compiler *);
+// Returns a compilation ID, input identity and executed transformation events.
+// For checkpoints from another compiler supply the original root SHA-256.
+const char *ci_compile_trace(const ci_compiler *, const char *exit_name,
+                             const void *input, size_t size, const char *after,
+                             const char *through, int assembly_text,
+                             const char *root_sha256, ci_buffer *output,
+                             ci_buffer *report);
 void ci_free(const void *);
 #if defined(__GNUC__)
 #pragma GCC visibility pop

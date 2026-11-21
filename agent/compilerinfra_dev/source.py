@@ -4,10 +4,8 @@ from contextlib import contextmanager
 import fcntl
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 from compilerinfra.tree import read, relative, write
 
 
@@ -101,6 +99,7 @@ def build(roots, directory, install):
     product = read(root / "product.json")
     env = dict(
         os.environ,
+        CI_PRIVATE_INSTALL="1",
         CI_EXTENSION_ROOTS=json.dumps(
             {k: str(v) for k, v in roots.items() if k != "."}
         ),
@@ -120,7 +119,9 @@ def build(roots, directory, install):
     )
     command(root, ["cmake", "--build", directory], env=env)
     command(root, ["cmake", "--install", directory, "--prefix", install], env=env)
-    lib = install / relative(product["install"]["library"])
+    lib = install / relative(
+        (directory / "compilerinfra/library.path").read_text().strip()
+    )
     return lib.resolve(strict=True)
 
 
@@ -137,55 +138,3 @@ def applied(roots, patches):
         for key in reversed(done):
             git(roots[key], "apply", "--reverse", "--binary", "-", data=patches[key])
         raise
-
-
-@contextmanager
-def publish(stage, prefix, backup, library):
-    """Replace installed files atomically and restore them if activation fails."""
-    done = []
-    generation = None
-    previous_generation = None
-    try:
-        for src in sorted(stage.rglob("*")):
-            if not src.is_file():
-                continue
-            rel = src.relative_to(stage)
-            dest = prefix / rel
-            old = backup / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            exists = dest.exists()
-            if exists:
-                old.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, old, follow_symlinks=False)
-
-            with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as tmp:
-                path = Path(tmp.name)
-            try:
-                shutil.copy2(src, path)
-                if rel == library:
-                    # A previously dlopen'ed pathname can still resolve to the
-                    # old mapping in a long-lived JIT. Publish a fresh realpath.
-                    generation = path.with_name(f".{dest.name}.build-{path.name}")
-                    if dest.is_symlink() and dest.resolve().name.startswith(
-                        f".{dest.name}.build-"
-                    ):
-                        previous_generation = dest.resolve()
-                    os.replace(path, generation)
-                    path.symlink_to(generation.name)
-                os.replace(path, dest)
-            finally:
-                path.unlink(missing_ok=True)
-            done.append((dest, old if exists else None))
-        yield
-    except BaseException:
-        for dest, old in reversed(done):
-            if old:
-                dest.unlink()
-                shutil.copy2(old, dest, follow_symlinks=False)
-            else:
-                dest.unlink()
-        if generation:
-            generation.unlink(missing_ok=True)
-        raise
-    if previous_generation:
-        previous_generation.unlink(missing_ok=True)

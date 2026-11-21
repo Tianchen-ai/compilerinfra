@@ -3,6 +3,7 @@
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace compilerinfra;
@@ -10,6 +11,21 @@ using llvm::createStringError;
 using mlir::ModuleOp;
 
 namespace {
+class ObserveIR
+    : public mlir::PassWrapper<ObserveIR, mlir::OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ObserveIR)
+  explicit ObserveIR(std::function<void(ModuleOp)> record)
+      : record(std::move(record)) {}
+  void runOnOperation() override {
+    record(getOperation());
+    markAllAnalysesPreserved();
+  }
+
+private:
+  std::function<void(ModuleOp)> record;
+};
+
 struct ExecutableStage {
   const Stage &spec;
   std::unique_ptr<mlir::PassManager> passes;
@@ -47,12 +63,11 @@ struct Bounds {
 } // namespace
 
 struct Session::Impl {
-  Impl(std::shared_ptr<const Compiler::Definition> definition,
-       const Target &target)
-      : definition(std::move(definition)), target(target) {}
+  Impl(std::shared_ptr<const Compiler::Definition> definition, const Exit &exit)
+      : definition(std::move(definition)), exit(exit) {}
 
   std::shared_ptr<const Compiler::Definition> definition;
-  const Target &target;
+  const Exit &exit;
   std::unique_ptr<mlir::MLIRContext> ownedContext;
   mlir::MLIRContext *context;
   std::vector<ExecutableStage> stages;
@@ -63,8 +78,8 @@ struct Session::Impl {
     for (size_t i = 0; i < stages.size(); ++i)
       if (stages[i].spec.name == name)
         return i + 1;
-    return createStringError("unknown stage '" + name + "' for target " +
-                             target.name);
+    return createStringError("unknown stage '" + name + "' for exit " +
+                             exit.name);
   }
 
   llvm::Expected<Bounds> bounds(const StageRange &range) const {
@@ -82,39 +97,38 @@ struct Session::Impl {
       result.end = *i;
     }
     if (result.end < result.begin)
-      return createStringError("stop stage precedes resume stage for target " +
-                               target.name);
+      return createStringError("stop stage precedes resume stage for exit " +
+                               exit.name);
     return result;
   }
 
   llvm::Error checkBoundary(const ExecutableStage &stage,
                             ModuleOp module) const {
     if (mlir::failed(stage.spec.verifyOutput(module)))
-      return createStringError(target.name +
-                               ": invalid IR at output boundary '" +
+      return createStringError(exit.name + ": invalid IR at output boundary '" +
                                stage.spec.name + "'");
     return llvm::Error::success();
   }
 
   llvm::Error run(ModuleOp module, Bounds bounds, Observer observe) {
     if (!module || module.getContext() != context)
-      return createStringError(target.name +
+      return createStringError(exit.name +
                                ": module must belong to the session context");
     if (mlir::failed(mlir::verify(module)))
-      return createStringError(target.name + ": invalid input module");
+      return createStringError(exit.name + ": invalid input module");
     if (bounds.begin) {
       if (auto error = checkBoundary(stages[bounds.begin - 1], module))
         return error;
       if (mlir::failed(detail::verifyDecisionCheckpoint(
-              llvm::ArrayRef(target.stages).take_front(bounds.begin), module)))
+              llvm::ArrayRef(exit.stages).take_front(bounds.begin), module)))
         return createStringError("invalid decision state at checkpoint " +
                                  stages[bounds.begin - 1].spec.name);
     } else {
       if ((definition->frontend.verifyInput &&
            mlir::failed(definition->frontend.verifyInput(module))) ||
-          (target.verifyInput && mlir::failed(target.verifyInput(module))))
+          (exit.verifyInput && mlir::failed(exit.verifyInput(module))))
         return createStringError(
-            target.name +
+            exit.name +
             ": module does not satisfy the frontend input boundary");
       if (observe)
         if (auto error = observe("input", module))
@@ -124,7 +138,7 @@ struct Session::Impl {
     for (size_t i = bounds.begin; i < bounds.end; ++i) {
       ExecutableStage &stage = stages[i];
       if (mlir::failed(stage.passes->run(module)))
-        return createStringError(target.name + ": lowering failed in stage '" +
+        return createStringError(exit.name + ": lowering failed in stage '" +
                                  stage.spec.name + "'");
       if (auto error = checkBoundary(stage, module))
         return error;
@@ -150,15 +164,15 @@ void Session::printPipeline(llvm::raw_ostream &output) const {
 
 llvm::Expected<std::unique_ptr<Session>>
 Session::create(std::shared_ptr<const Compiler::Definition> definition,
-                const Target &target, mlir::MLIRContext *external,
+                const Exit &exit, mlir::MLIRContext *external,
                 const SessionOptions &options) {
-  auto state = std::make_unique<Impl>(std::move(definition), target);
+  auto state = std::make_unique<Impl>(std::move(definition), exit);
   const Frontend &frontend = state->definition->frontend;
   mlir::DialectRegistry dialects;
   if (frontend.registerDialects)
     frontend.registerDialects(dialects);
-  if (target.registerDialects)
-    target.registerDialects(dialects);
+  if (exit.registerDialects)
+    exit.registerDialects(dialects);
   if (external) {
     external->appendDialectRegistry(dialects);
     state->context = external;
@@ -166,11 +180,20 @@ Session::create(std::shared_ptr<const Compiler::Definition> definition,
     state->ownedContext = std::make_unique<mlir::MLIRContext>(dialects);
     state->context = state->ownedContext.get();
   }
-  for (const Stage &stage : target.stages) {
+  for (const Stage &stage : exit.stages) {
     auto passes = std::make_unique<mlir::PassManager>(
         state->context, ModuleOp::getOperationName());
     passes->enableVerifier();
     for (const PassGroup &group : stage.groups) {
+      auto observe = group.isRequired()
+                         ? decltype(options.observeContribution){}
+                         : options.observeContribution;
+      std::shared_ptr<std::optional<mlir::OperationFingerPrint>> before;
+      if (observe && group.defaultEnabled()) {
+        before = std::make_shared<std::optional<mlir::OperationFingerPrint>>();
+        passes->addPass(std::make_unique<ObserveIR>(
+            [before](ModuleOp m) { before->emplace(m); }));
+      }
       const BuildPasses *build = &group.builder();
       BuildPasses observed;
       if (group.decision() && options.observeDecision) {
@@ -179,9 +202,18 @@ Session::create(std::shared_ptr<const Compiler::Definition> definition,
       }
       if (group.defaultEnabled())
         if (auto error = (*build)(*passes))
-          return createStringError(target.name + "/" + stage.name + " " +
+          return createStringError(exit.name + "/" + stage.name + " " +
                                    group.name() + ": " +
                                    llvm::toString(std::move(error)));
+      if (observe) {
+        passes->addPass(std::make_unique<ObserveIR>(
+            [observe, before, id = group.name().str(),
+             at = stage.name](ModuleOp m) {
+              observe(id, at, bool(before),
+                      before &&
+                          before->value() != mlir::OperationFingerPrint(m));
+            }));
+      }
     }
     state->stages.push_back({stage, std::move(passes)});
   }
@@ -229,7 +261,7 @@ llvm::Expected<Artifact> Session::compile(mlir::OwningOpRef<ModuleOp> module,
   Artifact bytes;
   llvm::raw_svector_ostream output(bytes);
   auto error = range.through ? writeIR(module.get(), format, output)
-                             : impl->target.emit(module.get(), output);
+                             : impl->exit.emit(module.get(), output);
   if (auto result = diagnostics.finish(std::move(error)))
     return result;
   return bytes;

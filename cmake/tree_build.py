@@ -27,6 +27,20 @@ def save(path, data):
         path.write_text(data)
 
 
+def source_directories(model):
+    # Use the declared package location even when building from private snapshots.
+    root = Path(model["packages"]["."])
+    packages = {".": "."}
+    for ext in model["product"].get("extensions", []):
+        packages[ext["name"]] = os.path.relpath(root / ext["path"], root)
+    return packages
+
+
+def unit_directory(model, u):
+    key = next(k for k, v in model["packages"].items() if v == u["package"])
+    return key, str(Path(source_directories(model)[key]) / u["path"])
+
+
 def configure(model, out):
     units = model["units"]
     lines = []
@@ -37,6 +51,8 @@ def configure(model, out):
                 f"set(ci_unit {quote(key)})",
                 f"set(ci_target {target})",
                 f"set(ci_owner {quote(u['owner'])})",
+                f"set(ci_source_ref {quote(unit_directory(model, u)[1])})",
+                f"set(ci_source_package {quote(source_directories(model)[unit_directory(model, u)[0]])})",
                 f"set(ci_package {quote(u['package'])})",
                 f"add_subdirectory({quote(u['directory'])} units/{target})",
                 f"if(NOT TARGET {target})",
@@ -60,6 +76,16 @@ def generated(model, out):
         declarations.append(f"namespace {ns} {{ void bind(compilerinfra::Unit &); }}")
         calls.append(f'  registry.bind("{key}", {ns}::bind);')
     model["fingerprint"] = provenance(model)
+    model["library"] = (out / "library.path").read_text().strip()
+    for u in model["units"].values():
+        u["package"], u["directory"] = unit_directory(model, u)
+    model["packages"] = source_directories(model)
+    for ext in model["product"].get("extensions", []):
+        ext["path"] = model["packages"][ext["name"]]
+    model["product"]["install"] = {"environment": model["library"] + ".python"}
+    model["product"]["build"] = {"entry": "CMakeLists.txt"}
+    for asset in model["assets"]:
+        del asset["source"]
     save(
         out / "Product.cpp",
         '#include "compilerinfra/Product.h"\n'
@@ -201,6 +227,17 @@ def audit(model):
 
 
 if __name__ == "__main__":
+    if sys.argv[1] == "publish":
+        from compilerinfra.installation import publish
+        from tempfile import TemporaryDirectory
+        import shutil
+
+        stage, prefix, library, previous = map(Path, sys.argv[2:])
+        with TemporaryDirectory(dir=stage.parent) as tmp:
+            with publish(stage, prefix, Path(tmp), library, previous_manifest=previous):
+                pass
+        shutil.rmtree(stage)
+        sys.exit(0)
     mode, root, out = sys.argv[1:]
     model = tree(
         root, extension_roots=json.loads(os.environ.get("CI_EXTENSION_ROOTS", "{}"))

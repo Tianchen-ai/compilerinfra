@@ -48,10 +48,10 @@ def init(directory: str, name: str, version: str = "0.1.0", language: str = "mli
             nodes=[],
             exits=[],
             runtimes=[],
-            frontend=dict(language=language, entry="compilerinfra:root_ir"),
+            frontend=dict(language=language, entry="author:root_ir"),
             configuration=config,
             build=dict(configure_args=[]),
-            install=dict(library=f"lib/lib{name}.so", python=os.sys.executable),
+            install=dict(python=os.sys.executable),
         ),
     )
     (root / "CMakeLists.txt").write_text(
@@ -63,6 +63,9 @@ def init(directory: str, name: str, version: str = "0.1.0", language: str = "mli
         "Register changes in their owning unit. Use the development skill for derivation and measurement.\n"
     )
     unit(root, f"frontend/{language}", "Input.cpp", registration("  (void)unit;\n"))
+    (root / f"frontend/{language}/author.py").write_text(
+        "def root_ir(source: bytes) -> bytes:\n    return source\n"
+    )
     return str(root / "product.json")
 
 
@@ -125,18 +128,34 @@ def add_node(
     )
 
 
-def add_exit(directory: str, name: str, at: str, description: str):
+def add_exit(
+    directory: str,
+    name: str,
+    at: str,
+    description: str,
+    boundaries: list[str] | None = None,
+):
     """Attach an exit. Its initial emitter returns verified textual MLIR."""
+    boundaries = (
+        ["ready"] if boundaries is None else [identifier(b) for b in boundaries]
+    )
     body = (
-        "  Exit value;\n"
-        "  value.legalize = [](mlir::OpPassManager &, const TargetProfile &) { return llvm::Error::success(); };\n"
+        "  auto lower = [](mlir::OpPassManager &, const TargetProfile &) { return llvm::Error::success(); };\n"
+        "  auto verify = [](mlir::ModuleOp m, const TargetProfile &) { return mlir::verify(m); };\n"
+    )
+    for b in boundaries:
+        body += f'  unit.boundaries.push_back({{{{"{b}", lower, verify}}, COMPILERINFRA_SOURCE}});\n'
+    body += (
+        "  ExitImplementation value;\n"
         "  value.emit = [](mlir::ModuleOp m, llvm::raw_pwrite_stream &out) { m.print(out); return llvm::Error::success(); };\n"
-        "  unit.exit = Located<Exit>{std::move(value), COMPILERINFRA_SOURCE};\n"
+        "  unit.exit = Located<ExitImplementation>{std::move(value), COMPILERINFRA_SOURCE};\n"
     )
     return update(
         directory,
         "exits",
-        dict(name=identifier(name), at=at, description=description),
+        dict(
+            name=identifier(name), at=at, description=description, boundaries=boundaries
+        ),
         f"exits/{name}",
         "emit/Exit.cpp",
         registration(body),

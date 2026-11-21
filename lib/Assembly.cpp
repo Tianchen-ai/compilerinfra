@@ -19,7 +19,7 @@ std::string field(const Object &obj, llvm::StringRef key) {
 
 struct Components {
   std::map<std::string, const Located<Boundary> *> boundaries;
-  std::map<std::string, const Located<Exit> *> exits;
+  std::map<std::string, const Located<ExitImplementation> *> exits;
   std::map<std::string, Located<Contribution>> contributions;
   std::map<std::string, Located<FamilyBinding>> families;
   std::map<std::string, Located<Strategy>> strategies;
@@ -44,7 +44,8 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
   const Object &units = *manifest.getObject("units");
   auto owner = field(*units.getObject(u.id), "owner");
   auto node = llvm::StringRef(owner).rsplit('/').second.str();
-  auto *n = manifest.getObject("nodes")->getObject(node);
+  bool exitUnit = llvm::StringRef(owner).starts_with("exits/");
+  auto *n = manifest.getObject(exitUnit ? "exits" : "nodes")->getObject(node);
   auto local = [&](llvm::StringRef at) {
     if (!n || owner != field(*units.getObject(field(*n, "unit")), "owner"))
       return false;
@@ -63,8 +64,8 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
     c.boundaries[at] = &b;
   }
   if (u.exit) {
-    if (owner != "exits/" + node || !u.exit->value.emit ||
-        !u.exit->value.legalize)
+    if (owner != "exits/" + node || u.id != field(*n, "unit") ||
+        !u.exit->value.emit)
       return createStringError(u.id + ": invalid exit implementation");
     auto at = field(*manifest.getObject("exits")->getObject(node), "at");
     if (auto e = c.record(owner, u.id, at, "exit", u.exit->source))
@@ -81,8 +82,8 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
   }
   for (auto &[v, s] : u.families) {
     auto id = u.qualify(v.family.name);
-    if (!local(v.decideAt) || !v.family.applies || !v.family.read ||
-        !v.family.write || !v.family.verify)
+    if (!local(v.decideAt) || !local(v.materializeAt) || !v.family.applies ||
+        !v.family.read || !v.family.write || !v.family.verify)
       return createStringError(id + ": invalid decision family");
     if (auto e = c.record(id, u.id, v.decideAt, "family", s))
       return e;
@@ -205,7 +206,7 @@ llvm::Error checkConfiguration(const Object &config, const Object &manifest,
           if (group == "nodes"
                   ? !llvm::StringRef(at).starts_with(key.str() + "@")
                   : !llvm::any_of(
-                        *declaration->getArray("boundaries"),
+                        *declaration->getArray("path"),
                         [&](const auto &v) { return v.getAsString() == at; }))
             return createStringError(id.str() + " is outside " + key.str());
         }
@@ -219,9 +220,15 @@ llvm::Error checkConfiguration(const Object &config, const Object &manifest,
 llvm::Expected<Compiler> Assembly::link(const Object &manifest,
                                         const Object &config) const {
   Components components;
-  for (auto &[_, unit] : units)
-    if (auto e = collect(manifest, unit, components))
-      return std::move(e);
+  std::map<std::string, std::string> invalidExits;
+  for (auto &[id, unit] : units) {
+    if (auto error = collect(manifest, unit, components)) {
+      auto owner = field(*manifest.getObject("units")->getObject(id), "owner");
+      if (!llvm::StringRef(owner).starts_with("exits/"))
+        return std::move(error);
+      invalidExits.emplace(owner.substr(6), llvm::toString(std::move(error)));
+    }
+  }
   auto &c = components;
   for (auto &[node, value] : *manifest.getObject("nodes"))
     for (auto &b : *value.getAsObject()->getArray("boundaries")) {
@@ -231,26 +238,45 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
     }
   for (auto &[id, binding] : c.families) {
     auto end = c.boundaries.find(binding.value.materializeAt);
-    if (end == c.boundaries.end())
-      return createStringError(id + ": unknown materialization boundary " +
-                               binding.value.materializeAt);
+    if (end == c.boundaries.end()) {
+      auto unit = field(*c.catalog.getObject(id), "unit");
+      auto owner =
+          field(*manifest.getObject("units")->getObject(unit), "owner");
+      auto message = id + ": unknown materialization boundary " +
+                     binding.value.materializeAt;
+      if (!llvm::StringRef(owner).starts_with("exits/"))
+        return createStringError(message);
+      invalidExits.emplace(owner.substr(6), message);
+    }
   }
   auto attach = [&](const auto &entries) -> llvm::Error {
     for (auto &[id, v] : entries) {
       auto f = c.families.find(v.value.family);
-      if (f == c.families.end())
-        return createStringError(id + ": unknown family " + v.value.family);
       auto &unitMap = *manifest.getObject("units");
       auto *itemUnit =
           unitMap.getObject(field(*c.catalog.getObject(id), "unit"));
+      auto owner = field(*itemUnit, "owner");
+      if (f == c.families.end()) {
+        auto message = id + ": unknown family " + v.value.family;
+        if (!llvm::StringRef(owner).starts_with("exits/"))
+          return createStringError(message);
+        invalidExits.emplace(owner.substr(6), message);
+        continue;
+      }
       auto *familyUnit = unitMap.getObject(
           field(*c.catalog.getObject(v.value.family), "unit"));
-      if (!llvm::any_of(*itemUnit->getArray("allowed"), [&](const auto &key) {
+      if (field(*itemUnit, "owner") != field(*familyUnit, "owner") &&
+          !llvm::any_of(*itemUnit->getArray("allowed"), [&](const auto &key) {
             return field(*unitMap.getObject(*key.getAsString()), "owner") ==
                    field(*familyUnit, "owner");
-          }))
-        return createStringError(
-            id + ": family is outside unit ancestry: " + v.value.family);
+          })) {
+        auto message =
+            id + ": family is outside unit ancestry: " + v.value.family;
+        if (!llvm::StringRef(owner).starts_with("exits/"))
+          return createStringError(message);
+        invalidExits.emplace(owner.substr(6), message);
+        continue;
+      }
       (*c.catalog.getObject(id))["at"] = f->second.value.decideAt;
     }
     return llvm::Error::success();
@@ -259,8 +285,21 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
     return std::move(e);
   if (auto e = attach(c.realizers))
     return std::move(e);
-  if (auto e = checkConfiguration(config, manifest, c))
+  Object sharedConfig = config;
+  sharedConfig.erase("exits");
+  if (auto e = checkConfiguration(sharedConfig, manifest, c))
     return std::move(e);
+  if (auto *overrides = config.get("exits")) {
+    if (!overrides->getAsObject())
+      return createStringError("expected exit configuration map");
+    for (auto &[name, settings] : *overrides->getAsObject()) {
+      if (!manifest.getObject("exits")->get(name))
+        return createStringError("unknown exit " + name.str());
+      if (auto err = checkConfiguration(
+              Object{{"exits", Object{{name, settings}}}}, manifest, c))
+        invalidExits.emplace(name.str(), llvm::toString(std::move(err)));
+    }
+  }
   Frontend front;
   front.import = importMLIR;
   front.verifyInput = [](mlir::ModuleOp op) { return mlir::verify(op); };
@@ -271,142 +310,183 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
   if (units.at(frontId).input)
     front.verifyInput = units.at(frontId).input;
   Object selected;
-  std::vector<Target> targets;
+  std::vector<Exit> exits;
+  Object description = manifest;
   for (auto &[key, value] : *manifest.getObject("exits")) {
     std::string name = key.str();
     auto &e = *value.getAsObject();
-    if (!c.exits.count(name))
-      return createStringError("missing emitter for " + name);
-    auto &provider = c.exits.at(name)->value;
-    auto overrides = settings(config, "exits", name);
-    auto profile = std::make_shared<TargetProfile>();
-    profile->name = name;
-    auto options = mergedField({}, overrides, "options");
-    if (provider.capabilities) {
-      auto facts = provider.capabilities(options);
-      if (!facts)
-        return facts.takeError();
-      *profile = std::move(*facts);
-    } else if (!options.empty())
-      return createStringError(name + ": unsupported exit options");
-    Target t;
-    t.name = name;
-    t.emit = provider.emit;
-    std::set<std::string> owners{"exits/" + name};
-    for (auto &eligible : *manifest.getObject("units")
-                               ->getObject(field(e, "unit"))
-                               ->getArray("allowed"))
-      owners.insert(field(
-          *manifest.getObject("units")->getObject(*eligible.getAsString()),
-          "owner"));
-    auto available = [&](const std::string &id) {
-      auto unit = field(*c.catalog.getObject(id), "unit");
-      return owners.count(
-          field(*manifest.getObject("units")->getObject(unit), "owner"));
-    };
-    std::map<std::string, detail::DecisionProgram> pending;
-    std::set<std::string> chosen;
-    for (auto &b : *e.getArray("boundaries")) {
-      auto at = b.getAsString()->str();
-      auto node = at.substr(0, at.find('@'));
-      auto nodeUnit =
-          field(*manifest.getObject("nodes")->getObject(node), "unit");
-      owners.insert(
-          field(*manifest.getObject("units")->getObject(nodeUnit), "owner"));
-      if (!c.boundaries.count(at))
-        return createStringError("missing implementation of " + at);
-      auto spec = c.boundaries.at(at)->value;
-      auto wrap = [profile](ModelPasses build) -> BuildPasses {
-        return [profile, build](mlir::OpPassManager &pm) {
-          return build(pm, *profile);
+    auto buildExit = [&]() -> llvm::Expected<Exit> {
+      if (invalidExits.count(name))
+        return createStringError(invalidExits.at(name));
+      if (!c.exits.count(name))
+        return createStringError("missing emitter for " + name);
+      auto &implementation = c.exits.at(name)->value;
+      auto overrides = settings(config, "exits", name);
+      auto profile = std::make_shared<TargetProfile>();
+      profile->name = name;
+      auto options = mergedField({}, overrides, "options");
+      if (implementation.capabilities) {
+        auto facts = implementation.capabilities(options);
+        if (!facts)
+          return facts.takeError();
+        *profile = std::move(*facts);
+      } else if (!options.empty())
+        return createStringError(name + ": unsupported exit options");
+      Exit t;
+      t.name = name;
+      t.emit = implementation.emit;
+      std::set<std::string> owners{"exits/" + name};
+      for (auto &eligible : *manifest.getObject("units")
+                                 ->getObject(field(e, "unit"))
+                                 ->getArray("allowed"))
+        owners.insert(field(
+            *manifest.getObject("units")->getObject(*eligible.getAsString()),
+            "owner"));
+      auto available = [&](const std::string &id) {
+        auto unit = field(*c.catalog.getObject(id), "unit");
+        return owners.count(
+            field(*manifest.getObject("units")->getObject(unit), "owner"));
+      };
+      std::map<std::string, detail::DecisionProgram> pending;
+      std::set<std::string> chosen;
+      for (auto &b : *e.getArray("path")) {
+        auto at = b.getAsString()->str();
+        auto node = at.substr(0, at.find('@'));
+        if (!c.boundaries.count(at))
+          return createStringError("missing implementation of " + at);
+        auto spec = c.boundaries.at(at)->value;
+        auto wrap = [profile](ModelPasses build) -> BuildPasses {
+          return [profile, build](mlir::OpPassManager &pm) {
+            return build(pm, *profile);
+          };
         };
-      };
-      Stage stage;
-      stage.name = at;
-      stage.verifyOutput = [spec, profile](mlir::ModuleOp m) {
-        return spec.verify(m, *profile);
-      };
-      stage.groups.push_back(PassGroup::required(wrap(spec.lower)));
-      auto defaults = settings(config, "nodes", node);
-      auto opts = mergedField(defaults, overrides, "optimizations");
-      std::vector<std::string> ordered;
-      if (auto err = orderContributions(c, at, ordered))
-        return std::move(err);
-      for (auto &id : ordered) {
-        auto &v = c.contributions.at(id).value;
-        bool enabled = opts.getBoolean(id).value_or(v.enabled);
-        if (enabled)
-          chosen.insert(id);
-        stage.groups.push_back(
-            PassGroup::optimization(id, wrap(v.build), enabled));
-      }
-      for (auto &[id, v] : c.families) {
-        if (v.value.decideAt != at)
-          continue;
-        auto table = std::make_shared<detail::DecisionTable>();
-        table->family = v.value.family;
-        table->target = profile;
-        for (auto &[sid, s] : c.strategies)
-          if (s.value.family == id && available(sid))
-            table->strategies.emplace(sid, s.value);
-        for (auto &[rid, r] : c.realizers)
-          if (r.value.family == id && available(rid))
-            table->realizers.emplace(rid, r.value);
-        auto choice =
-            choiceFor(mergedField(defaults, overrides, "decisions"), id);
-        if (!choice)
-          return choice.takeError();
-        detail::DecisionProgram program{table, *choice, false};
-        if (auto err = program.validate())
+        Stage stage;
+        stage.name = at;
+        stage.verifyOutput = [spec, profile](mlir::ModuleOp m) {
+          return spec.verify(m, *profile);
+        };
+        if (node == name &&
+            at == name + "@" +
+                      e.getArray("boundaries")->front().getAsString()->str()) {
+          for (auto &[id, program] : pending) {
+            program.materialize = true;
+            stage.groups.push_back(PassGroup::forDecision(program));
+          }
+          pending.clear();
+        }
+        stage.groups.push_back(PassGroup::required(wrap(spec.lower)));
+        auto owner = field(*manifest.getObject("units")->getObject(
+                               field(*c.catalog.getObject(at), "unit")),
+                           "owner");
+        auto defaults = owner == "exits/" + name
+                            ? Object{}
+                            : settings(config, "nodes", node);
+        auto opts = mergedField(defaults, overrides, "optimizations");
+        std::vector<std::string> ordered;
+        if (auto err = orderContributions(c, at, ordered))
           return std::move(err);
-        chosen.insert(id);
-        chosen.insert(choice->strategies.begin(), choice->strategies.end());
-        chosen.insert(choice->realizer);
-        stage.groups.push_back(PassGroup::forDecision(program));
-        pending.emplace(id, std::move(program));
+        for (auto &id : ordered) {
+          auto &v = c.contributions.at(id).value;
+          bool enabled = opts.getBoolean(id).value_or(v.enabled);
+          if (enabled)
+            chosen.insert(id);
+          stage.groups.push_back(
+              PassGroup::optimization(id, wrap(v.build), enabled));
+        }
+        for (auto &[id, v] : c.families) {
+          if (v.value.decideAt != at)
+            continue;
+          auto table = std::make_shared<detail::DecisionTable>();
+          table->family = v.value.family;
+          table->target = profile;
+          for (auto &[sid, s] : c.strategies)
+            if (s.value.family == id && available(sid))
+              table->strategies.emplace(sid, s.value);
+          for (auto &[rid, r] : c.realizers)
+            if (r.value.family == id && available(rid))
+              table->realizers.emplace(rid, r.value);
+          auto choice =
+              choiceFor(mergedField(defaults, overrides, "decisions"), id);
+          if (!choice)
+            return choice.takeError();
+          auto path = e.getArray("path");
+          if (!llvm::any_of(*path, [&](const auto &p) {
+                return p.getAsString() == v.value.materializeAt;
+              })) {
+            std::vector<std::string> local;
+            for (auto &[rid, r] : table->realizers) {
+              auto unit = field(*c.catalog.getObject(rid), "unit");
+              if (field(*manifest.getObject("units")->getObject(unit),
+                        "owner") == "exits/" + name)
+                local.push_back(rid);
+            }
+            if (!llvm::is_contained(local, choice->realizer)) {
+              auto *explicitChoices = overrides.getObject("decisions");
+              if (local.size() != 1 ||
+                  (explicitChoices && explicitChoices->get(id)))
+                return createStringError(
+                    name +
+                    ": early exit needs a unique or explicitly selected "
+                    "exit-private realizer for " +
+                    id);
+              choice->realizer = local.front();
+            }
+          }
+          detail::DecisionProgram program{table, *choice, false};
+          if (auto err = program.validate())
+            return std::move(err);
+          chosen.insert(id);
+          chosen.insert(choice->strategies.begin(), choice->strategies.end());
+          chosen.insert(choice->realizer);
+          stage.groups.push_back(PassGroup::forDecision(program));
+          pending.emplace(id, std::move(program));
+        }
+        for (auto &[id, v] : c.families) {
+          if (v.value.materializeAt != at)
+            continue;
+          if (!pending.count(id))
+            return createStringError("materialization precedes decision for " +
+                                     id);
+          auto program = pending.at(id);
+          program.materialize = true;
+          stage.groups.push_back(PassGroup::forDecision(std::move(program)));
+          pending.erase(id);
+        }
+        t.stages.push_back(std::move(stage));
       }
-      for (auto &[id, v] : c.families) {
-        if (v.value.materializeAt != at)
-          continue;
-        if (!pending.count(id))
-          return createStringError("materialization precedes decision for " +
-                                   id);
-        auto program = pending.at(id);
-        program.materialize = true;
-        stage.groups.push_back(PassGroup::forDecision(std::move(program)));
-        pending.erase(id);
-      }
-      t.stages.push_back(std::move(stage));
-    }
-    if (!pending.empty())
-      return createStringError(name + ": exit before materialization of " +
-                               pending.begin()->first);
-    auto legalize = provider.legalize;
-    Stage final;
-    final.name = "exits/" + name;
-    final.groups.push_back(
-        PassGroup::required([legalize, profile](mlir::OpPassManager &pm) {
-          return legalize(pm, *profile);
-        }));
-    final.verifyOutput = [](mlir::ModuleOp m) { return mlir::verify(m); };
-    t.stages.push_back(std::move(final));
-    std::vector<RegisterDialects> dialects;
-    for (auto &[id, unit] : units)
-      if (unit.dialects &&
-          owners.count(
-              field(*manifest.getObject("units")->getObject(id), "owner")))
-        dialects.push_back(unit.dialects);
-    t.registerDialects = [dialects](mlir::DialectRegistry &r) {
-      for (auto &add : dialects)
-        add(r);
+      if (!pending.empty())
+        return createStringError(name + ": exit before materialization of " +
+                                 pending.begin()->first);
+      std::vector<RegisterDialects> dialects;
+      for (auto &[id, unit] : units)
+        if (unit.dialects &&
+            owners.count(
+                field(*manifest.getObject("units")->getObject(id), "owner")))
+          dialects.push_back(unit.dialects);
+      t.registerDialects = [dialects](mlir::DialectRegistry &r) {
+        for (auto &add : dialects)
+          add(r);
+      };
+      selected[name] = Array(chosen);
+      return t;
     };
-    selected[name] = Array(chosen);
-    targets.push_back(std::move(t));
+    auto made = buildExit();
+    auto *status = description.getObject("exits")->getObject(key);
+    (*status)["valid"] = bool(made);
+    if (made)
+      exits.push_back(std::move(*made));
+    else {
+      Exit invalid;
+      invalid.name = name;
+      invalid.error = llvm::toString(made.takeError());
+      (*status)["error"] = invalid.error;
+      selected[name] = Array{};
+      exits.push_back(std::move(invalid));
+    }
   }
-  Object description = manifest;
   description["configuration"] = Object(config);
   description["components"] = std::move(c.catalog);
   description["selected"] = std::move(selected);
-  return Compiler::create(std::move(front), std::move(targets),
+  return Compiler::create(std::move(front), std::move(exits),
                           std::move(description));
 }

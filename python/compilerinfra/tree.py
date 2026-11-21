@@ -101,7 +101,10 @@ def tree(root, complete=True, extension_roots=None):
     args = product["build"]["configure_args"]
     if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
         raise ValueError("expected build.configure_args array of strings")
-    relative(product["install"]["library"])
+    if "library" in product["install"]:
+        raise ValueError(
+            "install.library is derived by the build; remove it from product.json"
+        )
     if (
         not isinstance(product["install"]["python"], str)
         or not product["install"]["python"]
@@ -162,6 +165,10 @@ def tree(root, complete=True, extension_roots=None):
             if key in exits or not e["description"].strip():
                 raise ValueError(f"duplicate or undescribed exit {key}")
             path = f"exits/{key}"
+            if not e["boundaries"] or len(set(e["boundaries"])) != len(e["boundaries"]):
+                raise ValueError(f"{key}: expected unique exit and ordered boundaries")
+            for boundary in e["boundaries"]:
+                name(boundary)
             exits[key] = dict(e, unit=unit(prefix + path, package, path, path, []))
         for key in decl.get("runtimes", []):
             name(key)
@@ -195,8 +202,12 @@ def tree(root, complete=True, extension_roots=None):
         if not sep or node not in nodes or stop not in nodes[node]["boundaries"]:
             raise ValueError(f"{k}: unknown attachment {e['at']}")
         chain = ancestors(node)
-        route = [i + "@" + b for i in chain for b in nodes[i]["boundaries"]]
-        e["boundaries"] = route[: route.index(e["at"]) + 1]
+        chain_boundaries = [i + "@" + b for i in chain for b in nodes[i]["boundaries"]]
+        if k in nodes and set(e["boundaries"]).intersection(nodes[k]["boundaries"]):
+            raise ValueError(f"{k}: node and exit declare the same qualified boundary")
+        e["path"] = chain_boundaries[: chain_boundaries.index(e["at"]) + 1] + [
+            k + "@" + b for b in e["boundaries"]
+        ]
         units[e["unit"]]["allowed"] = [nodes[i]["unit"] for i in chain]
     if (
         not set(runtimes) <= set(exits)
@@ -243,6 +254,29 @@ def tree(root, complete=True, extension_roots=None):
                             sha256=hashlib.sha256(f.read_bytes()).hexdigest(),
                         )
                     )
+    for f in sorted((root / front).rglob("*")):
+        rel = f.relative_to(root / front)
+        if (
+            f.is_file()
+            and rel.parts[0] != "agent"
+            and "__pycache__" not in rel.parts
+            and f.suffix != ".pyc"
+        ):
+            assets.append(
+                dict(
+                    path=f"{front}/{rel}",
+                    kind="frontend",
+                    source=str(f),
+                    sha256=hashlib.sha256(f.read_bytes()).hexdigest(),
+                )
+            )
+    module = product["frontend"]["entry"].split(":")[0].replace(".", "/")
+    if not any(
+        item["path"]
+        in (front + "/" + module + ".py", front + "/" + module + "/__init__.py")
+        for item in assets
+    ):
+        raise ValueError(f"{front}: missing installed frontend module {module}")
     return dict(
         product=product,
         levels=list(levels.values()),

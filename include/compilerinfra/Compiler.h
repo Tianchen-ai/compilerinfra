@@ -65,11 +65,12 @@ private:
 struct Stage {
   std::string name;
   std::vector<PassGroup> groups;
-  // Checks the representation and target invariants both on exit and on resume.
+  // Checks the representation and exit invariants both on exit and on resume.
   BoundaryCheck verifyOutput;
 };
 
-struct Target {
+struct Exit {
+  std::string error;
   std::string name;
   RegisterDialects registerDialects;
   std::vector<Stage> stages;
@@ -79,6 +80,8 @@ struct Target {
 
 struct SessionOptions {
   DecisionObserver observeDecision;
+  std::function<void(llvm::StringRef, llvm::StringRef, bool, bool)>
+      observeContribution;
 };
 
 class Session;
@@ -88,28 +91,28 @@ using Artifact = llvm::SmallVector<char, 0>;
 // Construct once per product configuration. Callbacks own their captures.
 class Compiler {
 public:
-  llvm::ArrayRef<Target> targets() const;
-  llvm::Expected<Artifact> compile(llvm::StringRef target,
+  llvm::ArrayRef<Exit> exits() const;
+  llvm::Expected<Artifact> compile(llvm::StringRef exit,
                                    llvm::MemoryBufferRef input) const;
   const llvm::json::Object &describe() const { return definition->description; }
 
   llvm::Expected<std::unique_ptr<Session>>
-  open(llvm::StringRef target, const SessionOptions &options = {}) const;
+  open(llvm::StringRef exit, const SessionOptions &options = {}) const;
   // Embed in a product that already owns an MLIR context. The context must
   // outlive this session and be available for its exclusive use during calls.
   llvm::Expected<std::unique_ptr<Session>>
-  open(llvm::StringRef target, mlir::MLIRContext &context,
+  open(llvm::StringRef exit, mlir::MLIRContext &context,
        const SessionOptions &options = {}) const;
 
 private:
   friend class Session;
   friend class Assembly;
   static llvm::Expected<Compiler> create(Frontend frontend,
-                                         std::vector<Target> targets,
+                                         std::vector<Exit> exits,
                                          llvm::json::Object description);
   struct Definition {
     Frontend frontend;
-    std::vector<Target> targets;
+    std::vector<Exit> exits;
     llvm::json::Object description;
   };
   explicit Compiler(std::shared_ptr<const Definition> definition);

@@ -2,12 +2,18 @@
 
 import ctypes as C
 import json
-from importlib import import_module
+from .frontend import Frontend
 from pathlib import Path
 
 
 class Buffer(C.Structure):
     _fields_ = [("data", C.c_void_p), ("size", C.c_size_t)]
+
+
+class CompilationError(ValueError):
+    def __init__(self, report):
+        self.report = report
+        super().__init__(f"{report['compilation_id']}: {report['error']}")
 
 
 class Library:
@@ -28,11 +34,19 @@ class Library:
             "ci_close": (None, [ptr]),
             "ci_free": (None, [ptr]),
         }
+        signatures["ci_compile_trace"] = (
+            ptr,
+            [ptr, string, ptr, C.c_size_t, string, string, C.c_int, string, buf, buf],
+        )
         for name, (result, args) in signatures.items():
             fn = getattr(self.api, name)
             fn.restype, fn.argtypes = result, args
         if self.api.ci_abi_version() != 1:
             raise ValueError(f"unsupported compiler ABI: {path}")
+
+    def __del__(self):
+        if getattr(self, "frontend", None):
+            self.frontend.close()
 
     def check(self, error):
         if error:
@@ -51,6 +65,8 @@ class Library:
 class Compiler:
     def __init__(self, library, configuration=None):
         self.library = Library(library)
+        self.observations = {}
+        self.last_compilation_id = None
         self.handle = C.c_void_p()
         self.library.check(
             self.library.api.ci_open(
@@ -58,8 +74,12 @@ class Compiler:
             )
         )
 
+        self.library.frontend = Frontend(self.library.path, self.describe())
+
     def derive(self, configuration):
         child = object.__new__(Compiler)
+        child.observations = {}
+        child.last_compilation_id = None
         child.library, child.handle = self.library, C.c_void_p()
         self.library.check(
             self.library.api.ci_derive(
@@ -75,12 +95,7 @@ class Compiler:
 
     def root_ir(self, author_input):
         """Run the installed product's frontend and return root IR bytes."""
-        entry = self.describe()["product"]["frontend"]["entry"]
-        module, symbol = entry.split(":", 1)
-        data = getattr(import_module(module), symbol)(author_input)
-        if not isinstance(data, bytes):
-            raise TypeError(f"{entry} must return root IR bytes")
-        return data
+        return self.library.frontend(author_input)
 
     def compile(
         self,
@@ -91,25 +106,34 @@ class Compiler:
         after=None,
         text=False,
         explain=False,
+        root_sha256=None,
     ):
         out, events = Buffer(), Buffer()
-        self.library.check(
-            self.library.api.ci_compile(
-                self.handle,
-                exit.encode(),
-                source,
-                len(source),
-                after and after.encode(),
-                through and through.encode(),
-                text,
-                C.byref(out),
-                C.byref(events) if explain else None,
-            )
+        error = self.library.api.ci_compile_trace(
+            self.handle,
+            exit.encode(),
+            source,
+            len(source),
+            after and after.encode(),
+            through and through.encode(),
+            text,
+            root_sha256 and root_sha256.encode(),
+            C.byref(out),
+            C.byref(events),
         )
+        if not events.data:
+            self.library.check(error)
+        report = json.loads(self.library.take(events))
+        self.last_compilation_id = report["compilation_id"]
+        self.observations[self.last_compilation_id] = report
+        if error:
+            self.library.api.ci_free(error)
+            raise CompilationError(report)
         artifact = self.library.take(out)
-        return (
-            (artifact, json.loads(self.library.take(events))) if explain else artifact
-        )
+        return (artifact, report) if explain else artifact
+
+    def explain(self, compilation_id):
+        return self.observations[compilation_id]
 
     def close(self):
         if getattr(self, "handle", None):
@@ -124,8 +148,3 @@ class Compiler:
 
     def __del__(self):
         self.close()
-
-
-def root_ir(source: bytes):
-    """Identity frontend for products accepting MLIR assembly or bytecode."""
-    return source
