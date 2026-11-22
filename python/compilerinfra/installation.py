@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import fcntl
+import logging
 import json
 import os
 from pathlib import Path
@@ -106,9 +107,9 @@ def _publish(stage, prefix, backup, library, previous_manifest):
                     os.replace(path, generation)
                     path.symlink_to(generation.name)
                 os.replace(path, dest)
+                done.append((dest, old if exists else None))
             finally:
                 path.unlink(missing_ok=True)
-            done.append((dest, old if exists else None))
         yield
     except BaseException:
         for dest, old in reversed(done):
@@ -121,4 +122,9 @@ def _publish(stage, prefix, backup, library, previous_manifest):
             generation.unlink(missing_ok=True)
         raise
     if previous_generation:
-        previous_generation.unlink(missing_ok=True)
+        # Publication and activation have committed. Reclamation can be
+        # retried without reversing the product's source or installed ABI.
+        try:
+            previous_generation.unlink(missing_ok=True)
+        except OSError as error:
+            logging.getLogger(__name__).warning("retained %s: %s", previous_generation, error)

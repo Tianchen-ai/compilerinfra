@@ -251,7 +251,7 @@ class Scope:
                     shutil.rmtree(saved)
                     raise
                 if older:
-                    shutil.rmtree(older)
+                    shutil.rmtree(older,ignore_errors=True)
             return {
                 "base": self.base_key,
                 "previous": previous,
@@ -274,16 +274,26 @@ class Scope:
                 raise ValueError("current installation differs from the adopted baseline")
             roots = {k:Path(v) for k,v in model["packages"].items()}
             patches = {k:v.encode() for k,v in record["patches"].items()}
-            with TemporaryDirectory(dir=self.root) as tmp, applied(roots,patches):
+            with TemporaryDirectory(dir=self.root,ignore_cleanup_errors=True) as tmp, applied(roots,patches):
                 # publish writes an inventory into its input stage. Keep the saved
                 # installation intact if activation fails and revert is retried.
                 stage = Path(tmp) / "stage"
                 shutil.copytree(saved / "install", stage)
                 previous = self.base_key
-                with publish(stage, prefix, Path(tmp)/"backup", rel):
-                    self.load_base()
-                    pointer.unlink()
-            shutil.rmtree(saved)
+                try:
+                    with publish(stage, prefix, Path(tmp)/"backup", rel):
+                        self.load_base()
+                        pointer.unlink()
+                except BaseException:
+                    abandoned=self.base_key
+                    self.base_key=previous
+                    if abandoned!=previous:
+                        candidate=self.values.pop(abandoned)
+                        pinned=self.owned.pop(candidate.worker)
+                        candidate.worker.close()
+                        shutil.rmtree(pinned,ignore_errors=True)
+                    raise
+            shutil.rmtree(saved,ignore_errors=True)
             return {"base":self.base_key,"previous":previous,"library":str(self.library)}
 
     def compile(

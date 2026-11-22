@@ -7,7 +7,7 @@ import re
 import subprocess
 from pathlib import Path
 
-SDK_VERSION = "0.3.4"
+SDK_VERSION = "0.3.5"
 AREAS = {
     "levels": {
         "abi",

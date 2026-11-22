@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CompilerInfra VERSION 0.3.4 LANGUAGES C CXX)
+project(CompilerInfra VERSION 0.3.5 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
