@@ -67,7 +67,7 @@ async def host(mcp):
             @server.call_tool()
             async def call(name, arguments):
                 value = await invoke(name, arguments)
-                if name in {"derive", "adopt", "discard"}:
+                if name in {"derive", "adopt", "revert", "discard"}:
                     await server.request_context.session.send_tool_list_changed()
                 return [
                     TextContent(type="text", text=json.dumps(value, ensure_ascii=False))

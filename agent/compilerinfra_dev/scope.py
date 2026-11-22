@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from importlib import import_module
 import inspect
+import json
 import os
 from pathlib import Path
 import shutil
@@ -217,6 +218,7 @@ class Scope:
             # Write configuration in a disposable snapshot to keep existing candidates immutable.
             snap = c.snapshot.derive(folder, {})
             patches = snap.delta(c.description["configuration"])
+            reverse = snap.delta(c.description["configuration"], reverse=True)
             with applied(roots, patches):
                 stage = folder / "install"
                 lib = build(roots, folder / "build", stage)
@@ -226,18 +228,63 @@ class Scope:
                     raise ValueError(
                         "installed library does not match product install entry"
                     )
-                with publish(stage, prefix, folder / "backup", rel):
-                    if lib.relative_to(stage) != rel:
-                        raise ValueError(
-                            "install did not produce expected compiler library"
-                        )
-                    previous = self.base_key
-                    self.load_base()
+                if lib.relative_to(stage) != rel:
+                    raise ValueError("install did not produce expected compiler library")
+                history = prefix / ".compilerinfra" / (rel.name + ".revert")
+                history.mkdir(parents=True, exist_ok=True)
+                pointer = history / "previous"
+                older = pointer.resolve() if pointer.exists() else None
+                saved = history / uuid4().hex
+                saved.mkdir()
+                previous = self.base_key
+                try:
+                    with publish(stage, prefix, folder / "backup", rel, keep_install=saved / "install"):
+                        self.load_base()
+                        record = {"adopted":self.values[self.base_key].description["fingerprint"],
+                                  "patches":{k:v.decode() for k,v in reverse.items()}}
+                        (saved / "reverse.json").write_text(json.dumps(record))
+                        link = saved / "next"
+                        link.symlink_to(saved.name)
+                        link.replace(pointer)
+                except BaseException:
+                    self.base_key = previous
+                    shutil.rmtree(saved)
+                    raise
+                if older:
+                    shutil.rmtree(older)
             return {
                 "base": self.base_key,
                 "previous": previous,
                 "library": str(self.library),
             }
+
+    def revert(self):
+        with adoption_lock(self.workspace):
+            current = self.values[self.base_key].description
+            model = tree(self.workspace)
+            self.check_fingerprint(current, model)
+            rel = relative(current["library"])
+            prefix = self.library.parents[len(rel.parts)-1]
+            pointer = prefix / ".compilerinfra" / (rel.name + ".revert") / "previous"
+            if not pointer.is_symlink():
+                raise ValueError("no previous adoption to revert")
+            saved = pointer.resolve(strict=True)
+            record = json.loads((saved / "reverse.json").read_text())
+            if record["adopted"] != current["fingerprint"]:
+                raise ValueError("current installation differs from the adopted baseline")
+            roots = {k:Path(v) for k,v in model["packages"].items()}
+            patches = {k:v.encode() for k,v in record["patches"].items()}
+            with TemporaryDirectory(dir=self.root) as tmp, applied(roots,patches):
+                # publish writes an inventory into its input stage. Keep the saved
+                # installation intact if activation fails and revert is retried.
+                stage = Path(tmp) / "stage"
+                shutil.copytree(saved / "install", stage)
+                previous = self.base_key
+                with publish(stage, prefix, Path(tmp)/"backup", rel):
+                    self.load_base()
+                    pointer.unlink()
+            shutil.rmtree(saved)
+            return {"base":self.base_key,"previous":previous,"library":str(self.library)}
 
     def compile(
         self,

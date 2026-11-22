@@ -69,7 +69,7 @@ class Snapshot:
             git(child.roots[key], "apply", "--binary", "-", data=patch.encode())
         return child
 
-    def delta(self, configuration):
+    def delta(self, configuration, *, reverse=False):
         patches = {}
         for key, root in self.roots.items():
             if key == ".":
@@ -78,7 +78,8 @@ class Snapshot:
                     write(config, configuration)
             git(root, "add", "-f", "-A")
             patches[key] = git(
-                root, "diff", "--cached", "--binary", "--no-renames", self.initial[key]
+                root, "diff", "--cached", "--binary", "--no-renames",
+                *(["-R"] if reverse else []), self.initial[key]
             )
         return patches
 

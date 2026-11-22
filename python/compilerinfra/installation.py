@@ -11,12 +11,19 @@ from .tree import relative
 
 
 @contextmanager
-def publish(stage, prefix, backup, library, previous_manifest=None):
+def publish(stage, prefix, backup, library, previous_manifest=None, *, keep_install=None):
     stage, prefix = Path(stage), Path(prefix)
     prefix.mkdir(parents=True, exist_ok=True)
     lock = os.open(prefix, os.O_RDONLY)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        if keep_install is not None:
+            inventory = prefix / ".compilerinfra" / (library.name + ".files.json")
+            for entry in json.loads(inventory.read_text()):
+                rel = relative(entry)
+                saved = keep_install / rel
+                saved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(prefix / rel, saved)
         with _publish(stage, prefix, backup, library, previous_manifest):
             yield
     finally:

@@ -146,6 +146,10 @@ class Catalog:
             """Release one candidate handle and any build it alone owns."""
             return scope.discard(compiler)
 
+        def revert():
+            """Restore the sources and installation that preceded the latest adoption."""
+            return scope.revert()
+
         for fn in [
             derive,
             explain,
@@ -155,6 +159,7 @@ class Catalog:
             model_accuracy,
             measure,
             adopt,
+            revert,
             discard,
             scaffold.init,
             scaffold.add_level,
