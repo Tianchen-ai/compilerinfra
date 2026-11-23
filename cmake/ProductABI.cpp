@@ -182,14 +182,15 @@ static const char *compile(const ci_compiler *c, const char *exit,
   auto configuration = [&] { return Object(*c->compiler.describe().getObject("configuration")); };
   auto defaultPolicy = [&] {
     auto policy = [](Object config) {
-      if (auto *exits = config.getObject("exits"))
-        for (auto &[name, local] : *exits)
-          if (auto *settings = local.getAsObject()) settings->erase("options");
       if (auto *exits = config.getObject("exits")) {
         Object active;
-        for (auto &[name, local] : *exits)
-          if (auto *settings = local.getAsObject(); settings && !settings->empty())
-            active[name] = Object(*settings);
+        for (auto &[name, local] : *exits) {
+          Object policy;
+          if (auto *settings=local.getAsObject())
+            for (auto &[key,value]:*settings)
+              if(key!="options")policy[key]=value;
+          if(!policy.empty())active[name]=std::move(policy);
+        }
         config["exits"] = std::move(active);
       }
       return config;
