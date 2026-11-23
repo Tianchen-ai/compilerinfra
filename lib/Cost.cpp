@@ -200,7 +200,18 @@ compilerinfra::detail::rankCandidates(const DecisionProgram &p,
             name + ": incomplete or duplicate structure candidate " +
             candidate.id);
       Row r{std::move(candidate), name};
-      auto legality = table.family.verify(op, r.proposal.value, *table.target);
+      llvm::Error legality = llvm::Error::success();
+      for (auto &impl : r.proposal.implementations) {
+        auto it = table.target->implementations.find(impl);
+        if (it != table.target->implementations.end() &&
+            it->second.minimum > table.target->reuse) {
+          legality = createStringError(impl + ": exceeds reuse=" +
+                                       spelling(table.target->reuse));
+          break;
+        }
+      }
+      if (!legality)
+        legality = table.family.verify(op, r.proposal.value, *table.target);
       for (auto &impl : r.proposal.implementations)
         if (!legality)
           legality = table.target->checkImplementation(impl);
