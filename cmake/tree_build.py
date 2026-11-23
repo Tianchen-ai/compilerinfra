@@ -46,7 +46,12 @@ def configure(model, out):
     lines = []
     for dep in model["product"].get("optional_dependencies", []):
         version = dep["version"][2:].replace(",<", "...<")
-        lines.append(f'find_package({dep["package"]} {version} QUIET CONFIG)')
+        pkg, target = dep["package"], dep["cmake_target"]
+        lines.append(f'find_package({pkg} {version} QUIET CONFIG)')
+        evidence = quote(str(out / ("probe-" + dep["id"])))
+        lines += [f'if({pkg}_FOUND AND TARGET {target})',
+                  f'  file(WRITE {evidence} "found\\n${{{pkg}_VERSION}}")', "else()",
+                  f'  file(WRITE {evidence} "missing\\n")', "endif()"]
         # Publish the target only within its owning exit. A plugin can use it
         # for an optional adapter build without linking the base product to it.
     for key, u in units.items():
@@ -100,6 +105,20 @@ def generated(model, out):
                 raise ValueError(f"{file}: duplicate or empty calibration profile")
             docs[profile] = json.loads(file.read_text())
     model["calibrations"] = calibrations
+    for dep in model["product"].get("optional_dependencies", []):
+        status, _, version = (out / ("probe-" + dep["id"])).read_text().partition("\n")
+        dep["build"] = {"available": status == "found", "version": version,
+                        "target": dep["cmake_target"]}
+    # Keep source-backed JIT primitives available to an offline emitter. The
+    # same files are installed for the native runtime; opaque data stays external.
+    model["kernel_sources"] = {}
+    for asset in model["assets"]:
+        if asset.get("unit") and asset["path"].startswith(asset["unit"] + "/kernels/"):
+            try:
+                content = Path(asset["source"]).read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            model["kernel_sources"][asset["path"]] = content
     model["fingerprint"] = provenance(model)
     model["library"] = (out / "library.path").read_text().strip()
     for u in model["units"].values():

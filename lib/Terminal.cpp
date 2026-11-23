@@ -10,6 +10,11 @@ llvm::StringRef compilerinfra::spelling(Reuse level) {
   }
   llvm_unreachable("invalid reuse level");
 }
+llvm::Expected<llvm::StringRef> PrintContext::source(llvm::StringRef implementation) const {
+  auto it=sources->find(implementation.str());
+  if(it==sources->end())return llvm::createStringError("unbound runtime source "+implementation);
+  return llvm::StringRef(it->second);
+}
 std::string PrintContext::name(Value v) {
   auto id=names.try_emplace(v,names.size()).first->second;
   return "v"+std::to_string(id);
@@ -81,6 +86,7 @@ static llvm::Error visit(const TerminalPrinter &printer,Operation &op,PrintConte
 }
 llvm::Error TerminalPrinter::emit(Operation *root,llvm::raw_pwrite_stream &out) const {
   PrintContext ctx;
+  ctx.sources=&runtimeSources;
   if(auto e=visit(*this,*root,ctx))return e;
   return package(root->getAttrDictionary(),ctx.files,out);
 }

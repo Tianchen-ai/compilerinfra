@@ -186,21 +186,6 @@ def tree(root, complete=True, extension_roots=None):
                 raise ValueError(f"duplicate runtime {key}")
             path = f"runtime/{key}"
             runtimes[key] = unit(prefix + path, package, path, path, [])
-    deps = {}
-    for alias, _, declaration in parts:
-        for dep in declaration.get("optional_dependencies", []):
-            key = name(dep["id"])
-            owner = dep["owner"]
-            unit_id = ("extensions/" + alias + "/" if alias else "") + owner
-            if (key in deps or unit_id not in units or not owner.startswith("exits/")
-                    or not dep["probe"].startswith(unit_id + "::")
-                    or not re.fullmatch(r"[\w.+-]+", dep["package"])
-                    or not re.fullmatch(r"[\w.+-]+(?:::[\w.+-]+)+",dep["cmake_target"])
-                    or not re.fullmatch(r">=\d+(?:\.\d+)*(?:,<\d+(?:\.\d+)*)?",dep["version"])):
-                raise ValueError(f"{unit_id}: invalid optional dependency {key}")
-            deps[key] = dep
-    if deps:
-        product["optional_dependencies"] = list(deps.values())
     roots = [k for k, v in nodes.items() if v["parent"] == "entry"]
     if (nodes or complete) and len(roots) != 1:
         raise ValueError("expected one root with parent 'entry'")
@@ -303,6 +288,21 @@ def tree(root, complete=True, extension_roots=None):
                             sha256=hashlib.sha256(f.read_bytes()).hexdigest(),
                         )
                     )
+    deps = {}
+    for alias, _, declaration in parts:
+        for dep in declaration.get("optional_dependencies", []):
+            key = name(dep["id"])
+            owner = dep["owner"]
+            unit_id = ("extensions/" + alias + "/" if alias else "") + owner
+            if (key in deps or unit_id not in units or not owner.startswith("exits/")
+                    or not dep["probe"].startswith(unit_id + "::")
+                    or not re.fullmatch(r"[\w.+-]+", dep["package"])
+                    or not re.fullmatch(r"[\w.+-]+(?:::[\w.+-]+)+",dep["cmake_target"])
+                    or not re.fullmatch(r">=\d+(?:\.\d+)*(?:,<\d+(?:\.\d+)*)?",dep["version"])):
+                raise ValueError(f"{unit_id}: invalid optional dependency {key}")
+            deps[key] = dep
+    if deps:
+        product["optional_dependencies"] = list(deps.values())
     for f in sorted((root / front).rglob("*")):
         rel = f.relative_to(root / front)
         if (

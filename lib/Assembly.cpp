@@ -1,6 +1,7 @@
 #include "DecisionProgram.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VersionTuple.h"
 #include <cmath>
 #include <set>
 
@@ -97,6 +98,7 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
     if(auto e=c.record(id,u.id,node+"@"+n->getArray("boundaries")->back().getAsString()->str(),"implementation",where))return e;
     auto &item=*c.catalog.getObject(id);
     item["operation"]=impl.operation; item["symbol"]=impl.symbol;
+    if(!impl.resource.empty())item["resource"]=impl.resource;
     item["source"]=impl.source==ImplementationSource::Builtin?"builtin":impl.source==ImplementationSource::Runtime?"runtime":"external";
     item["reuse"]=spelling(impl.minimum).str(); item["operands"]=impl.operands;
     item["layout"]=impl.layout; item["accumulator"]=impl.accumulator;item["effects"]=impl.effects;
@@ -460,7 +462,9 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
     front.verifyInput = units.at(frontId).input;
   Object selected;
   std::vector<Exit> exits;
-  Object description = manifest;
+  Object description;
+  for (auto &[key,value] : manifest)
+    if(key!="kernel_sources")description[key]=value;
   std::map<std::string, FamilyBindings> handoffs;
   auto bindBranch = [&](const std::string &name, Object &branch,
                         llvm::StringRef group) {
@@ -521,7 +525,21 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
           if(field(d,"owner")!="exits/"+name)continue;
           auto probe=c.probes.find(field(d,"probe"));
           if(probe==c.probes.end())return createStringError("unregistered dependency probe "+field(d,"probe"));
-          profile->dependencies.emplace(field(d,"id"),probe->second);
+          profile->dependencies.emplace(field(d,"id"),[decl=Object(d),run=probe->second](){
+            auto report=run();
+            if(report.getBoolean("available").value_or(false)){
+              auto expected=decl.getString("version")->drop_front(2).split(",<");
+              auto installed=report.getString("version");
+              llvm::VersionTuple version,min,max;
+              if(!installed || version.tryParse(*installed) || min.tryParse(expected.first) ||
+                 version<min || (!expected.second.empty() && (max.tryParse(expected.second) || version>=max))){
+                report["available"]=false;
+                report["reason"]="runtime version outside "+field(decl,"version");
+              }
+            }
+            if(auto build=decl.getObject("build"))report["build"]=Object(*build);
+            return report;
+          });
         }
       profile->implementations=c.contracts[name];
       for(auto &[id,i]:profile->implementations){
@@ -548,12 +566,22 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       t.emit = implementation.emit;
       t.dependencies=profile->dependencies;
       if(implementation.terminal) {
-        auto &printer=*implementation.terminal;
+        auto printer=*implementation.terminal;
         if(!printer.package || printer.operations.empty() ||
            llvm::any_of(printer.operations,[](const auto &p){return p.first.empty() || !p.second;}))
           return createStringError(name+": incomplete terminal printer");
         for(auto &op:profile->implementationOps)if(!printer.operations.count(op))return createStringError(name+": no print rule for "+op);
-        t.emit=[printer](mlir::ModuleOp m,llvm::raw_pwrite_stream &out){return printer.emit(m,out);};
+        for(auto &[key,contract]:profile->implementations){
+          if(contract.source!=ImplementationSource::Runtime)continue;
+          auto *runtime=manifest.getObject("runtimes");
+          auto owner=runtime->getString(name);
+          auto *files=manifest.getObject("kernel_sources");
+          auto text=files?files->getString(contract.resource):std::nullopt;
+          if(!owner || !llvm::StringRef(contract.resource).starts_with((*owner+"/kernels/").str()) || !text)
+            return createStringError(key+": missing runtime kernel source "+contract.resource);
+          printer.runtimeSources.emplace(key,text->str());
+        }
+        t.emit=[printer=std::move(printer)](mlir::ModuleOp m,llvm::raw_pwrite_stream &out){return printer.emit(m,out);};
       }
       std::set<std::string> owners{"exits/" + name};
       for (auto &eligible : *manifest.getObject("units")
