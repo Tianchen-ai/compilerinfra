@@ -78,7 +78,8 @@ struct FamilyBinding {
   std::string decideAt, materializeAt;
 };
 struct ExitImplementation {
-  using Capabilities = std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)>;
+  using Capabilities =
+      std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)>;
   ExitImplementation() = default;
   [[deprecated("register a TerminalPrinter to emit verified operations")]]
   ExitImplementation(Emit legacy, Capabilities caps)

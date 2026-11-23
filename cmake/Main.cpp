@@ -20,7 +20,8 @@ int main(int argc, char **argv) {
     std::string opt = argv[i];
     if (opt == "--layout" || opt == "--inspect")
       layout = true;
-    else if(opt=="--doctor")doctor=true;
+    else if (opt == "--doctor")
+      doctor = true;
     else if (opt == "--text")
       text = true;
     else if (opt == "--explain")
@@ -44,7 +45,8 @@ int main(int argc, char **argv) {
   std::unique_ptr<ci_compiler, decltype(&ci_close)> c(raw, ci_close);
   ci_buffer output{}, events{};
   if (layout || doctor) {
-    if (failed(doctor ? ci_doctor(c.get(), &output) : ci_describe(c.get(), &output)))
+    if (failed(doctor ? ci_doctor(c.get(), &output)
+                      : ci_describe(c.get(), &output)))
       return 1;
   } else {
     if (!args.count("--exit")) {

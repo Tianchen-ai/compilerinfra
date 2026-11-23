@@ -201,8 +201,9 @@ compilerinfra::detail::rankCandidates(const DecisionProgram &p,
             candidate.id);
       Row r{std::move(candidate), name};
       auto legality = table.family.verify(op, r.proposal.value, *table.target);
-      for(auto &impl:r.proposal.implementations)
-        if(!legality)legality=table.target->checkImplementation(impl);
+      for (auto &impl : r.proposal.implementations)
+        if (!legality)
+          legality = table.target->checkImplementation(impl);
       if (!legality && table.family.verifyCandidate)
         legality = table.family.verifyCandidate(op, r.proposal, *table.target);
       if (legality) {
@@ -304,23 +305,30 @@ compilerinfra::detail::rankCandidates(const DecisionProgram &p,
     }
   }
   if (observe)
-    for (size_t i = 0; i < rows.size(); ++i)
-      {
-        Object details=describe(rows[i], model, selected == i);
-        details["reuse"]=spelling(table.target->reuse).str();
-        details["implementations"]=strings(rows[i].proposal.implementations);
-        Object contracts;
-        for(const auto &key:rows[i].proposal.implementations){
-          auto it=table.target->implementations.find(key);
-          if(it==table.target->implementations.end())continue;
-          const auto &impl=it->second;
-          contracts[key]=Object{{"symbol",impl.symbol},{"minimum_reuse",spelling(impl.minimum).str()},
-            {"source",impl.source==ImplementationSource::Builtin?"builtin":impl.source==ImplementationSource::Runtime?"runtime":"external"},
-            {"estimator",impl.estimator},{"parameters",strings(impl.costParameters)},{"dependencies",strings(impl.dependencies)}};
-        }
-        details["contracts"]=std::move(contracts);
-        observe(rows[i].strategy, rows[i].proposal.value,std::move(details));
+    for (size_t i = 0; i < rows.size(); ++i) {
+      Object details = describe(rows[i], model, selected == i);
+      details["reuse"] = spelling(table.target->reuse).str();
+      details["implementations"] = strings(rows[i].proposal.implementations);
+      Object contracts;
+      for (const auto &key : rows[i].proposal.implementations) {
+        auto it = table.target->implementations.find(key);
+        if (it == table.target->implementations.end())
+          continue;
+        const auto &impl = it->second;
+        contracts[key] = Object{
+            {"symbol", impl.symbol},
+            {"minimum_reuse", spelling(impl.minimum).str()},
+            {"source", impl.source == ImplementationSource::Builtin ? "builtin"
+                       : impl.source == ImplementationSource::Runtime
+                           ? "runtime"
+                           : "external"},
+            {"estimator", impl.estimator},
+            {"parameters", strings(impl.costParameters)},
+            {"dependencies", strings(impl.dependencies)}};
       }
+      details["contracts"] = std::move(contracts);
+      observe(rows[i].strategy, rows[i].proposal.value, std::move(details));
+    }
   if (selected == rows.size()) {
     std::string why = choice.candidate.empty()
                           ? "all proposals declined or eliminated"

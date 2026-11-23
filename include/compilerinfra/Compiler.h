@@ -76,7 +76,7 @@ struct Exit {
   std::vector<Stage> stages;
   Emit emit;
   BoundaryCheck verifyInput;
-  std::map<std::string,std::function<llvm::json::Object()>> dependencies;
+  std::map<std::string, std::function<llvm::json::Object()>> dependencies;
 };
 
 struct SessionOptions {

@@ -21,8 +21,9 @@ std::string field(const Object &obj, llvm::StringRef key) {
 }
 
 struct Components {
-  std::map<std::string,std::map<std::string,ImplementationContract>> contracts;
-  std::map<std::string,std::function<Object()>> probes;
+  std::map<std::string, std::map<std::string, ImplementationContract>>
+      contracts;
+  std::map<std::string, std::function<Object()>> probes;
   std::map<std::string, const Located<Boundary> *> boundaries;
   std::map<std::string, const Located<ExitImplementation> *> exits;
   std::map<std::string, Located<Contribution>> contributions;
@@ -77,34 +78,62 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
   }
   if (u.exit) {
     if (owner != "exits/" + node || u.id != field(*n, "unit") ||
-        bool(u.exit->value.emit)==bool(u.exit->value.terminal))
+        bool(u.exit->value.emit) == bool(u.exit->value.terminal))
       return createStringError(u.id + ": invalid exit implementation");
     auto at = field(*manifest.getObject("exits")->getObject(node), "at");
     if (auto e = c.record(owner, u.id, at, "exit", u.exit->source))
       return e;
     c.exits[node] = &*u.exit;
   }
-  for (auto &[localName, probe]:u.dependencyProbes) {
-    if(!exitUnit || !probe || !c.probes.emplace(u.qualify(localName), probe).second)
-      return createStringError(u.id+": invalid dependency probe "+localName);
+  for (auto &[localName, probe] : u.dependencyProbes) {
+    if (!exitUnit || !probe ||
+        !c.probes.emplace(u.qualify(localName), probe).second)
+      return createStringError(u.id + ": invalid dependency probe " +
+                               localName);
   }
-  for (auto &[impl,where]:u.implementations) {
-    if(!exitUnit || impl.name.empty() || impl.operation.empty() || impl.symbol.empty() ||
-       impl.operands.empty() || impl.layout.empty() || impl.accumulator.empty() ||
-       impl.effects.empty() || impl.numerical.empty() || impl.estimator.empty() ||
-       !impl.verify || !impl.available)
-      return createStringError(u.id+": incomplete implementation "+impl.name);
-    auto id=u.qualify(impl.name);
-    if(auto e=c.record(id,u.id,node+"@"+n->getArray("boundaries")->back().getAsString()->str(),"implementation",where))return e;
-    auto &item=*c.catalog.getObject(id);
-    item["operation"]=impl.operation; item["symbol"]=impl.symbol;
-    if(!impl.resource.empty())item["resource"]=impl.resource;
-    item["source"]=impl.source==ImplementationSource::Builtin?"builtin":impl.source==ImplementationSource::Runtime?"runtime":"external";
-    item["reuse"]=spelling(impl.minimum).str(); item["operands"]=impl.operands;
-    item["layout"]=impl.layout; item["accumulator"]=impl.accumulator;item["effects"]=impl.effects;
-    item["numerical"]=impl.numerical;item["estimator"]=impl.estimator;
-    item["cost_parameters"]=Array(impl.costParameters);item["dependencies"]=Array(impl.dependencies);
-    c.contracts[node].emplace(id,impl);
+  for (auto &[impl, where] : u.implementations) {
+    if (!exitUnit || impl.name.empty() || impl.operation.empty() ||
+        impl.symbol.empty() || impl.operands.empty() || impl.layout.empty() ||
+        impl.accumulator.empty() || impl.effects.empty() ||
+        impl.numerical.empty() || impl.estimator.empty() || !impl.verify ||
+        !impl.available)
+      return createStringError(u.id + ": incomplete implementation " +
+                               impl.name);
+    if (impl.source == ImplementationSource::External &&
+        impl.dependencies.empty())
+      return createStringError(
+          u.id + ": external implementation needs a declared dependency: " +
+          impl.name);
+    if ((impl.source == ImplementationSource::Runtime) !=
+        !impl.resource.empty())
+      return createStringError(
+          u.id + ": only runtime implementations bind a kernel resource: " +
+          impl.name);
+    auto id = u.qualify(impl.name);
+    if (auto e = c.record(
+            id, u.id,
+            node + "@" + n->getArray("boundaries")->back().getAsString()->str(),
+            "implementation", where))
+      return e;
+    auto &item = *c.catalog.getObject(id);
+    item["operation"] = impl.operation;
+    item["symbol"] = impl.symbol;
+    if (!impl.resource.empty())
+      item["resource"] = impl.resource;
+    item["source"] = impl.source == ImplementationSource::Builtin ? "builtin"
+                     : impl.source == ImplementationSource::Runtime
+                         ? "runtime"
+                         : "external";
+    item["reuse"] = spelling(impl.minimum).str();
+    item["operands"] = impl.operands;
+    item["layout"] = impl.layout;
+    item["accumulator"] = impl.accumulator;
+    item["effects"] = impl.effects;
+    item["numerical"] = impl.numerical;
+    item["estimator"] = impl.estimator;
+    item["cost_parameters"] = Array(impl.costParameters);
+    item["dependencies"] = Array(impl.dependencies);
+    c.contracts[node].emplace(id, impl);
   }
   for (auto &[v, s] : u.contributions) {
     auto id = u.qualify(v.name);
@@ -246,9 +275,10 @@ llvm::Expected<DecisionChoice> choiceFor(const Object &settings,
 llvm::Error checkConfiguration(const Object &config, const Object &manifest,
                                const Components &c) {
   for (auto &[group, entries] : config) {
-    if(group=="reuse"){
-      auto v=entries.getAsString();
-      if(v!="native" && v!="vendor" && v!="library")return createStringError("reuse must be native, vendor or library");
+    if (group == "reuse") {
+      auto v = entries.getAsString();
+      if (v != "native" && v != "vendor" && v != "library")
+        return createStringError("reuse must be native, vendor or library");
       continue;
     }
     if ((group != "nodes" && group != "exits") || !entries.getAsObject())
@@ -463,8 +493,9 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
   Object selected;
   std::vector<Exit> exits;
   Object description;
-  for (auto &[key,value] : manifest)
-    if(key!="kernel_sources")description[key]=value;
+  for (auto &[key, value] : manifest)
+    if (key != "kernel_sources")
+      description[key] = value;
   std::map<std::string, FamilyBindings> handoffs;
   auto bindBranch = [&](const std::string &name, Object &branch,
                         llvm::StringRef group) {
@@ -505,7 +536,7 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       if (!c.exits.count(name))
         return createStringError("missing emitter for " + name);
       auto &implementation = c.exits.at(name)->value;
-      (*status)["emission"]=implementation.terminal?"recursive":"legacy";
+      (*status)["emission"] = implementation.terminal ? "recursive" : "legacy";
       auto overrides = settings(config, "exits", name);
       auto profile = std::make_shared<TargetProfile>();
       profile->name = name;
@@ -517,37 +548,55 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         *profile = std::move(*facts);
       } else if (!options.empty())
         return createStringError(name + ": unsupported exit options");
-      auto reuse=config.getString("reuse").value_or("vendor");
-      profile->reuse=reuse=="native"?Reuse::Native:reuse=="library"?Reuse::Library:Reuse::Vendor;
-      if(auto *deps=manifest.getObject("product")->getArray("optional_dependencies"))
-        for(auto &decl:*deps){
-          auto &d=*decl.getAsObject();
-          if(field(d,"owner")!="exits/"+name)continue;
-          auto probe=c.probes.find(field(d,"probe"));
-          if(probe==c.probes.end())return createStringError("unregistered dependency probe "+field(d,"probe"));
-          profile->dependencies.emplace(field(d,"id"),[decl=Object(d),run=probe->second](){
-            auto report=run();
-            if(report.getBoolean("available").value_or(false)){
-              auto expected=decl.getString("version")->drop_front(2).split(",<");
-              auto installed=report.getString("version");
-              llvm::VersionTuple version,min,max;
-              if(!installed || version.tryParse(*installed) || min.tryParse(expected.first) ||
-                 version<min || (!expected.second.empty() && (max.tryParse(expected.second) || version>=max))){
-                report["available"]=false;
-                report["reason"]="runtime version outside "+field(decl,"version");
-              }
-            }
-            if(auto build=decl.getObject("build"))report["build"]=Object(*build);
-            return report;
-          });
+      auto reuse = config.getString("reuse").value_or("vendor");
+      profile->reuse = reuse == "native"    ? Reuse::Native
+                       : reuse == "library" ? Reuse::Library
+                                            : Reuse::Vendor;
+      if (auto *deps =
+              manifest.getObject("product")->getArray("optional_dependencies"))
+        for (auto &decl : *deps) {
+          auto &d = *decl.getAsObject();
+          if (field(d, "owner") != "exits/" + name)
+            continue;
+          auto probe = c.probes.find(field(d, "probe"));
+          if (probe == c.probes.end())
+            return createStringError("unregistered dependency probe " +
+                                     field(d, "probe"));
+          profile->dependencies.emplace(
+              field(d, "id"), [decl = Object(d), run = probe->second]() {
+                auto report = run();
+                if (report.getBoolean("available").value_or(false)) {
+                  auto expected =
+                      decl.getString("version")->drop_front(2).split(",<");
+                  auto installed = report.getString("version");
+                  llvm::VersionTuple version, min, max;
+                  if (!installed || version.tryParse(*installed) ||
+                      min.tryParse(expected.first) || version < min ||
+                      (!expected.second.empty() &&
+                       (max.tryParse(expected.second) || version >= max))) {
+                    report["available"] = false;
+                    report["reason"] =
+                        "runtime version outside " + field(decl, "version");
+                  }
+                }
+                if (auto build = decl.getObject("build"))
+                  report["build"] = Object(*build);
+                return report;
+              });
         }
-      profile->implementations=c.contracts[name];
-      for(auto &[id,i]:profile->implementations){
+      profile->implementations = c.contracts[name];
+      for (auto &[id, i] : profile->implementations) {
         profile->implementationOps.insert(i.operation);
-        auto est=c.costModels.find(i.estimator);
-        if(est==c.costModels.end() || field(*manifest.getObject("units")->getObject(field(*c.catalog.getObject(i.estimator),"unit")),"owner")!="exits/"+name)
-          return createStringError(id+": unknown exit-local estimator "+i.estimator);
-        for(auto &dep:i.dependencies)if(!profile->dependencies.count(dep))return createStringError(id+": unknown dependency "+dep);
+        auto est = c.costModels.find(i.estimator);
+        if (est == c.costModels.end() ||
+            field(*manifest.getObject("units")->getObject(
+                      field(*c.catalog.getObject(i.estimator), "unit")),
+                  "owner") != "exits/" + name)
+          return createStringError(id + ": unknown exit-local estimator " +
+                                   i.estimator);
+        for (auto &dep : i.dependencies)
+          if (!profile->dependencies.count(dep))
+            return createStringError(id + ": unknown dependency " + dep);
       }
       if (!profile->services.calibrationProfile.empty()) {
         auto *all = manifest.getObject("calibrations");
@@ -564,24 +613,37 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       Exit t;
       t.name = name;
       t.emit = implementation.emit;
-      t.dependencies=profile->dependencies;
-      if(implementation.terminal) {
-        auto printer=*implementation.terminal;
-        if(!printer.package || printer.operations.empty() ||
-           llvm::any_of(printer.operations,[](const auto &p){return p.first.empty() || !p.second;}))
-          return createStringError(name+": incomplete terminal printer");
-        for(auto &op:profile->implementationOps)if(!printer.operations.count(op))return createStringError(name+": no print rule for "+op);
-        for(auto &[key,contract]:profile->implementations){
-          if(contract.source!=ImplementationSource::Runtime)continue;
-          auto *runtime=manifest.getObject("runtimes");
-          auto owner=runtime->getString(name);
-          auto *files=manifest.getObject("kernel_sources");
-          auto text=files?files->getString(contract.resource):std::nullopt;
-          if(!owner || !llvm::StringRef(contract.resource).starts_with((*owner+"/kernels/").str()) || !text)
-            return createStringError(key+": missing runtime kernel source "+contract.resource);
-          printer.runtimeSources.emplace(key,text->str());
+      t.dependencies = profile->dependencies;
+      if (implementation.terminal) {
+        auto printer = *implementation.terminal;
+        if (!printer.package || printer.operations.empty() ||
+            llvm::any_of(printer.operations, [](const auto &p) {
+              return p.first.empty() || !p.second;
+            }))
+          return createStringError(name + ": incomplete terminal printer");
+        for (auto &op : profile->implementationOps)
+          if (!printer.operations.count(op))
+            return createStringError(name + ": no print rule for " + op);
+        for (auto &[key, contract] : profile->implementations) {
+          if (contract.source != ImplementationSource::Runtime)
+            continue;
+          auto *runtime = manifest.getObject("runtimes");
+          auto owner = runtime->getString(name);
+          auto *files = manifest.getObject("kernel_sources");
+          auto text =
+              files ? files->getString(contract.resource) : std::nullopt;
+          if (!owner ||
+              !llvm::StringRef(contract.resource)
+                   .starts_with((*owner + "/kernels/").str()) ||
+              !text)
+            return createStringError(key + ": missing runtime kernel source " +
+                                     contract.resource);
+          printer.runtimeSources.emplace(key, text->str());
         }
-        t.emit=[printer=std::move(printer)](mlir::ModuleOp m,llvm::raw_pwrite_stream &out){return printer.emit(m,out);};
+        t.emit = [printer = std::move(printer)](mlir::ModuleOp m,
+                                                llvm::raw_pwrite_stream &out) {
+          return printer.emit(m, out);
+        };
       }
       std::set<std::string> owners{"exits/" + name};
       for (auto &eligible : *manifest.getObject("units")
@@ -729,11 +791,13 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         for (auto &add : dialects)
           add(r);
       };
-      if(implementation.terminal){
-        auto &verify=t.stages.back().verifyOutput;
-        verify=[prior=verify,printer=*implementation.terminal,profile](mlir::ModuleOp m){
-          if(mlir::failed(prior(m)))return mlir::failure();
-          return printer.verify(m,*profile);
+      if (implementation.terminal) {
+        auto &verify = t.stages.back().verifyOutput;
+        verify = [prior = verify, printer = *implementation.terminal,
+                  profile](mlir::ModuleOp m) {
+          if (mlir::failed(prior(m)))
+            return mlir::failure();
+          return printer.verify(m, *profile);
         };
       }
       selected[name] = Array(chosen);

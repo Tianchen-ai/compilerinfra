@@ -53,7 +53,10 @@ static llvm::Error merge(Object &base, const Object &delta) {
   // Configuration has three map levels: section -> scope -> settings group.
   // The values in a group are atomic, including a complete family's selection.
   for (auto &[section, scopes] : delta) {
-    if(section=="reuse"){base[section]=scopes;continue;}
+    if (section == "reuse") {
+      base[section] = scopes;
+      continue;
+    }
     if (!scopes.getAsObject())
       return llvm::createStringError("expected scope map for " + section.str());
     if (!base.get(section))
@@ -141,21 +144,26 @@ const char *ci_describe(const ci_compiler *c, ci_buffer *out) {
   return nullptr;
 }
 const char *ci_doctor(const ci_compiler *c, ci_buffer *out) {
-  if(!c || !out)return ::strdup("missing compiler or output");
+  if (!c || !out)
+    return ::strdup("missing compiler or output");
   Object results;
-  auto declarations=c->manifest->getObject("product")->getArray("optional_dependencies");
-  for(const auto &exit:c->compiler.exits()){
+  auto declarations =
+      c->manifest->getObject("product")->getArray("optional_dependencies");
+  for (const auto &exit : c->compiler.exits()) {
     Object entry;
-    if(!exit.error.empty())entry["error"]=exit.error;
-    for(auto &[id,probe]:exit.dependencies){
-      auto report=probe();
-      if(declarations)for(auto &d:*declarations)
-        if(d.getAsObject()->getString("id")==id)report["declaration"]=d;
-      entry[id]=std::move(report);
+    if (!exit.error.empty())
+      entry["error"] = exit.error;
+    for (auto &[id, probe] : exit.dependencies) {
+      auto report = probe();
+      if (declarations)
+        for (auto &d : *declarations)
+          if (d.getAsObject()->getString("id") == id)
+            report["declaration"] = d;
+      entry[id] = std::move(report);
     }
-    results[exit.name]=std::move(entry);
+    results[exit.name] = std::move(entry);
   }
-  *out=copy(serialize(std::move(results)));
+  *out = copy(serialize(std::move(results)));
   return nullptr;
 }
 static const char *compile(const ci_compiler *c, const char *exit,
@@ -186,10 +194,12 @@ static const char *compile(const ci_compiler *c, const char *exit,
         Object active;
         for (auto &[name, local] : *exits) {
           Object policy;
-          if (auto *settings=local.getAsObject())
-            for (auto &[key,value]:*settings)
-              if(key!="options")policy[key]=value;
-          if(!policy.empty())active[name]=std::move(policy);
+          if (auto *settings = local.getAsObject())
+            for (auto &[key, value] : *settings)
+              if (key != "options")
+                policy[key] = value;
+          if (!policy.empty())
+            active[name] = std::move(policy);
         }
         config["exits"] = std::move(active);
       }
