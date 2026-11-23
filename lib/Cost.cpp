@@ -309,6 +309,16 @@ compilerinfra::detail::rankCandidates(const DecisionProgram &p,
         Object details=describe(rows[i], model, selected == i);
         details["reuse"]=spelling(table.target->reuse).str();
         details["implementations"]=strings(rows[i].proposal.implementations);
+        Object contracts;
+        for(const auto &key:rows[i].proposal.implementations){
+          auto it=table.target->implementations.find(key);
+          if(it==table.target->implementations.end())continue;
+          const auto &impl=it->second;
+          contracts[key]=Object{{"symbol",impl.symbol},{"minimum_reuse",spelling(impl.minimum).str()},
+            {"source",impl.source==ImplementationSource::Builtin?"builtin":impl.source==ImplementationSource::Runtime?"runtime":"external"},
+            {"estimator",impl.estimator},{"parameters",strings(impl.costParameters)},{"dependencies",strings(impl.dependencies)}};
+        }
+        details["contracts"]=std::move(contracts);
         observe(rows[i].strategy, rows[i].proposal.value,std::move(details));
       }
   if (selected == rows.size()) {
