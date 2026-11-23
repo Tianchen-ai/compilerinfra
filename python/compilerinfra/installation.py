@@ -1,6 +1,6 @@
 """Publish only this product's files, retaining mapped library inodes and unrelated installs."""
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import logging
 import json
@@ -25,18 +25,31 @@ def publish(stage, prefix, backup, library, previous_manifest=None, *, keep_inst
                 saved = keep_install / rel
                 saved.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(prefix / rel, saved)
-        with _publish(stage, prefix, backup, library, previous_manifest):
-            yield
+        with ExitStack() as backups:
+            with _publish(stage, prefix, backups, library, previous_manifest):
+                yield
     finally:
         os.close(lock)
 
 
 @contextmanager
-def _publish(stage, prefix, backup, library, previous_manifest):
+def _publish(stage, prefix, backups, library, previous_manifest):
     """Replace installed files atomically and restore them if activation fails."""
     done = []
     generation = None
     previous_generation = None
+    directories = {}
+
+    def save(dest):
+        # A rollback must not need to allocate or copy file contents after ENOSPC.
+        # Save on the destination filesystem, including for mounted subdirectories.
+        if dest.parent not in directories:
+            directories[dest.parent] = Path(backups.enter_context(
+                tempfile.TemporaryDirectory(prefix=".ci-rollback-", dir=dest.parent)))
+        old = directories[dest.parent] / dest.name
+        shutil.copy2(dest, old, follow_symlinks=False)
+        return old
+
     try:
         inventory = Path(".compilerinfra") / (library.name + ".files.json")
         record = prefix / inventory
@@ -73,9 +86,7 @@ def _publish(stage, prefix, backup, library, previous_manifest):
             rel = relative(removed)
             dest = prefix / rel
             if dest.is_file() or dest.is_symlink():
-                old = backup / rel
-                old.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, old, follow_symlinks=False)
+                old = save(dest)
                 dest.unlink()
                 done.append((dest, old))
         (stage / inventory).parent.mkdir(exist_ok=True)
@@ -85,12 +96,8 @@ def _publish(stage, prefix, backup, library, previous_manifest):
                 continue
             rel = src.relative_to(stage)
             dest = prefix / rel
-            old = backup / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            exists = dest.exists()
-            if exists:
-                old.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(dest, old, follow_symlinks=False)
+            old = save(dest) if dest.exists() or dest.is_symlink() else None
 
             with tempfile.NamedTemporaryFile(dir=dest.parent, delete=False) as tmp:
                 path = Path(tmp.name)
@@ -107,15 +114,14 @@ def _publish(stage, prefix, backup, library, previous_manifest):
                     os.replace(path, generation)
                     path.symlink_to(generation.name)
                 os.replace(path, dest)
-                done.append((dest, old if exists else None))
+                done.append((dest, old))
             finally:
                 path.unlink(missing_ok=True)
         yield
     except BaseException:
         for dest, old in reversed(done):
             if old:
-                dest.unlink(missing_ok=True)
-                shutil.copy2(old, dest, follow_symlinks=False)
+                os.replace(old, dest)
             else:
                 dest.unlink()
         if generation:

@@ -43,7 +43,7 @@ def init(directory: str, name: str, version: str = "0.1.0", language: str = "mli
         dict(
             name=name,
             version=version,
-            compilerinfra="0.3.5",
+            compilerinfra="0.3.6",
             levels=[],
             nodes=[],
             exits=[],
@@ -56,9 +56,9 @@ def init(directory: str, name: str, version: str = "0.1.0", language: str = "mli
     )
     (root / "CMakeLists.txt").write_text(
         "cmake_minimum_required(VERSION 3.22)\n"
-        "find_package(CompilerInfra 0.3.5 EXACT REQUIRED CONFIG COMPONENTS Project)\n"
+        "find_package(CompilerInfra 0.3.6 EXACT REQUIRED CONFIG COMPONENTS Project)\n"
         "compilerinfra_project_name(product_name)\nproject(${product_name} LANGUAGES C CXX)\n"
-        "find_package(CompilerInfra 0.3.5 EXACT REQUIRED CONFIG)\ncompilerinfra_product()\n"
+        "find_package(CompilerInfra 0.3.6 EXACT REQUIRED CONFIG)\ncompilerinfra_product()\n"
     )
     (root / "AGENTS.md").write_text(
         "Read product.json and the installed compiler layout. "
