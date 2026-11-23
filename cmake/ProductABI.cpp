@@ -140,6 +140,24 @@ const char *ci_describe(const ci_compiler *c, ci_buffer *out) {
   *out = copy(serialize(Object(c->compiler.describe())));
   return nullptr;
 }
+const char *ci_doctor(const ci_compiler *c, ci_buffer *out) {
+  if(!c || !out)return ::strdup("missing compiler or output");
+  Object results;
+  auto declarations=c->manifest->getObject("product")->getArray("optional_dependencies");
+  for(const auto &exit:c->compiler.exits()){
+    Object entry;
+    if(!exit.error.empty())entry["error"]=exit.error;
+    for(auto &[id,probe]:exit.dependencies){
+      auto report=probe();
+      if(declarations)for(auto &d:*declarations)
+        if(d.getAsObject()->getString("id")==id)report["declaration"]=d;
+      entry[id]=std::move(report);
+    }
+    results[exit.name]=std::move(entry);
+  }
+  *out=copy(serialize(std::move(results)));
+  return nullptr;
+}
 static const char *compile(const ci_compiler *c, const char *exit,
                            const void *input, size_t size, const char *after,
                            const char *through, int text, ci_buffer *out,

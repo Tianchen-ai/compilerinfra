@@ -44,8 +44,20 @@ def unit_directory(model, u):
 def configure(model, out):
     units = model["units"]
     lines = []
+    for dep in model["product"].get("optional_dependencies", []):
+        version = dep["version"][2:].replace(",<", "...<")
+        lines.append(f'find_package({dep["package"]} {version} QUIET CONFIG)')
+        # Publish the target only within its owning exit. A plugin can use it
+        # for an optional adapter build without linking the base product to it.
     for key, u in units.items():
         target = ident(key)
+        for dep in model["product"].get("optional_dependencies", []):
+            var = "CI_OPTIONAL_" + dep["id"].replace("-", "_")
+            lines.append(f"unset({var})")
+            if dep["probe"].split("::")[0] == key:
+                imported = dep["cmake_target"]
+                lines += [f'if({dep["package"]}_FOUND AND TARGET {imported})',
+                          f"  set({var} {imported})", "endif()"]
         lines.extend(
             [
                 f"set(ci_unit {quote(key)})",

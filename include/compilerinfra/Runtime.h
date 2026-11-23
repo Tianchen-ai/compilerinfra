@@ -19,6 +19,7 @@ const char *ci_open(const char *configuration_json, ci_compiler **out);
 const char *ci_derive(const ci_compiler *, const char *configuration_json,
                       ci_compiler **out);
 const char *ci_describe(const ci_compiler *, ci_buffer *json);
+const char *ci_doctor(const ci_compiler *, ci_buffer *json);
 const char *ci_compile(const ci_compiler *, const char *exit_name,
                        const void *input, size_t size, const char *after,
                        const char *through, int assembly_text,

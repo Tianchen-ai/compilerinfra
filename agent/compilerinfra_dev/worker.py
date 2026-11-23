@@ -52,6 +52,8 @@ def serve(pipe, path, profile):
                             result = (result, handles[key].last_compilation_id)
                     except CompilationError as exc:
                         result = (None, exc.report)
+                elif op == "doctor":
+                    result = handles[key].doctor()
                 elif op == "catalog":
                     result = (
                         catalogs[key].describe()

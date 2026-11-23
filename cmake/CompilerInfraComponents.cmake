@@ -111,7 +111,7 @@ function(compilerinfra_product)
     string(JSON dir GET "${layout}" packages "${key}")
     list(APPEND ci_public_includes "${dir}/include")
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${dir}/product.json")
-    file(GLOB_RECURSE asset_inputs CONFIGURE_DEPENDS "${dir}/frontend/*" "${dir}/runtime/*.py" "${dir}/agent/*.py" "${dir}/agent/*.md"
+    file(GLOB_RECURSE asset_inputs CONFIGURE_DEPENDS "${dir}/frontend/*" "${dir}/runtime/*/kernels/*" "${dir}/runtime/*.py" "${dir}/agent/*.py" "${dir}/agent/*.md"
       "${dir}/levels/*/agent/*" "${dir}/exits/*/agent/*" "${dir}/levels/*/CMakeLists.txt"
       "${dir}/exits/*/CMakeLists.txt" "${dir}/runtime/*/CMakeLists.txt")
     if(EXISTS "${dir}/include")

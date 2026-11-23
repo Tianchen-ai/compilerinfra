@@ -59,6 +59,11 @@ class Catalog:
 
         action("layout", layout)
         action("inspect", inspect_compiler)
+        def doctor(compiler: str = "base"):
+            """Probe this installed compiler's optional target dependencies."""
+            key = scope.key(compiler)
+            return scope.values[key].worker.call("doctor", key)
+        action("doctor", doctor)
         action("compile", compile_ir)
         if scope.profile == "runtime":
             return

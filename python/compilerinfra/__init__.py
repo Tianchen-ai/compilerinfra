@@ -28,6 +28,7 @@ class Library:
             "ci_open": (ptr, [string, C.POINTER(ptr)]),
             "ci_derive": (ptr, [ptr, string, C.POINTER(ptr)]),
             "ci_describe": (ptr, [ptr, buf]),
+            "ci_doctor": (ptr, [ptr, buf]),
             "ci_compile": (
                 ptr,
                 [ptr, string, ptr, C.c_size_t, string, string, C.c_int, buf, buf],
@@ -104,6 +105,11 @@ class Compiler:
     def runtime(self, owner, module=""):
         """Import a runtime module from this compiler installation."""
         return self.library.modules.runtime(owner, module)
+
+    def doctor(self):
+        out = Buffer()
+        self.library.check(self.library.api.ci_doctor(self.handle, C.byref(out)))
+        return json.loads(self.library.take(out))
 
     def compile(
         self,
