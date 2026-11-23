@@ -2,6 +2,7 @@
 #define COMPILERINFRA_ASSEMBLY_H
 
 #include "compilerinfra/Compiler.h"
+#include "compilerinfra/Terminal.h"
 #include "mlir/Support/TypeID.h"
 #include "llvm/ADT/DenseMap.h"
 #include <set>
@@ -50,6 +51,11 @@ struct TargetProfile {
   std::string name;
   std::set<std::string> features;
   TargetServices services;
+  Reuse reuse = Reuse::Vendor;
+  std::map<std::string, ImplementationContract> implementations;
+  std::set<std::string> implementationOps;
+  std::map<std::string, std::function<llvm::json::Object()>> dependencies;
+  llvm::Error checkImplementation(llvm::StringRef name) const;
 };
 using ModelCheck =
     std::function<mlir::LogicalResult(mlir::ModuleOp, const TargetProfile &)>;
@@ -75,6 +81,7 @@ struct ExitImplementation {
   Emit emit;
   std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)>
       capabilities;
+  std::optional<TerminalPrinter> terminal;
 };
 template <typename T> struct Located {
   T value;
@@ -94,6 +101,8 @@ public:
   std::vector<Located<Strategy>> strategies;
   std::vector<Located<Realizer>> realizers;
   std::vector<Located<CostModel>> costModels;
+  std::vector<Located<ImplementationContract>> implementations;
+  std::map<std::string, std::function<llvm::json::Object()>> dependencyProbes;
   std::optional<Located<ExitImplementation>> exit;
   std::string qualify(llvm::StringRef local) const {
     return id + "::" + local.str();

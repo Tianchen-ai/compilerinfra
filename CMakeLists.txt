@@ -17,7 +17,7 @@ if(standalone AND NOT DEFINED MLIR_LINK_MLIR_DYLIB AND TARGET MLIR AND TARGET LL
 endif()
 option(COMPILERINFRA_LINK_MLIR_DYLIB "Match the product's shared MLIR/LLVM linkage" ${shared_mlir_default})
 option(COMPILERINFRA_INSTALL "Install the CompilerInfra SDK" ${standalone})
-add_library(CompilerInfraCore STATIC lib/Assembly.cpp lib/Cost.cpp lib/Compiler.cpp lib/Decision.cpp lib/Session.cpp)
+add_library(CompilerInfraCore STATIC lib/Assembly.cpp lib/Cost.cpp lib/Compiler.cpp lib/Decision.cpp lib/Session.cpp lib/Terminal.cpp)
 add_library(CompilerInfra::Core ALIAS CompilerInfraCore)
 set_target_properties(CompilerInfraCore PROPERTIES EXPORT_NAME Core POSITION_INDEPENDENT_CODE ON)
 target_compile_features(CompilerInfraCore PUBLIC cxx_std_17)

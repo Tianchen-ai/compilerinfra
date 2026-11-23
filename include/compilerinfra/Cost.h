@@ -17,6 +17,7 @@ struct StructuralCandidate {
   std::string id, topology;
   mlir::Attribute value;
   std::vector<std::string> preconditions;
+  std::vector<std::string> implementations;
 };
 struct Quantity {
   double value;

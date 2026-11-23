@@ -53,6 +53,7 @@ static llvm::Error merge(Object &base, const Object &delta) {
   // Configuration has three map levels: section -> scope -> settings group.
   // The values in a group are atomic, including a complete family's selection.
   for (auto &[section, scopes] : delta) {
+    if(section=="reuse"){base[section]=scopes;continue;}
     if (!scopes.getAsObject())
       return llvm::createStringError("expected scope map for " + section.str());
     if (!base.get(section))
