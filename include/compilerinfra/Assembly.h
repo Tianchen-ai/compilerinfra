@@ -86,6 +86,20 @@ struct ExitImplementation {
   Capabilities capabilities;
   TerminalPrinter terminal;
 };
+struct CapabilityDeclaration {
+  std::string name;
+  std::string category;
+  std::string summary;
+};
+enum class ParityStatus : uint8_t { Implemented, Unsupported, Todo };
+llvm::StringRef spelling(ParityStatus status);
+struct ParityDeclaration {
+  std::string capability;
+  std::string architecture = "*";
+  ParityStatus status = ParityStatus::Todo;
+  std::vector<std::string> bindings;
+  std::string reason;
+};
 template <typename T> struct Located {
   T value;
   SourceRef source;
@@ -105,6 +119,8 @@ public:
   std::vector<Located<Realizer>> realizers;
   std::vector<Located<CostModel>> costModels;
   std::vector<Located<ImplementationContract>> implementations;
+  std::vector<Located<CapabilityDeclaration>> capabilities;
+  std::vector<Located<ParityDeclaration>> parity;
   std::map<std::string, std::function<llvm::json::Object()>> dependencyProbes;
   std::optional<Located<ExitImplementation>> exit;
   std::string qualify(llvm::StringRef local) const {

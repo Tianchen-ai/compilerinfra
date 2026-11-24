@@ -33,18 +33,54 @@ def _top_k(values, k):
     }
 
 
-def timed_receipt(invocation_id, selection, samples_ms):
+def timed_receipt(invocation_id, selection, samples_ms, execution=None):
     """Seal the timer's samples together with the bound launch it just measured."""
     record = dict(invocation_id=invocation_id, runtime_identity=selection["runtime_identity"],
                   artifact_sha256=selection["artifact_sha256"], samples_ms=list(samples_ms))
+    if execution is not None:
+        record["execution"] = dict(execution)
     record["digest"] = _receipt_digest(record)
     return record
 
 
 def _receipt_digest(record):
-    fields = {k:record[k] for k in ("invocation_id","runtime_identity","artifact_sha256","samples_ms")}
+    keys = ["invocation_id", "runtime_identity", "artifact_sha256", "samples_ms"]
+    if "execution" in record:
+        keys.append("execution")
+    fields = {k: record[k] for k in keys}
     encoded = json.dumps(fields, allow_nan=False, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def check_protocol(protocol, receipt):
+    """Lightweight v0.5 comparability check between Bench protocol and runtime receipt."""
+    if not isinstance(protocol, dict) or not isinstance(receipt, dict):
+        raise TypeError("protocol and receipt must be dicts")
+    mismatches = []
+    if receipt.get("digest") and receipt.get("digest") != _receipt_digest(receipt):
+        mismatches.append(
+            {"field": "digest", "expected": _receipt_digest(receipt), "actual": receipt.get("digest")}
+        )
+    exec_info = receipt.get("execution") or {}
+    ident = receipt.get("runtime_identity") or {}
+    for key, expected in protocol.items():
+        if expected is None:
+            continue
+        if key in exec_info:
+            actual = exec_info[key]
+        elif key in ident:
+            actual = ident[key]
+        elif key in receipt:
+            actual = receipt[key]
+        else:
+            actual = None
+        if actual != expected:
+            mismatches.append({"field": key, "expected": expected, "actual": actual})
+    return {
+        "comparable": not mismatches,
+        "status": "comparable" if not mismatches else "incomparable",
+        "mismatches": mismatches,
+    }
 
 
 def measurement_rows(batch, split, family, receipts):
@@ -129,6 +165,14 @@ def _join_batch(batch, compilations, measured):
             raise ValueError(f"{ident}: missing timed invocation receipt")
         if not run.get("invocation_id") or run.get("digest") != _receipt_digest(run):
             raise ValueError(f"{ident}: timed invocation contents changed")
+        if "protocol" in row and row["protocol"] is not None:
+            verdict = check_protocol(row["protocol"], run)
+            if not verdict["comparable"]:
+                diffs = ", ".join(
+                    f"{m['field']}: expected {m['expected']!r}, got {m['actual']!r}"
+                    for m in verdict["mismatches"]
+                )
+                raise ValueError(f"{ident}: incomparable measurement protocol ({diffs})")
         receipt = run["runtime_identity"]
         if receipt != row.get("runtime_identity", receipt):
             raise ValueError(f"{ident}: timed invocation differs from reported execution")

@@ -1,5 +1,6 @@
 #include "compilerinfra/Assembly.h"
 #include "compilerinfra/Contract.h"
+#include "compilerinfra/Product.h"
 #include "compilerinfra/Proofs.h"
 #include "compilerinfra/Terminal.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -299,6 +300,21 @@ void testTailAccessProof(MLIRContext &ctx) {
   auto pMasked = proveTailAccess({unaligned}, &ranges);
   assert(pMasked.proven && pMasked.kind == TailKind::MaskedSafe);
 }
+
+void testParityAndReadinessMetadata() {
+  assert(spelling(ParityStatus::Implemented) == "implemented");
+  assert(spelling(ParityStatus::Unsupported) == "unsupported");
+  assert(spelling(ParityStatus::Todo) == "todo");
+
+  auto parsed = llvm::cantFail(NumericalOptions::parse(llvm::json::Object{
+      {"fastmath", "reassoc,contract"},
+      {"denormal_mode", "preserve-sign"},
+  }));
+  assert(arith::bitEnumContainsAll(parsed.defaultFastMath,
+                                   arith::FastMathFlags::reassoc |
+                                       arith::FastMathFlags::contract));
+  assert(parsed.defaultDenormal == llvm::DenormalMode::getPreserveSign());
+}
 } // namespace
 
 int main() {
@@ -313,7 +329,8 @@ int main() {
   testNarrowAddressProof(ctx);
   testValueReplayProof(ctx);
   testTailAccessProof(ctx);
+  testParityAndReadinessMetadata();
 
-  std::cout << "ALL V0.5 P0 TESTS PASSED\n";
+  std::cout << "ALL V0.5 P0+P1 TESTS PASSED\n";
   return 0;
 }

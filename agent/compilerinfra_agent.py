@@ -19,6 +19,7 @@ def options():
     )
     parser.add_argument("action", nargs="?")
     parser.add_argument("arguments", nargs="?", default="{}")
+    parser.add_argument("extra_arguments", nargs="?")
     return parser.parse_args()
 
 
@@ -39,7 +40,12 @@ async def host(mcp):
 
     try:
         if opts.action:
-            value = await invoke(opts.action, json.loads(opts.arguments))
+            act_name = opts.action
+            raw_args = opts.arguments
+            if act_name == "inspect" and raw_args in ("parity", "readiness"):
+                act_name = f"inspect-{raw_args}"
+                raw_args = opts.extra_arguments or "{}"
+            value = await invoke(act_name, json.loads(raw_args))
             print(
                 value
                 if isinstance(value, str)

@@ -4,7 +4,7 @@ import base64
 import difflib
 from pathlib import Path
 from typing import Any
-from . import scaffold
+from . import inspection, scaffold
 from .plugins import Actions
 
 
@@ -21,12 +21,39 @@ class Catalog:
             """Describe the linked tree, native owners, source locations and actual configuration."""
             return scope.values[scope.key(compiler)].description
 
-        def inspect_compiler(compiler: str = "base"):
-            """Inspect the installed compiler and its scoped development assets."""
+        def inspect_compiler(
+            compiler: str = "base",
+            view: str | None = None,
+            exit: str | None = None,
+            records: str | None = None,
+        ):
+            """Inspect the installed compiler, or read-only 'parity' / 'readiness' views."""
+            if view == "parity":
+                return inspection.build_parity_report(scope, compiler=compiler, exit_filter=exit)
+            if view == "readiness":
+                return inspection.build_readiness_report(
+                    scope, compiler=compiler, exit_filter=exit, records=records
+                )
+            if view is not None:
+                raise ValueError(f"unknown inspect view {view!r}; expected 'parity' or 'readiness'")
             return dict(
                 layout(compiler),
                 source_locations=scope.source_locations(compiler),
                 **self.plugins(compiler),
+            )
+
+        def inspect_parity(compiler: str = "base", exit: str | None = None):
+            """Read-only parity report across node capabilities and sibling exits."""
+            return inspection.build_parity_report(scope, compiler=compiler, exit_filter=exit)
+
+        def inspect_readiness(
+            compiler: str = "base",
+            exit: str | None = None,
+            records: str | None = None,
+        ):
+            """Read-only per-exit readiness summary: v0.5 coverage, calibration, holdout accuracy and provenance."""
+            return inspection.build_readiness_report(
+                scope, compiler=compiler, exit_filter=exit, records=records
             )
 
         def compile_ir(
@@ -59,6 +86,8 @@ class Catalog:
 
         action("layout", layout)
         action("inspect", inspect_compiler)
+        action("inspect-parity", inspect_parity)
+        action("inspect-readiness", inspect_readiness)
         def doctor(compiler: str = "base"):
             """Probe this installed compiler's optional target dependencies."""
             key = scope.key(compiler)

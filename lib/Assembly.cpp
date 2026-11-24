@@ -15,6 +15,18 @@ void Assembly::bind(llvm::StringRef id, void (*registerUnit)(Unit &)) {
   registerUnit(entry.first->second);
 }
 
+llvm::StringRef compilerinfra::spelling(ParityStatus status) {
+  switch (status) {
+  case ParityStatus::Implemented:
+    return "implemented";
+  case ParityStatus::Unsupported:
+    return "unsupported";
+  case ParityStatus::Todo:
+    return "todo";
+  }
+  llvm_unreachable("invalid ParityStatus");
+}
+
 namespace {
 std::string field(const Object &obj, llvm::StringRef key) {
   return obj.getString(key)->str();
@@ -31,6 +43,8 @@ struct Components {
   std::map<std::string, Located<Strategy>> strategies;
   std::map<std::string, Located<Realizer>> realizers;
   std::map<std::string, Located<CostModel>> costModels;
+  std::map<std::string, Located<CapabilityDeclaration>> capabilities;
+  std::map<std::string, std::vector<Located<ParityDeclaration>>> parity;
   Object catalog;
   llvm::Error record(const std::string &name, const std::string &unit,
                      const std::string &at, llvm::StringRef kind,
@@ -194,6 +208,30 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
     if (auto e = c.record(id, u.id, "", "realizer", s))
       return e;
     c.realizers.emplace(id, Located<Realizer>{v, s});
+  }
+  for (auto &[cap, s] : u.capabilities) {
+    if (exitUnit || cap.name.empty() || cap.summary.empty())
+      return createStringError(u.id + ": invalid node capability declaration " +
+                               cap.name);
+    auto id = u.qualify(cap.name);
+    if (auto e = c.record(id, u.id, node, "capability", s))
+      return e;
+    auto &item = *c.catalog.getObject(id);
+    item["category"] = cap.category;
+    item["summary"] = cap.summary;
+    item["node"] = node;
+    c.capabilities.emplace(id, Located<CapabilityDeclaration>{cap, s});
+  }
+  for (auto &[p, s] : u.parity) {
+    if (!exitUnit || p.capability.empty() || p.architecture.empty())
+      return createStringError(u.id + ": invalid parity declaration");
+    if (p.status == ParityStatus::Unsupported && p.reason.empty())
+      return createStringError(u.id + ": unsupported parity for " +
+                               p.capability + " requires a reason");
+    if (p.status == ParityStatus::Implemented && p.bindings.empty())
+      return createStringError(u.id + ": implemented parity for " +
+                               p.capability + " requires bound components");
+    c.parity[node].push_back(Located<ParityDeclaration>{p, s});
   }
   return llvm::Error::success();
 }
@@ -827,6 +865,82 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
           return mlir::failure();
         return printer.verify(m, *profile);
       };
+      (*status)["calibration_profile"] = profile->services.calibrationProfile;
+      (*status)["reuse"] = spelling(profile->reuse).str();
+      (*status)["numerical"] = profile->numerical.toJSON();
+
+      // Build parity records for all ancestor capabilities on this exit's path.
+      std::map<std::string, std::vector<Located<ParityDeclaration>>> byCap;
+      if (auto pit = c.parity.find(name); pit != c.parity.end()) {
+        for (const auto &entry : pit->second) {
+          auto cit = c.capabilities.find(entry.value.capability);
+          if (cit == c.capabilities.end() || !available(entry.value.capability))
+            return createStringError(
+                name + ": parity references unknown or unreachable capability " +
+                entry.value.capability);
+          for (const auto &b : entry.value.bindings) {
+            if (!c.catalog.getObject(b) || !available(b))
+              return createStringError(name + ": parity binding " + b +
+                                       " is unregistered or unreachable");
+          }
+          byCap[entry.value.capability].push_back(entry);
+        }
+      }
+      Array parityItems;
+      for (const auto &[capId, capLoc] : c.capabilities) {
+        if (!available(capId))
+          continue;
+        auto declIt = byCap.find(capId);
+        if (declIt == byCap.end()) {
+          parityItems.push_back(Object{
+              {"capability", capId},
+              {"category", capLoc.value.category},
+              {"summary", capLoc.value.summary},
+              {"architecture", "*"},
+              {"status", "todo"},
+              {"registered", false},
+              {"selected", false},
+              {"auto_generated", true},
+              {"bindings", Array{}},
+              {"reason", ""},
+          });
+          continue;
+        }
+        for (const auto &d : declIt->second) {
+          bool isImpl = d.value.status == ParityStatus::Implemented;
+          bool anySelected = false;
+          for (const auto &b : d.value.bindings) {
+            if (chosen.count(b)) {
+              anySelected = true;
+              break;
+            }
+            if (auto iit = profile->implementations.find(b);
+                iit != profile->implementations.end()) {
+              auto chk = profile->checkImplementation(b);
+              if (!chk)
+                anySelected = true;
+              else
+                llvm::consumeError(std::move(chk));
+            }
+          }
+          parityItems.push_back(Object{
+              {"capability", capId},
+              {"category", capLoc.value.category},
+              {"summary", capLoc.value.summary},
+              {"architecture", d.value.architecture},
+              {"status", spelling(d.value.status).str()},
+              {"registered", isImpl},
+              {"selected", isImpl && anySelected},
+              {"auto_generated", false},
+              {"bindings", Array(d.value.bindings)},
+              {"reason", d.value.reason},
+              {"file", d.source.file},
+              {"line", d.source.line},
+          });
+        }
+      }
+      (*status)["parity"] = std::move(parityItems);
+
       selected[name] = Array(chosen);
       return t;
     };
