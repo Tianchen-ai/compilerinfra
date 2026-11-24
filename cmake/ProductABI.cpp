@@ -219,11 +219,17 @@ static const char *compile(const ci_compiler *c, const char *exit,
   };
   auto finish = [&](const char *failure) {
     if (events) {
-      if (trace)
+      if (trace) {
+        std::string calProfile;
+        if (const auto *exitsObj = c->compiler.describe().getObject("exits"))
+          if (const auto *exObj = exitsObj->getObject(exit))
+            if (auto cp = exObj->getString("calibration_profile"))
+              calProfile = cp->str();
         *events = copy(serialize(Object{{"compilation_id", id},
                                         {"candidate", c->id},
                                         {"error", failure ? failure : ""},
                                         {"exit", exit},
+                                        {"calibration_profile", calProfile},
                                         {"root_sha256", root},
                                         {"input_sha256", inputHash}, {"artifact_sha256", artifactHash},
                                         {"after", after ? after : ""},
@@ -234,7 +240,7 @@ static const char *compile(const ci_compiler *c, const char *exit,
                                         {"product_default", defaultPolicy()}, {"configuration", configuration()},
                                         {"fingerprint", *c->manifest->get("fingerprint")},
                                         {"events", std::move(log)}}));
-      else if (!failure)
+      } else if (!failure)
         *events = copy(serialize(std::move(log)));
     }
     return failure;

@@ -35,10 +35,17 @@ def _top_k(values, k):
 
 def timed_receipt(invocation_id, selection, samples_ms, execution=None):
     """Seal the timer's samples together with the bound launch it just measured."""
-    record = dict(invocation_id=invocation_id, runtime_identity=selection["runtime_identity"],
-                  artifact_sha256=selection["artifact_sha256"], samples_ms=list(samples_ms))
+    samples = list(samples_ms)
+    exec_meta = {"sample_count": len(samples)}
     if execution is not None:
-        record["execution"] = dict(execution)
+        exec_meta.update(dict(execution))
+    record = dict(
+        invocation_id=invocation_id,
+        runtime_identity=selection["runtime_identity"],
+        artifact_sha256=selection["artifact_sha256"],
+        samples_ms=samples,
+        execution=exec_meta,
+    )
     record["digest"] = _receipt_digest(record)
     return record
 
@@ -93,6 +100,8 @@ def check_protocol(protocol, receipt):
     for key, expected in active.items():
         if key in exec_info:
             actual = exec_info[key]
+        elif key == "sample_count" and isinstance(receipt.get("samples_ms"), list):
+            actual = len(receipt["samples_ms"])
         elif key in ident:
             actual = ident[key]
         elif key in receipt:
@@ -108,8 +117,38 @@ def check_protocol(protocol, receipt):
     }
 
 
-def measurement_rows(batch, split, family, receipts):
+_PER_CANDIDATE_IDENTITY_KEYS = frozenset({
+    "compilation_id",
+    "compiler_candidate",
+    "package_sha256",
+    "structures",
+    "row_id",
+    "row_selection",
+})
+
+
+def _infer_batch_protocol(receipts):
+    if not receipts:
+        return {}
+    first = receipts[0]
+    proto = {}
+    if isinstance(first.get("execution"), dict):
+        for k, v in first["execution"].items():
+            if v is not None:
+                proto[k] = v
+    if "sample_count" not in proto and isinstance(first.get("samples_ms"), list) and first["samples_ms"]:
+        proto["sample_count"] = len(first["samples_ms"])
+    ident = first.get("runtime_identity")
+    if isinstance(ident, dict):
+        for k, v in ident.items():
+            if k not in _PER_CANDIDATE_IDENTITY_KEYS and v is not None:
+                proto.setdefault(k, v)
+    return proto
+
+
+def measurement_rows(batch, split, family, receipts, protocol=None):
     """Select the actual automatic run and the forced runs of all other rows."""
+    effective_protocol = dict(protocol) if protocol is not None else _infer_batch_protocol(receipts)
     grouped = defaultdict(list)
     for rec in receipts:
         grouped[rec["runtime_identity"]["structures"][family]].append(rec)
@@ -123,9 +162,17 @@ def measurement_rows(batch, split, family, receipts):
             identity = rec["runtime_identity"]
             if identity["row_selection"] == "forced" and identity["row_id"] == winner:
                 continue
-            rows.append(dict(batch=batch, split=split, candidate=structure,
-                compilation_id=identity["compilation_id"], compiler_candidate=identity["compiler_candidate"],
-                row_id=identity["row_id"], artifact_sha256=rec["artifact_sha256"], measurement_receipt=rec))
+            rows.append(dict(
+                batch=batch,
+                split=split,
+                candidate=structure,
+                compilation_id=identity["compilation_id"],
+                compiler_candidate=identity["compiler_candidate"],
+                row_id=identity["row_id"],
+                artifact_sha256=rec["artifact_sha256"],
+                protocol=dict(effective_protocol),
+                measurement_receipt=rec,
+            ))
     return rows
 
 

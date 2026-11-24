@@ -84,28 +84,49 @@ bool isAddressScalarOrShapedInt(Type ty) {
   return llvm::isa<IntegerType, IndexType>(leafScalarType(ty));
 }
 
-bool rangeFitsTarget(const ConstantIntRanges &r,
-                     const AddressProofOptions &opts, uint64_t scale) {
+bool fitsSignedWidth(const ConstantIntRanges &r, unsigned bits,
+                     bool requireNonNegative = false, uint64_t scale = 1) {
   unsigned w = r.smin().getBitWidth();
-  if (w == 0 || opts.targetBitwidth == 0 || opts.targetBitwidth > 64)
+  if (w == 0 || bits == 0 || bits > 64)
     return false;
-  unsigned calcW = std::max(w, opts.targetBitwidth) + 65;
+  unsigned calcW = std::max(w, bits) + 65;
   APInt scaleAP(calcW, scale == 0 ? 1 : scale, /*isSigned=*/false);
+  APInt lo = r.smin().sext(calcW) * scaleAP;
+  APInt hi = r.smax().sext(calcW) * scaleAP;
+  if (requireNonNegative && lo.isNegative())
+    return false;
+  APInt minT = APInt::getSignedMinValue(bits).sext(calcW);
+  APInt maxT = APInt::getSignedMaxValue(bits).sext(calcW);
+  return lo.sge(minT) && hi.sle(maxT);
+}
 
-  if (opts.isSigned) {
-    APInt lo = r.smin().sext(calcW) * scaleAP;
-    APInt hi = r.smax().sext(calcW) * scaleAP;
-    APInt minT = APInt::getSignedMinValue(opts.targetBitwidth).sext(calcW);
-    APInt maxT = APInt::getSignedMaxValue(opts.targetBitwidth).sext(calcW);
-    if (opts.requireNonNegative && lo.isNegative())
-      return false;
-    return lo.sge(minT) && hi.sle(maxT);
-  }
+// Unsigned non-wrapping fit: must be non-negative in signed view AND within
+// unsigned (or signed-positive when `mustAlsoFitSignedPositive` is true) upper
+// bound so high bits above `bits` are provably zero before narrowing.
+bool fitsUnsignedWidth(const ConstantIntRanges &r, unsigned bits,
+                       bool mustAlsoFitSignedPositive = false,
+                       uint64_t scale = 1) {
+  unsigned w = r.umax().getBitWidth();
+  if (w == 0 || bits == 0 || bits > 64)
+    return false;
   if (r.smin().isNegative())
     return false;
+  unsigned calcW = std::max(w, bits) + 65;
+  APInt scaleAP(calcW, scale == 0 ? 1 : scale, /*isSigned=*/false);
   APInt uhi = r.umax().zext(calcW) * scaleAP;
-  APInt maxU = APInt::getMaxValue(opts.targetBitwidth).zext(calcW);
-  return uhi.ule(maxU);
+  APInt maxBound = mustAlsoFitSignedPositive
+                       ? APInt::getSignedMaxValue(bits).zext(calcW)
+                       : APInt::getMaxValue(bits).zext(calcW);
+  return uhi.ule(maxBound);
+}
+
+bool rangeFitsOptions(const ConstantIntRanges &r,
+                      const AddressProofOptions &opts, uint64_t scale) {
+  if (opts.isSigned)
+    return fitsSignedWidth(r, opts.targetBitwidth, opts.requireNonNegative,
+                           scale);
+  return fitsUnsignedWidth(r, opts.targetBitwidth,
+                           /*mustAlsoFitSignedPositive=*/false, scale);
 }
 
 bool isCastOrTruncOp(Operation *op) {
@@ -146,8 +167,8 @@ AddressProof compilerinfra::proveNarrowAddress(
       if (!v || !isAddressScalarOrShapedInt(v.getType())) {
         out.culpritValue = v;
         out.culpritOp = v ? v.getDefiningOp() : nullptr;
-        out.reason =
-            "explicit address value is null or not an integer/index scalar or vector";
+        out.reason = "explicit address value is null or not an integer/index "
+                     "scalar or vector";
         return out;
       }
       Operation *parent =
@@ -161,8 +182,6 @@ AddressProof compilerinfra::proveNarrowAddress(
         roots.push_back(v);
     }
   } else {
-    // Default scan across ALL nested regions and blocks under scopeRoot:
-    // collect scalar or vector/tensor integer/index operands of memory/cast ops.
     scopeRoot->walk([&](Operation *op) {
       bool memOrCast =
           isCastOrTruncOp(op) || llvm::isa<MemoryEffectOpInterface>(op);
@@ -170,12 +189,12 @@ AddressProof compilerinfra::proveNarrowAddress(
         return;
       for (Value v : op->getOperands())
         if (isAddressScalarOrShapedInt(v.getType()) &&
+            !leafScalarType(v.getType()).isInteger(1) &&
             rootSet.insert(v).second)
           roots.push_back(v);
     });
   }
 
-  // Conservative rule: empty root set means nothing was identified to prove.
   if (roots.empty()) {
     out.reason = "no address roots found to prove";
     return out;
@@ -183,6 +202,13 @@ AddressProof compilerinfra::proveNarrowAddress(
 
   llvm::SmallVector<Value, 64> worklist(roots.begin(), roots.end());
   llvm::DenseSet<Value> visited(roots.begin(), roots.end());
+  auto enqueue = [&](Value v) {
+    if (v && isAddressScalarOrShapedInt(v.getType()) &&
+        !leafScalarType(v.getType()).isInteger(1) && visited.insert(v).second)
+      worklist.push_back(v);
+  };
+
+  const unsigned T = options.targetBitwidth;
 
   while (!worklist.empty()) {
     Value cur = worklist.pop_back_val();
@@ -194,10 +220,73 @@ AddressProof compilerinfra::proveNarrowAddress(
       out.reason = "uninitialized or unknown integer range";
       return out;
     }
-    if (!rangeFitsTarget(*rng, options, scale)) {
+    if (!rangeFitsOptions(*rng, options, scale)) {
       out.culpritValue = cur;
       out.culpritOp = cur.getDefiningOp();
       out.reason = "value range exceeds target narrow bitwidth";
+      return out;
+    }
+
+    // Whitelist BlockArguments inside scopeRoot.
+    if (auto barg = llvm::dyn_cast<BlockArgument>(cur)) {
+      Region *parentReg = barg.getOwner()->getParent();
+      Operation *parentOp = parentReg ? parentReg->getParentOp() : nullptr;
+      if (!parentOp || !scopeRoot->isAncestor(parentOp)) {
+        // Entry argument of scopeRoot or outer dominating parameter: range
+        // already verified above.
+        if (parentOp == scopeRoot && !barg.getOwner()->isEntryBlock()) {
+          out.culpritValue = cur;
+          out.reason = "non-entry CFG block argument is not whitelisted";
+          return out;
+        }
+        continue;
+      }
+      if (auto loop = llvm::dyn_cast<LoopLikeOpInterface>(parentOp)) {
+        if (!barg.getOwner()->isEntryBlock() || !parentReg->hasOneBlock()) {
+          out.culpritValue = cur;
+          out.culpritOp = parentOp;
+          out.reason = "multi-block loop block argument is not whitelisted";
+          return out;
+        }
+        bool matched = false;
+        if (auto ivs = loop.getLoopInductionVars()) {
+          auto lbs = loop.getLoopLowerBounds();
+          auto ubs = loop.getLoopUpperBounds();
+          auto steps = loop.getLoopSteps();
+          if (lbs && ubs && steps && ivs->size() == lbs->size() &&
+              ivs->size() == ubs->size() && ivs->size() == steps->size()) {
+            for (size_t i = 0; i < ivs->size(); ++i) {
+              if ((*ivs)[i] != barg)
+                continue;
+              matched = true;
+              if (Value lbV = (*lbs)[i].dyn_cast<Value>())
+                enqueue(lbV);
+              if (Value ubV = (*ubs)[i].dyn_cast<Value>())
+                enqueue(ubV);
+              if (Value stV = (*steps)[i].dyn_cast<Value>())
+                enqueue(stV);
+            }
+          }
+        }
+        if (!matched) {
+          auto iterArgs = loop.getRegionIterArgs();
+          auto yielded = loop.getYieldedValuesMutable();
+          for (auto [idx, ia] : llvm::enumerate(iterArgs)) {
+            if (ia != barg)
+              continue;
+            matched = true;
+            if (idx < loop.getInits().size())
+              enqueue(loop.getInits()[idx]);
+            if (yielded && idx < yielded->size())
+              enqueue((*yielded)[idx].get());
+          }
+        }
+        if (matched)
+          continue;
+      }
+      out.culpritValue = cur;
+      out.culpritOp = parentOp;
+      out.reason = "unsupported BlockArgument in narrow-address whitelist";
       return out;
     }
 
@@ -205,129 +294,333 @@ AddressProof compilerinfra::proveNarrowAddress(
     if (!def || !scopeRoot->isAncestor(def))
       continue;
 
-    if (isCastOrTruncOp(def)) {
+    // Strict op whitelist: only operations whose signed/unsigned semantics at
+    // narrowed width T are completely modeled are admitted.
+    if (llvm::isa<arith::ConstantOp>(def)) {
+      continue;
+    }
+
+    if (llvm::isa<arith::SelectOp>(def)) {
+      auto sel = llvm::cast<arith::SelectOp>(def);
+      auto tR = existingRanges->query(sel.getTrueValue());
+      auto fR = existingRanges->query(sel.getFalseValue());
+      if (!tR || !fR || !rangeFitsOptions(*tR, options, 1) ||
+          !rangeFitsOptions(*fR, options, 1)) {
+        out.culpritOp = def;
+        out.culpritValue = cur;
+        out.reason = "select branch exceeds target narrow bitwidth";
+        return out;
+      }
+      enqueue(sel.getTrueValue());
+      enqueue(sel.getFalseValue());
+      continue;
+    }
+
+    // Signed/truncating casts: ExtSI, IndexCast, TruncI.
+    if (llvm::isa<arith::ExtSIOp, arith::IndexCastOp, arith::TruncIOp>(def)) {
       Value src = def->getOperand(0);
       auto srcRng = existingRanges->query(src);
       unsigned dstW =
           ConstantIntRanges::getStorageBitwidth(leafScalarType(cur.getType()));
-      AddressProofOptions castCheck = options;
-      castCheck.targetBitwidth = std::min(options.targetBitwidth, dstW);
-      castCheck.requireNonNegative =
-          llvm::isa<arith::IndexCastUIOp>(def) || options.requireNonNegative;
-      if (!srcRng || !rangeFitsTarget(*srcRng, castCheck, 1)) {
+      unsigned effW = std::min(T, dstW);
+      bool ok = srcRng && (options.isSigned
+                               ? fitsSignedWidth(*srcRng, effW,
+                                                 options.requireNonNegative, 1)
+                               : fitsUnsignedWidth(*srcRng, effW, false, 1));
+      if (!ok) {
         out.culpritOp = def;
         out.culpritValue = src;
-        out.reason = "index_cast/trunci operand may wrap around narrow width";
+        out.reason =
+            "signed cast/trunci operand exceeds or wraps around narrow width";
         return out;
       }
+      unsigned srcW =
+          ConstantIntRanges::getStorageBitwidth(leafScalarType(src.getType()));
+      if (llvm::isa<IndexType>(leafScalarType(src.getType())) || srcW >= T ||
+          llvm::isa<arith::TruncIOp>(def))
+        enqueue(src);
+      continue;
     }
 
-    if (llvm::isa<arith::ShRSIOp, arith::ShRUIOp>(def)) {
-      auto lhsR = existingRanges->query(def->getOperand(0));
-      auto rhsR = existingRanges->query(def->getOperand(1));
+    // Unsigned casts: ExtUI, IndexCastUI.
+    if (llvm::isa<arith::ExtUIOp, arith::IndexCastUIOp>(def)) {
+      Value src = def->getOperand(0);
+      auto srcRng = existingRanges->query(src);
+      unsigned dstW =
+          ConstantIntRanges::getStorageBitwidth(leafScalarType(cur.getType()));
+      unsigned effW = std::min(T, dstW);
+      if (!srcRng ||
+          !fitsUnsignedWidth(*srcRng, effW,
+                             /*mustAlsoFitSignedPositive=*/options.isSigned,
+                             1)) {
+        out.culpritOp = def;
+        out.culpritValue = src;
+        out.reason =
+            "unsigned cast operand may be negative or exceed narrow width";
+        return out;
+      }
+      unsigned srcW =
+          ConstantIntRanges::getStorageBitwidth(leafScalarType(src.getType()));
+      if (llvm::isa<IndexType>(leafScalarType(src.getType())) || srcW >= T)
+        enqueue(src);
+      continue;
+    }
+
+    // Add / Sub / Mul (modeled separately for signed vs unsigned targets).
+    if (llvm::isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def)) {
+      Value lhs = def->getOperand(0), rhs = def->getOperand(1);
+      auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
+      if (!lhsR || !rhsR || !rangeFitsOptions(*lhsR, options, 1) ||
+          !rangeFitsOptions(*rhsR, options, 1)) {
+        out.culpritOp = def;
+        out.culpritValue = cur;
+        out.reason = "arithmetic operand exceeds target narrow bitwidth";
+        return out;
+      }
+      unsigned w = lhsR->smin().getBitWidth();
+      unsigned extW = std::max(w, T) + 66;
+      if (options.isSigned) {
+        APInt lMin = lhsR->smin().sext(extW), lMax = lhsR->smax().sext(extW);
+        APInt rMin = rhsR->smin().sext(extW), rMax = rhsR->smax().sext(extW);
+        APInt wMin(extW, 0), wMax(extW, 0);
+        if (llvm::isa<arith::AddIOp>(def)) {
+          wMin = lMin + rMin;
+          wMax = lMax + rMax;
+        } else if (llvm::isa<arith::SubIOp>(def)) {
+          wMin = lMin - rMax;
+          wMax = lMax - rMin;
+        } else {
+          APInt p1 = lMin * rMin, p2 = lMin * rMax, p3 = lMax * rMin,
+                p4 = lMax * rMax;
+          wMin = llvm::APIntOps::smin(llvm::APIntOps::smin(p1, p2),
+                                      llvm::APIntOps::smin(p3, p4));
+          wMax = llvm::APIntOps::smax(llvm::APIntOps::smax(p1, p2),
+                                      llvm::APIntOps::smax(p3, p4));
+        }
+        APInt minT = APInt::getSignedMinValue(T).sext(extW);
+        APInt maxT = APInt::getSignedMaxValue(T).sext(extW);
+        if (wMin.slt(minT) || wMax.sgt(maxT) ||
+            (options.requireNonNegative && wMin.isNegative())) {
+          out.culpritOp = def;
+          out.culpritValue = cur;
+          out.reason = "signed intermediate arithmetic overflows narrow width";
+          return out;
+        }
+      } else {
+        APInt lMin = lhsR->umin().zext(extW), lMax = lhsR->umax().zext(extW);
+        APInt rMin = rhsR->umin().zext(extW), rMax = rhsR->umax().zext(extW);
+        APInt wMax(extW, 0);
+        if (llvm::isa<arith::AddIOp>(def)) {
+          wMax = lMax + rMax;
+        } else if (llvm::isa<arith::SubIOp>(def)) {
+          if (lMin.ult(rMax)) {
+            out.culpritOp = def;
+            out.culpritValue = cur;
+            out.reason = "unsigned subtraction may underflow in narrow width";
+            return out;
+          }
+          wMax = lMax - rMin;
+        } else {
+          wMax = lMax * rMax;
+        }
+        if (wMax.ugt(APInt::getMaxValue(T).zext(extW))) {
+          out.culpritOp = def;
+          out.culpritValue = cur;
+          out.reason =
+              "unsigned intermediate arithmetic overflows narrow width";
+          return out;
+        }
+      }
+      enqueue(lhs);
+      enqueue(rhs);
+      continue;
+    }
+
+    // Signed division, remainder, min, max.
+    if (llvm::isa<arith::DivSIOp, arith::RemSIOp, arith::MinSIOp,
+                  arith::MaxSIOp>(def)) {
+      Value lhs = def->getOperand(0), rhs = def->getOperand(1);
+      auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
+      bool reqNonNeg = !options.isSigned || options.requireNonNegative;
+      if (!lhsR || !rhsR || !fitsSignedWidth(*lhsR, T, reqNonNeg, 1) ||
+          !fitsSignedWidth(*rhsR, T, !options.isSigned, 1)) {
+        out.culpritOp = def;
+        out.culpritValue = cur;
+        out.reason =
+            "signed div/rem/min/max operand exceeds signed narrow width";
+        return out;
+      }
+      if (llvm::isa<arith::DivSIOp, arith::RemSIOp>(def)) {
+        unsigned w = rhsR->smin().getBitWidth();
+        unsigned extW = std::max(w, T) + 2;
+        APInt rLo = rhsR->smin().sext(extW), rHi = rhsR->smax().sext(extW);
+        if (rLo.sle(0) && rHi.sge(0)) {
+          out.culpritOp = def;
+          out.culpritValue = rhs;
+          out.reason = "signed div/rem divisor may be zero";
+          return out;
+        }
+        APInt minT = APInt::getSignedMinValue(T).sext(extW);
+        APInt negOne = APInt::getAllOnes(extW);
+        if (lhsR->smin().sext(extW).sle(minT) && rLo.sle(negOne) &&
+            rHi.sge(negOne)) {
+          out.culpritOp = def;
+          out.culpritValue = cur;
+          out.reason = "signed div/rem may overflow INT_MIN / -1 at narrow T";
+          return out;
+        }
+      }
+      enqueue(lhs);
+      enqueue(rhs);
+      continue;
+    }
+
+    // Unsigned division, remainder, min, max (Audit v0.5.1 item 1: operands
+    // must fit UNSIGNED narrow width and be non-negative so high bits are 0!).
+    if (llvm::isa<arith::DivUIOp, arith::RemUIOp, arith::MinUIOp,
+                  arith::MaxUIOp>(def)) {
+      Value lhs = def->getOperand(0), rhs = def->getOperand(1);
+      auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
+      if (!lhsR || !rhsR || !fitsUnsignedWidth(*lhsR, T, options.isSigned, 1) ||
+          !fitsUnsignedWidth(*rhsR, T, options.isSigned, 1)) {
+        out.culpritOp = def;
+        out.culpritValue = cur;
+        out.reason =
+            "unsigned divui/remui/minui/maxui operand exceeds unsigned narrow "
+            "width (e.g. negative signed value)";
+        return out;
+      }
+      if (llvm::isa<arith::DivUIOp, arith::RemUIOp>(def) &&
+          rhsR->umin().isZero()) {
+        out.culpritOp = def;
+        out.culpritValue = rhs;
+        out.reason = "unsigned divui/remui divisor may be zero";
+        return out;
+      }
+      enqueue(lhs);
+      enqueue(rhs);
+      continue;
+    }
+
+    // Shifts: ShLI, ShRSI, ShRUI.
+    if (llvm::isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(def)) {
+      Value lhs = def->getOperand(0), rhs = def->getOperand(1);
+      auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
       if (!lhsR || !rhsR) {
         out.culpritOp = def;
         out.culpritValue = cur;
-        out.reason = "missing operand range on right shift";
+        out.reason = "missing operand range on shift";
         return out;
       }
-      if (rhsR->smin().isNegative() ||
-          rhsR->smax().uge(options.targetBitwidth) ||
-          rhsR->umax().uge(options.targetBitwidth)) {
+      if (rhsR->smin().isNegative() || rhsR->smax().uge(T) ||
+          rhsR->umax().uge(T)) {
         out.culpritOp = def;
-        out.culpritValue = def->getOperand(1);
-        out.reason = "right-shift amount may be negative or >= narrow bitwidth";
+        out.culpritValue = rhs;
+        out.reason = "shift amount may be negative or >= narrow bitwidth";
         return out;
       }
       if (llvm::isa<arith::ShRUIOp>(def)) {
-        AddressProofOptions uOpts = options;
-        uOpts.isSigned = false;
-        uOpts.requireNonNegative = true;
-        if (!rangeFitsTarget(*lhsR, uOpts, 1)) {
+        if (!fitsUnsignedWidth(*lhsR, T, options.isSigned, 1)) {
           out.culpritOp = def;
-          out.culpritValue = def->getOperand(0);
+          out.culpritValue = lhs;
           out.reason =
               "unsigned right-shift input exceeds unsigned narrow bitwidth";
           return out;
         }
-      } else {
-        AddressProofOptions sOpts = options;
-        sOpts.isSigned = true;
-        if (!rangeFitsTarget(*lhsR, sOpts, 1)) {
+      } else if (llvm::isa<arith::ShRSIOp>(def)) {
+        if (!fitsSignedWidth(*lhsR, T, !options.isSigned, 1)) {
           out.culpritOp = def;
-          out.culpritValue = def->getOperand(0);
+          out.culpritValue = lhs;
           out.reason =
               "signed right-shift input exceeds signed narrow bitwidth";
           return out;
         }
-      }
-    }
-
-    if (llvm::isa<arith::AddIOp, arith::SubIOp, arith::MulIOp, arith::ShLIOp>(
-            def)) {
-      auto lhsR = existingRanges->query(def->getOperand(0));
-      auto rhsR = existingRanges->query(def->getOperand(1));
-      if (!lhsR || !rhsR) {
-        out.culpritOp = def;
-        out.culpritValue = cur;
-        out.reason = "missing operand range on address arithmetic";
-        return out;
-      }
-      unsigned w = lhsR->smin().getBitWidth();
-      unsigned extW = std::max(w, options.targetBitwidth) + 66;
-      APInt lMin = lhsR->smin().sext(extW), lMax = lhsR->smax().sext(extW);
-      APInt rMin = rhsR->smin().sext(extW), rMax = rhsR->smax().sext(extW);
-      APInt wideMin(extW, 0), wideMax(extW, 0);
-      if (llvm::isa<arith::AddIOp>(def)) {
-        wideMin = lMin + rMin;
-        wideMax = lMax + rMax;
-      } else if (llvm::isa<arith::SubIOp>(def)) {
-        wideMin = lMin - rMax;
-        wideMax = lMax - rMin;
-      } else if (llvm::isa<arith::MulIOp>(def)) {
-        APInt p1 = lMin * rMin, p2 = lMin * rMax, p3 = lMax * rMin,
-              p4 = lMax * rMax;
-        wideMin = llvm::APIntOps::smin(llvm::APIntOps::smin(p1, p2),
-                                       llvm::APIntOps::smin(p3, p4));
-        wideMax = llvm::APIntOps::smax(llvm::APIntOps::smax(p1, p2),
-                                       llvm::APIntOps::smax(p3, p4));
       } else {
-        if (rMin.isNegative() || rMax.uge(options.targetBitwidth) ||
-            rhsR->umax().uge(options.targetBitwidth)) {
-          out.culpritOp = def;
-          out.culpritValue = cur;
-          out.reason = "shift amount may overflow narrow width";
-          return out;
+        unsigned w = lhsR->smin().getBitWidth();
+        unsigned extW = std::max(w, T) + 66;
+        unsigned shMin = static_cast<unsigned>(rhsR->umin().getZExtValue());
+        unsigned shMax = static_cast<unsigned>(rhsR->umax().getZExtValue());
+        if (options.isSigned) {
+          if (!fitsSignedWidth(*lhsR, T, options.requireNonNegative, 1)) {
+            out.culpritOp = def;
+            out.culpritValue = lhs;
+            out.reason = "shli input exceeds signed narrow bitwidth";
+            return out;
+          }
+          APInt lMin = lhsR->smin().sext(extW), lMax = lhsR->smax().sext(extW);
+          APInt p1 = lMin.shl(shMin), p2 = lMin.shl(shMax),
+                p3 = lMax.shl(shMin), p4 = lMax.shl(shMax);
+          APInt wMin = llvm::APIntOps::smin(llvm::APIntOps::smin(p1, p2),
+                                            llvm::APIntOps::smin(p3, p4));
+          APInt wMax = llvm::APIntOps::smax(llvm::APIntOps::smax(p1, p2),
+                                            llvm::APIntOps::smax(p3, p4));
+          if (wMin.slt(APInt::getSignedMinValue(T).sext(extW)) ||
+              wMax.sgt(APInt::getSignedMaxValue(T).sext(extW)) ||
+              (options.requireNonNegative && wMin.isNegative())) {
+            out.culpritOp = def;
+            out.culpritValue = cur;
+            out.reason = "shli result overflows signed narrow bitwidth";
+            return out;
+          }
+        } else {
+          if (!fitsUnsignedWidth(*lhsR, T, false, 1)) {
+            out.culpritOp = def;
+            out.culpritValue = lhs;
+            out.reason = "shli input exceeds unsigned narrow bitwidth";
+            return out;
+          }
+          APInt uMax = lhsR->umax().zext(extW).shl(shMax);
+          if (uMax.ugt(APInt::getMaxValue(T).zext(extW))) {
+            out.culpritOp = def;
+            out.culpritValue = cur;
+            out.reason = "shli result overflows unsigned narrow bitwidth";
+            return out;
+          }
         }
-        unsigned shMin = static_cast<unsigned>(rMin.getZExtValue());
-        unsigned shMax = static_cast<unsigned>(rMax.getZExtValue());
-        APInt p1 = lMin.shl(shMin), p2 = lMin.shl(shMax),
-              p3 = lMax.shl(shMin), p4 = lMax.shl(shMax);
-        wideMin = llvm::APIntOps::smin(llvm::APIntOps::smin(p1, p2),
-                                       llvm::APIntOps::smin(p3, p4));
-        wideMax = llvm::APIntOps::smax(llvm::APIntOps::smax(p1, p2),
-                                       llvm::APIntOps::smax(p3, p4));
       }
-      APInt minT =
-          options.isSigned
-              ? APInt::getSignedMinValue(options.targetBitwidth).sext(extW)
-              : APInt(extW, 0);
-      APInt maxT =
-          options.isSigned
-              ? APInt::getSignedMaxValue(options.targetBitwidth).sext(extW)
-              : APInt::getMaxValue(options.targetBitwidth).zext(extW);
-      if (wideMin.slt(minT) || wideMax.sgt(maxT)) {
-        out.culpritOp = def;
-        out.culpritValue = cur;
-        out.reason = "intermediate arithmetic overflows narrow bitwidth";
-        return out;
-      }
+      enqueue(lhs);
+      enqueue(rhs);
+      continue;
     }
 
-    for (Value operand : def->getOperands())
-      if (isAddressScalarOrShapedInt(operand.getType()) &&
-          visited.insert(operand).second)
-        worklist.push_back(operand);
+    // Bitwise: AndI, OrI, XOrI.
+    if (llvm::isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(def)) {
+      Value lhs = def->getOperand(0), rhs = def->getOperand(1);
+      auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
+      if (!lhsR || !rhsR || !rangeFitsOptions(*lhsR, options, 1) ||
+          !rangeFitsOptions(*rhsR, options, 1)) {
+        out.culpritOp = def;
+        out.culpritValue = cur;
+        out.reason = "bitwise operand exceeds target narrow bitwidth";
+        return out;
+      }
+      enqueue(lhs);
+      enqueue(rhs);
+      continue;
+    }
+
+    // Read-free InferIntRangeInterface metadata/symbol ops with zero dynamic
+    // integer operands (e.g. symbol constants or static/memref dim queries).
+    if (llvm::isa<InferIntRangeInterface>(def)) {
+      bool hasNonConstIntOperand = false;
+      for (Value opnd : def->getOperands()) {
+        if (isAddressScalarOrShapedInt(opnd.getType())) {
+          if (!opnd.getDefiningOp<arith::ConstantOp>())
+            hasNonConstIntOperand = true;
+          else
+            enqueue(opnd);
+        }
+      }
+      if (!hasNonConstIntOperand)
+        continue;
+    }
+
+    // Default conservative rejection: any unmodeled operation is unproven.
+    out.culpritOp = def;
+    out.culpritValue = cur;
+    out.reason = "operation not in narrow-address whitelist: " +
+                 def->getName().getStringRef().str();
+    return out;
   }
 
   out.proven = true;
@@ -382,8 +675,9 @@ bool collectOpReadEffects(Operation *root,
   return ok;
 }
 
-// Collect transitive backward SSA slice of `firstOp` (within `scopeOp`) so
-// loads feeding pure arithmetic ops are always included in the read set.
+// Strict whitelist transitive read collection: non-entry CFG block arguments
+// (which may carry values loaded in predecessor blocks) are rejected as
+// unproven instead of being assumed immutable.
 bool collectTransitiveReads(Operation *firstOp, Operation *scopeOp,
                             llvm::SmallVectorImpl<Value> &locations,
                             llvm::SmallVectorImpl<Operation *> &readOps,
@@ -399,33 +693,77 @@ bool collectTransitiveReads(Operation *firstOp, Operation *scopeOp,
         visitedOps.insert(op).second)
       opWorklist.push_back(op);
   };
-  auto enqueueVal = [&](Value v) {
+
+  std::function<bool(Value)> enqueueVal = [&](Value v) -> bool {
     if (!v || !visitedVals.insert(v).second)
       return true;
     if (Operation *def = v.getDefiningOp()) {
+      if (!scopeOp->isAncestor(def) && def != scopeOp) {
+        err = "value defined outside isolated scopeRoot";
+        return false;
+      }
       enqueueOp(def);
       return true;
     }
     auto barg = llvm::cast<BlockArgument>(v);
-    Region *parentReg = barg.getOwner()->getParent();
+    Block *ownerBlk = barg.getOwner();
+    Region *parentReg = ownerBlk ? ownerBlk->getParent() : nullptr;
     Operation *parentOp = parentReg ? parentReg->getParentOp() : nullptr;
-    if (!parentOp || parentOp == scopeOp || !scopeOp->isAncestor(parentOp))
-      return true; // Outer function/entry region parameter is immutable SSA.
-    if (auto loop = llvm::dyn_cast<LoopLikeOpInterface>(parentOp)) {
-      auto iterArgs = loop.getRegionIterArgs();
-      for (auto [idx, iterArg] : llvm::enumerate(iterArgs)) {
-        if (iterArg == barg) {
-          if (idx < loop.getInits().size())
-            enqueueOp(loop.getInits()[idx].getDefiningOp());
-          if (auto yieldedVals = loop.getYieldedValuesMutable())
-            for (OpOperand &yielded : *yieldedVals)
-              enqueueOp(yielded.get().getDefiningOp());
-          return true;
+
+    // Whitelist 1: Entry block parameter of the isolated enclosing function/op
+    // (has zero predecessors). Non-entry CFG block arguments are REJECTED!
+    if (parentOp == scopeOp) {
+      if (ownerBlk->isEntryBlock() &&
+          scopeOp->hasTrait<OpTrait::IsIsolatedFromAbove>())
+        return true;
+      err = "non-entry CFG block argument may carry predecessor memory loads";
+      return false;
+    }
+
+    // Whitelist 2: Single-block LoopLikeOpInterface induction / iter_args,
+    // tracing all incoming init/bound/step/yielded values recursively.
+    if (auto loop = llvm::dyn_cast_or_null<LoopLikeOpInterface>(parentOp)) {
+      if (scopeOp->isAncestor(parentOp) && ownerBlk->isEntryBlock() &&
+          parentReg->hasOneBlock()) {
+        auto iterArgs = loop.getRegionIterArgs();
+        auto yieldedVals = loop.getYieldedValuesMutable();
+        for (auto [idx, iterArg] : llvm::enumerate(iterArgs)) {
+          if (iterArg == barg) {
+            if (idx >= loop.getInits().size() || !yieldedVals ||
+                idx >= yieldedVals->size()) {
+              err = "incomplete loop iter_arg init/yield values";
+              return false;
+            }
+            return enqueueVal(loop.getInits()[idx]) &&
+                   enqueueVal((*yieldedVals)[idx].get());
+          }
+        }
+        if (auto ivs = loop.getLoopInductionVars()) {
+          auto lbs = loop.getLoopLowerBounds();
+          auto ubs = loop.getLoopUpperBounds();
+          auto steps = loop.getLoopSteps();
+          if (lbs && ubs && steps && ivs->size() == lbs->size() &&
+              ivs->size() == ubs->size() && ivs->size() == steps->size()) {
+            for (size_t i = 0; i < ivs->size(); ++i) {
+              if ((*ivs)[i] != barg)
+                continue;
+              if (Value lbV = (*lbs)[i].dyn_cast<Value>())
+                if (!enqueueVal(lbV))
+                  return false;
+              if (Value ubV = (*ubs)[i].dyn_cast<Value>())
+                if (!enqueueVal(ubV))
+                  return false;
+              if (Value stV = (*steps)[i].dyn_cast<Value>())
+                if (!enqueueVal(stV))
+                  return false;
+              return true;
+            }
+          }
         }
       }
-      return true;
     }
-    err = "cannot trace memory provenance through unstructured block argument";
+
+    err = "cannot trace memory provenance through non-whitelisted BlockArgument";
     return false;
   };
 
@@ -438,12 +776,17 @@ bool collectTransitiveReads(Operation *firstOp, Operation *scopeOp,
     for (Value operand : cur->getOperands())
       if (!enqueueVal(operand))
         return false;
+    bool nestedOk = true;
     cur->walk([&](Operation *nested) {
-      for (Value operand : nested->getOperands())
-        if (!visitedVals.contains(operand))
-          (void)enqueueVal(operand);
+      for (Value operand : nested->getOperands()) {
+        if (!enqueueVal(operand)) {
+          nestedOk = false;
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
     });
-    if (!err.empty())
+    if (!nestedOk || !err.empty())
       return false;
   }
   return true;
@@ -542,9 +885,6 @@ bool checkPathBetween(Operation *startOp, Operation *replayOp,
     return false;
   }
 
-  // If `startOp` is conditionally nested inside `startTop` and `commonRegion`
-  // itself lies inside an outer loop, another iteration could skip `startOp`
-  // or execute sibling branches / trailing ops in that outer loop.
   if (startOp != startTop) {
     for (Operation *enc = commonRegion->getParentOp(); enc != nullptr;
          enc = enc->getParentOp()) {
@@ -556,10 +896,6 @@ bool checkPathBetween(Operation *startOp, Operation *replayOp,
     }
   }
 
-  // 1. Climb from `startOp` up to `startTop`. If any enclosing ancestor is a
-  // loop (or multi-region non-if), check the ENTIRE loop operation so writes in
-  // sibling conditional branches (`else` when `startOp` is in `then`) on
-  // subsequent iterations are always scanned.
   for (Operation *cur = startOp; cur != startTop; cur = cur->getParentOp()) {
     Operation *parent = cur->getParentOp();
     if (llvm::isa<LoopLikeOpInterface>(parent) ||
@@ -574,17 +910,12 @@ bool checkPathBetween(Operation *startOp, Operation *replayOp,
         return false;
   }
 
-  // 2. Check all operations strictly between `startTop` and `replayTop`.
   for (Operation *mid = startTop->getNextNode(); mid != replayTop;
        mid = mid->getNextNode()) {
     if (!checkInterferenceOnOp(mid, locations, hasGlobalRead, aa, out))
       return false;
   }
 
-  // 3. Climb from `replayOp` up to `replayTop`. If any enclosing ancestor is a
-  // loop, check the ENTIRE loop operation so writes in sibling conditional
-  // branches (`else` on iteration 0 before `replayOp` in `then` on iteration 1)
-  // and loop backedges are all scanned.
   for (Operation *cur = replayOp; cur != replayTop; cur = cur->getParentOp()) {
     Operation *parent = cur->getParentOp();
     if (llvm::isa<LoopLikeOpInterface>(parent) ||
@@ -707,7 +1038,8 @@ bool opCannotWrapSigned(Operation *op, const IntegerRangeContext *ranges) {
   auto rhsR = ranges->query(op->getOperand(1));
   if (!lhsR || !rhsR)
     return false;
-  unsigned bw = ConstantIntRanges::getStorageBitwidth(op->getResult(0).getType());
+  unsigned bw =
+      ConstantIntRanges::getStorageBitwidth(op->getResult(0).getType());
   if (bw == 0 || bw > 64)
     return false;
   unsigned extW = bw + 66;
@@ -728,7 +1060,7 @@ bool opCannotWrapSigned(Operation *op, const IntegerRangeContext *ranges) {
     wMax = llvm::APIntOps::smax(llvm::APIntOps::smax(p1, p2),
                                 llvm::APIntOps::smax(p3, p4));
   } else if (llvm::isa<arith::ShLIOp>(op)) {
-    if (rMin.isNegative() || rMax.uge(bw))
+    if (rMin.isNegative() || rMax.uge(bw) || rhsR->umax().uge(bw))
       return false;
     unsigned s0 = static_cast<unsigned>(rMin.getZExtValue());
     unsigned s1 = static_cast<unsigned>(rMax.getZExtValue());
@@ -746,6 +1078,10 @@ bool opCannotWrapSigned(Operation *op, const IntegerRangeContext *ranges) {
   return wMin.sge(minT) && wMax.sle(maxT);
 }
 
+// Strict whitelist divisibility proof: models signed and unsigned casts
+// separately. Zero-extension (`extui` / `index_castui`) preserves divisibility
+// ONLY when the source value is proven non-negative (e.g. i8(-3) is divisible
+// by 3 as signed -3, whereas zero-extended 253 is NOT!).
 bool isProvenMultipleOf(Value v, int64_t align,
                         const IntegerRangeContext *ranges, unsigned depth = 0) {
   if (!v || align <= 0 || depth > 16)
@@ -754,7 +1090,13 @@ bool isProvenMultipleOf(Value v, int64_t align,
     return true;
   if (auto c = matchScalarConstInt(v))
     return (*c % align) == 0;
+  if (!ranges)
+    return false;
+
   if (auto barg = llvm::dyn_cast<BlockArgument>(v)) {
+    auto vr = ranges->query(v);
+    if (!vr || vr->smin().isNegative())
+      return false;
     Operation *parent =
         barg.getOwner()->getParent() ? barg.getOwner()->getParentOp() : nullptr;
     if (auto loop = llvm::dyn_cast_or_null<LoopLikeOpInterface>(parent)) {
@@ -770,14 +1112,21 @@ bool isProvenMultipleOf(Value v, int64_t align,
           auto lbAttr = (*lbs)[i].dyn_cast<Attribute>();
           auto stVal = (*steps)[i].dyn_cast<Value>();
           auto stAttr = (*steps)[i].dyn_cast<Attribute>();
-          bool lbOk = lbVal ? isProvenMultipleOf(lbVal, align, ranges, depth + 1)
-                            : (llvm::isa_and_nonnull<IntegerAttr>(lbAttr) &&
-                               (llvm::cast<IntegerAttr>(lbAttr).getInt() %
-                                align) == 0);
-          bool stOk = stVal ? isProvenMultipleOf(stVal, align, ranges, depth + 1)
-                            : (llvm::isa_and_nonnull<IntegerAttr>(stAttr) &&
-                               (llvm::cast<IntegerAttr>(stAttr).getInt() %
-                                align) == 0);
+          bool lbOk = false, stOk = false;
+          if (lbVal) {
+            auto lbR = ranges->query(lbVal);
+            lbOk = lbR && !lbR->smin().isNegative() &&
+                   isProvenMultipleOf(lbVal, align, ranges, depth + 1);
+          } else if (auto ia = llvm::dyn_cast_or_null<IntegerAttr>(lbAttr)) {
+            lbOk = ia.getInt() >= 0 && (ia.getInt() % align) == 0;
+          }
+          if (stVal) {
+            auto stR = ranges->query(stVal);
+            stOk = stR && stR->smin().sgt(0) &&
+                   isProvenMultipleOf(stVal, align, ranges, depth + 1);
+          } else if (auto ia = llvm::dyn_cast_or_null<IntegerAttr>(stAttr)) {
+            stOk = ia.getInt() > 0 && (ia.getInt() % align) == 0;
+          }
           return lbOk && stOk;
         }
       }
@@ -812,24 +1161,32 @@ bool isProvenMultipleOf(Value v, int64_t align,
     return isProvenMultipleOf(sel.getTrueValue(), align, ranges, depth + 1) &&
            isProvenMultipleOf(sel.getFalseValue(), align, ranges, depth + 1);
   }
-  if (llvm::isa<arith::ExtSIOp, arith::ExtUIOp, arith::IndexCastOp,
-                arith::IndexCastUIOp>(def)) {
+  if (llvm::isa<arith::ExtSIOp, arith::IndexCastOp>(def)) {
     Value src = def->getOperand(0);
     unsigned srcW = ConstantIntRanges::getStorageBitwidth(src.getType());
     unsigned dstW = ConstantIntRanges::getStorageBitwidth(v.getType());
     if (srcW == 0 || dstW == 0)
       return false;
     if (dstW < srcW) {
-      if (!ranges)
-        return false;
       auto sr = ranges->query(src);
-      AddressProofOptions chk;
-      chk.targetBitwidth = dstW;
-      chk.isSigned = !llvm::isa<arith::IndexCastUIOp>(def);
-      chk.requireNonNegative = llvm::isa<arith::IndexCastUIOp>(def);
-      if (!sr || !rangeFitsTarget(*sr, chk, 1))
+      if (!sr || !fitsSignedWidth(*sr, dstW, false, 1))
         return false;
     }
+    return isProvenMultipleOf(src, align, ranges, depth + 1);
+  }
+  if (llvm::isa<arith::ExtUIOp, arith::IndexCastUIOp>(def)) {
+    Value src = def->getOperand(0);
+    unsigned srcW = ConstantIntRanges::getStorageBitwidth(src.getType());
+    unsigned dstW = ConstantIntRanges::getStorageBitwidth(v.getType());
+    if (srcW == 0 || dstW == 0)
+      return false;
+    auto sr = ranges->query(src);
+    // Zero-extension only preserves the signed integer value (and therefore
+    // signed divisibility) when `src` is proven non-negative and non-wrapping!
+    if (!sr ||
+        !fitsUnsignedWidth(*sr, std::min(srcW, dstW),
+                           /*mustAlsoFitSignedPositive=*/true, 1))
+      return false;
     return isProvenMultipleOf(src, align, ranges, depth + 1);
   }
   return false;
@@ -841,12 +1198,18 @@ bool verifyOffsetAlignment(const TailDimension &d, int64_t align,
     return false;
   if (d.staticOffset && !d.dynamicOffset)
     return *d.staticOffset >= 0 && (*d.staticOffset % align) == 0;
-  if (d.dynamicOffset && !d.staticOffset)
+  if (d.dynamicOffset && !d.staticOffset) {
+    if (!ranges)
+      return false;
+    auto r = ranges->query(d.dynamicOffset);
+    if (!r || r->smin().isNegative())
+      return false;
     return isProvenMultipleOf(d.dynamicOffset, align, ranges);
+  }
   return false;
 }
 
-Value stripLosslessIntCast(Value v) {
+Value stripLosslessSignedCast(Value v) {
   while (v) {
     Operation *def = v.getDefiningOp();
     if (!def || !llvm::isa<arith::ExtSIOp, arith::IndexCastOp>(def))
@@ -927,8 +1290,8 @@ bool matchRampVector(Value v, int64_t tileSize, int64_t baseOffset,
 bool matchLaneCoordinates(Value coordVal, const TailDimension &d) {
   if (d.tileSize == 1 && llvm::isa<IntegerType, IndexType>(coordVal.getType())) {
     if (d.dynamicOffset)
-      return stripLosslessIntCast(coordVal) ==
-             stripLosslessIntCast(d.dynamicOffset);
+      return stripLosslessSignedCast(coordVal) ==
+             stripLosslessSignedCast(d.dynamicOffset);
     if (d.staticOffset) {
       auto c = matchScalarConstInt(coordVal);
       return c && *c == *d.staticOffset;
@@ -949,8 +1312,8 @@ bool matchLaneCoordinates(Value coordVal, const TailDimension &d) {
       continue;
     if (d.dynamicOffset) {
       Value splatSrc = matchSplatScalar(baseVec, d.tileSize);
-      if (splatSrc && stripLosslessIntCast(splatSrc) ==
-                          stripLosslessIntCast(d.dynamicOffset))
+      if (splatSrc && stripLosslessSignedCast(splatSrc) ==
+                          stripLosslessSignedCast(d.dynamicOffset))
         return true;
     } else if (d.staticOffset) {
       auto cst = matchSplatConstInt(baseVec, d.tileSize);
@@ -963,8 +1326,8 @@ bool matchLaneCoordinates(Value coordVal, const TailDimension &d) {
 
 bool matchExtentBound(Value boundVal, const TailDimension &d) {
   if (d.tileSize == 1 && llvm::isa<IntegerType, IndexType>(boundVal.getType())) {
-    if (d.dynamicExtent && stripLosslessIntCast(boundVal) ==
-                               stripLosslessIntCast(d.dynamicExtent))
+    if (d.dynamicExtent && stripLosslessSignedCast(boundVal) ==
+                               stripLosslessSignedCast(d.dynamicExtent))
       return true;
     if (d.staticExtent) {
       auto c = matchScalarConstInt(boundVal);
@@ -974,8 +1337,8 @@ bool matchExtentBound(Value boundVal, const TailDimension &d) {
   }
   if (d.dynamicExtent) {
     Value splatSrc = matchSplatScalar(boundVal, d.tileSize);
-    if (splatSrc && stripLosslessIntCast(splatSrc) ==
-                        stripLosslessIntCast(d.dynamicExtent))
+    if (splatSrc && stripLosslessSignedCast(splatSrc) ==
+                        stripLosslessSignedCast(d.dynamicExtent))
       return true;
   }
   if (d.staticExtent) {
@@ -986,9 +1349,13 @@ bool matchExtentBound(Value boundVal, const TailDimension &d) {
   return false;
 }
 
+// Verify that `pred` masks out every out-of-bounds lane without wrapping in the
+// actual lane coordinate storage bitwidth `coordBits` (e.g. narrow i8/i16/i32).
 bool verifyMaskPredicate(Value pred, const TailDimension &d,
+                         const APInt &maxCoord128,
                          const std::optional<SRange> &extB,
                          unsigned depth = 0) {
+  constexpr unsigned W = 128;
   if (!pred || depth > 8)
     return false;
   if (d.tileSize == 1) {
@@ -1005,8 +1372,9 @@ bool verifyMaskPredicate(Value pred, const TailDimension &d,
   }
 
   if (auto andOp = pred.getDefiningOp<arith::AndIOp>()) {
-    return verifyMaskPredicate(andOp.getLhs(), d, extB, depth + 1) ||
-           verifyMaskPredicate(andOp.getRhs(), d, extB, depth + 1);
+    return verifyMaskPredicate(andOp.getLhs(), d, maxCoord128, extB,
+                               depth + 1) ||
+           verifyMaskPredicate(andOp.getRhs(), d, maxCoord128, extB, depth + 1);
   }
 
   auto cmp = pred.getDefiningOp<arith::CmpIOp>();
@@ -1038,8 +1406,22 @@ bool verifyMaskPredicate(Value pred, const TailDimension &d,
     return false;
   }
 
-  if (isUnsigned && (!extB || extB->lo.isNegative()))
+  // Audit v0.5.1 item 3b: check non-wrapping in the ACTUAL lane coordinate
+  // element bitwidth (not just i64!), separately for signed vs unsigned cmpi!
+  unsigned coordBits =
+      ConstantIntRanges::getStorageBitwidth(leafScalarType(coordVal.getType()));
+  if (coordBits == 0 || coordBits > 64 || !extB || extB->lo.isNegative())
     return false;
+
+  if (isUnsigned) {
+    APInt maxU = APInt::getMaxValue(coordBits).zext(W);
+    if (maxCoord128.ugt(maxU) || extB->hi.ugt(maxU))
+      return false;
+  } else {
+    APInt maxS = APInt::getSignedMaxValue(coordBits).sext(W);
+    if (maxCoord128.sgt(maxS) || extB->hi.sgt(maxS))
+      return false;
+  }
 
   return matchLaneCoordinates(coordVal, d) && matchExtentBound(boundVal, d);
 }
@@ -1097,17 +1479,11 @@ compilerinfra::proveTailAccess(llvm::ArrayRef<TailDimension> dimensions,
         kind = TailKind::PaddedSafe;
     }
 
-    // MaskedSafe requires BOTH a proven non-negative offset bound (with no
-    // i64 lane-coordinate overflow) AND a verified predicate covering all
-    // out-of-bounds lanes.
     if (kind == TailKind::Unproven && d.hasExplicitMask && offB &&
         !offB->lo.isNegative()) {
       APInt maxCoord = offB->hi + span;
-      APInt maxI64 = APInt::getSignedMaxValue(64).sext(W);
-      if (maxCoord.sle(maxI64) &&
-          verifyMaskPredicate(d.maskPredicate, d, extB)) {
+      if (verifyMaskPredicate(d.maskPredicate, d, maxCoord, extB))
         kind = TailKind::MaskedSafe;
-      }
     }
 
     out.dimensionKinds.push_back(kind);

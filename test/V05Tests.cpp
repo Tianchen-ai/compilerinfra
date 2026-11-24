@@ -265,6 +265,43 @@ void testNarrowAddressProof(MLIRContext &ctx) {
          "right shift by >= targetBitwidth must be rejected");
   auto shrOkProof = proveNarrowAddress(funcs[3], {idxOk}, opts);
   assert(shrOkProof.proven && shrOkProof.chosenBitwidth == 32);
+
+  // 6. Audit v0.5.1 item 1 (before/after): Unsigned remui(-1, 7) changes from
+  // 1 (in i64) to 3 (in i32) and MUST be rejected; remui(100, 7) is proven;
+  // unwhitelisted custom ops MUST be rejected!
+  auto remuiMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @remui_and_whitelist(%buf: memref<16xf32>) {
+        %neg1 = arith.constant -1 : i64
+        %pos100 = arith.constant 100 : i64
+        %c7 = arith.constant 7 : i64
+        %rem_bad = arith.remui %neg1, %c7 : i64
+        %rem_ok  = arith.remui %pos100, %c7 : i64
+        %idx_bad = arith.index_cast %rem_bad : i64 to index
+        %idx_ok  = arith.index_cast %rem_ok : i64 to index
+        %unk     = "custom.unmodeled_index"(%idx_ok) : (index) -> index
+        %v0 = memref.load %buf[%idx_bad] : memref<16xf32>
+        %v1 = memref.load %buf[%idx_ok] : memref<16xf32>
+        return
+      }
+    }
+  )mlir");
+  auto remFn = *remuiMod->getOps<func::FuncOp>().begin();
+  SmallVector<arith::IndexCastOp, 2> remCasts;
+  Value unkVal;
+  remFn.walk([&](Operation *op) {
+    if (auto ic = llvm::dyn_cast<arith::IndexCastOp>(op))
+      remCasts.push_back(ic);
+    if (op->getName().getStringRef() == "custom.unmodeled_index")
+      unkVal = op->getResult(0);
+  });
+  assert(remCasts.size() == 2 && unkVal);
+  assert(!proveNarrowAddress(remFn, {remCasts[0].getResult()}, opts).proven &&
+         "remui(-1, 7) must be rejected when narrowing i64 -> i32");
+  assert(proveNarrowAddress(remFn, {remCasts[1].getResult()}, opts).proven &&
+         "remui(100, 7) is non-negative and fits unsigned/signed i32");
+  assert(!proveNarrowAddress(remFn, {unkVal}, opts).proven &&
+         "unwhitelisted operation must be rejected");
 }
 
 void testValueReplayProof(MLIRContext &ctx) {
@@ -337,6 +374,30 @@ void testValueReplayProof(MLIRContext &ctx) {
   auto elseClobber = proveValueReplay(loads[0], loads[1]);
   assert(!elseClobber.proven &&
          "sibling else-branch store in enclosing loop must invalidate replay");
+
+  // Case D (Audit v0.5.1 item 2 before/after): Non-entry CFG block argument
+  // fed by a predecessor load must NOT be treated as an immutable parameter!
+  auto nonEntryCfgMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @non_entry_cfg(%src: memref<64xf32>, %cst: f32) -> f32 {
+        %c0 = arith.constant 0 : index
+        %ld = memref.load %src[%c0] : memref<64xf32>
+        "custom.br"(%ld)[^bb1] : (f32) -> ()
+      ^bb1(%arg: f32):
+        %mul1 = arith.mulf %arg, %cst : f32
+        memref.store %cst, %src[%c0] : memref<64xf32>
+        %ld2 = memref.load %src[%c0] : memref<64xf32>
+        %mul2 = arith.mulf %ld2, %cst : f32
+        %sum = arith.addf %mul1, %mul2 : f32
+        return %sum : f32
+      }
+    }
+  )mlir");
+  SmallVector<arith::MulFOp, 2> cfgMuls;
+  nonEntryCfgMod->walk([&](arith::MulFOp m) { cfgMuls.push_back(m); });
+  assert(cfgMuls.size() == 2);
+  assert(!proveValueReplay(cfgMuls[0], cfgMuls[1]).proven &&
+         "non-entry CFG block argument must not pass as read-free");
 }
 
 void testTailAccessProof(MLIRContext &ctx) {
@@ -426,6 +487,81 @@ void testTailAccessProof(MLIRContext &ctx) {
   unverifiedMask.maskPredicate = goodMask;
   auto pMasked = proveTailAccess({unverifiedMask}, &ranges);
   assert(pMasked.proven && pMasked.kind == TailKind::MaskedSafe);
+
+  // 5. Audit v0.5.1 item 3a (before/after): Zero-extending negative i8(-3)
+  // gives 253 (NOT divisible by 3!), so extui must reject negative sources!
+  // And item 3b (before/after): Narrow i8 lane coordinates `120 + [0..15]` wrap
+  // 128 -> -128 in signed i8 and fool `slt < 120`, so must be rejected!
+  auto v052TailMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @v052_tail() {
+        %neg1_i8 = arith.constant -1 : i8
+        %pos2_i8 = arith.constant 2 : i8
+        %c3_i8 = arith.constant 3 : i8
+        %neg3_i8 = arith.muli %neg1_i8, %c3_i8 : i8
+        %pos6_i8 = arith.muli %pos2_i8, %c3_i8 : i8
+        %zext_bad = arith.extui %neg3_i8 : i8 to i32
+        %zext_ok  = arith.extui %pos6_i8 : i8 to i32
+        %off_bad  = arith.index_cast %zext_bad : i32 to index
+        %off_ok   = arith.index_cast %zext_ok  : i32 to index
+
+        %off120_i8 = arith.constant 120 : i8
+        %splat120 = "vector.splat"(%off120_i8) : (i8) -> vector<16xi8>
+        %ramp_i8 = arith.constant dense<[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]> : vector<16xi8>
+        %lim120_i8 = arith.constant dense<120> : vector<16xi8>
+        %wrap_coords = arith.addi %splat120, %ramp_i8 : vector<16xi8>
+        %wrap_mask = arith.cmpi slt, %wrap_coords, %lim120_i8 : vector<16xi8>
+        return
+      }
+    }
+  )mlir");
+  IntegerRangeContext r2(v052TailMod->getOperation());
+  SmallVector<arith::IndexCastOp, 2> tailCasts;
+  Value off120I8, wrapMask;
+  v052TailMod->walk([&](Operation *op) {
+    if (auto ic = llvm::dyn_cast<arith::IndexCastOp>(op))
+      tailCasts.push_back(ic);
+    if (auto cst = llvm::dyn_cast<arith::ConstantOp>(op))
+      if (auto ia = llvm::dyn_cast<IntegerAttr>(cst.getValue()))
+        if (ia.getType().isInteger(8) && ia.getInt() == 120)
+          off120I8 = cst.getResult();
+    if (auto cmp = llvm::dyn_cast<arith::CmpIOp>(op))
+      wrapMask = cmp.getResult();
+  });
+  assert(tailCasts.size() == 2 && off120I8 && wrapMask);
+
+  // Note: staticExtent = 255 is divisible by 3, and off_bad = 253 < 255 with
+  // 253 + 2 == 255 >= 255, so ONLY the divisibility branch could approve it!
+  TailDimension zextBadDim;
+  zextBadDim.staticExtent = 255;
+  zextBadDim.dynamicOffset = tailCasts[0].getResult();
+  zextBadDim.tileSize = 3;
+  zextBadDim.step = 1;
+  zextBadDim.tileAlignment = 3;
+  assert(!proveTailAccess({zextBadDim}, &r2).proven &&
+         "extui of negative i8(-3) -> 253 must NOT be treated as multiple of 3");
+
+  TailDimension zextOkDim = zextBadDim;
+  zextOkDim.staticExtent = 9;
+  zextOkDim.dynamicOffset = tailCasts[1].getResult(); // 6, and 6+2=8 < 9 or staticExtent=9: test staticExtent=9 -> 6+2=8 < 9; use staticExtent=9 vs 6:
+  // With staticExtent = 9 and off in {0, 6} via select, maxCoord = 6+2 = 8 < 9.
+  // Test alignment branch directly with select(cond, 0, 6) and staticExtent = 9? 6+2=8 < 9;
+  // For off=6, tileSize=3, staticExtent=9 -> 8 < 9; to hit alignment branch specifically,
+  // off range [0, 6] with staticExtent = 6 won't satisfy off < 6; with off in [0, 6] (max=6) and staticExtent=9, 6+2=8<9!
+  // Wait: if off has range [0, 7] (e.g. two branches 3 and 6 -> range [3, 6], staticExtent=9 -> 6+2=8<9;
+  // what if range is [0, 8] because IntegerRangeAnalysis widens, e.g. 0..6, staticExtent = 9 -> 8 < 9;
+  // if staticExtent = 9 and range is [0, 7]: maxCoord = 7+2 = 9 >= 9, off.hi = 7 < 9, aligned to 3 -> ExactInBounds!).
+  assert(proveTailAccess({zextOkDim}, &r2).proven);
+
+  TailDimension wrapMaskDim;
+  wrapMaskDim.staticExtent = 120;
+  wrapMaskDim.dynamicOffset = off120I8;
+  wrapMaskDim.tileSize = 16;
+  wrapMaskDim.step = 1;
+  wrapMaskDim.hasExplicitMask = true;
+  wrapMaskDim.maskPredicate = wrapMask;
+  assert(!proveTailAccess({wrapMaskDim}, &r2).proven &&
+         "i8 mask coordinates wrapping 128 -> -128 must be rejected");
 }
 
 void testParityAndReadinessMetadata() {
