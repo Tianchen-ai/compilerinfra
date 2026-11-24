@@ -32,11 +32,11 @@ public:
   void line(const llvm::Twine &text);
   unsigned indent = 0;
   unsigned region = 0, block = 0;
-  std::map<std::string, std::string> files;
   std::string file;
 
 private:
   friend struct TerminalPrinter;
+  std::map<std::string, std::string> files;
   const std::map<std::string, std::string> *sources = nullptr;
   llvm::DenseMap<mlir::Value, unsigned> names;
   llvm::DenseMap<mlir::Block *, unsigned> labels;
@@ -104,8 +104,8 @@ public:
 
   PrintRule() = default;
 
-  // Implicit compatibility: callables taking LocalOpView become Kind::Local;
-  // legacy callables taking mlir::Operation& become Kind::Custom automatically.
+  // Callables taking LocalOpView become Kind::Local; Operation& callbacks have
+  // no implicit conversion and must be explicitly declared via PrintRule::custom.
   template <
       typename Fn,
       std::enable_if_t<
@@ -117,16 +117,6 @@ public:
           int> = 0>
   PrintRule(Fn &&fn)
       : ruleKind(Kind::Local), localFn(std::forward<Fn>(fn)) {}
-
-  template <typename Fn,
-            std::enable_if_t<!std::is_same_v<std::decay_t<Fn>, PrintRule> &&
-                                 std::is_invocable_r_v<llvm::Error, Fn,
-                                                       mlir::Operation &,
-                                                       PrintPoint, PrintContext &>,
-                             int> = 0>
-  PrintRule(Fn &&fn)
-      : ruleKind(Kind::Custom), customFn(std::forward<Fn>(fn)),
-        note("legacy_operation_rule") {}
 
   static PrintRule local(LocalFn fn);
   static PrintRule format(std::string enterTemplate,

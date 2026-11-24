@@ -203,6 +203,7 @@ enum class EffectMask : uint8_t {
   Allocate = 1 << 2,
   Free = 1 << 3,
   ReadWrite = Read | Write,
+  All = Read | Write | Allocate | Free,
 };
 inline constexpr EffectMask operator|(EffectMask a, EffectMask b) {
   return static_cast<EffectMask>(static_cast<uint8_t>(a) |

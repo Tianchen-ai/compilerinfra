@@ -29,7 +29,9 @@ class Catalog:
         ):
             """Inspect the installed compiler, or read-only 'parity' / 'readiness' views."""
             if view == "parity":
-                return inspection.build_parity_report(scope, compiler=compiler, exit_filter=exit)
+                return inspection.build_parity_report(
+                    scope, compiler=compiler, exit_filter=exit, records=records
+                )
             if view == "readiness":
                 return inspection.build_readiness_report(
                     scope, compiler=compiler, exit_filter=exit, records=records
@@ -42,9 +44,15 @@ class Catalog:
                 **self.plugins(compiler),
             )
 
-        def inspect_parity(compiler: str = "base", exit: str | None = None):
+        def inspect_parity(
+            compiler: str = "base",
+            exit: str | None = None,
+            records: str | None = None,
+        ):
             """Read-only parity report across node capabilities and sibling exits."""
-            return inspection.build_parity_report(scope, compiler=compiler, exit_filter=exit)
+            return inspection.build_parity_report(
+                scope, compiler=compiler, exit_filter=exit, records=records
+            )
 
         def inspect_readiness(
             compiler: str = "base",

@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "compilerinfra-agent"
-version = "0.5.0"
+version = "0.5.1"
 description = "Scoped compiler development, source plugins, CLI and MCP for CompilerInfra products"
 requires-python = ">=3.10"
-dependencies = ["compilerinfra==0.5.0", "mcp>=1.12,<2", "pydantic>=2,<3"]
+dependencies = ["compilerinfra==0.5.1", "mcp>=1.12,<2", "pydantic>=2,<3"]
 
 [project.scripts]
 compilerinfra-agent = "compilerinfra_agent:main"

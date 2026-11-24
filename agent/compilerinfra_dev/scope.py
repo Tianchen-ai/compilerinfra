@@ -284,6 +284,15 @@ class Scope:
                     with publish(stage, prefix, Path(tmp)/"backup", rel):
                         self.load_base()
                         pointer.unlink()
+                        restored_fp = self.values[self.base_key].description["fingerprint"]
+                        revert_receipt = {
+                            "reverted_from": record["adopted"],
+                            "restored_fingerprint": restored_fp,
+                            "library": str(self.library),
+                        }
+                        (pointer.parent / "last_revert.json").write_text(
+                            json.dumps(revert_receipt)
+                        )
                 except BaseException:
                     abandoned=self.base_key
                     self.base_key=previous

@@ -55,17 +55,42 @@ def _receipt_digest(record):
 def check_protocol(protocol, receipt):
     """Lightweight v0.5 comparability check between Bench protocol and runtime receipt."""
     if not isinstance(protocol, dict) or not isinstance(receipt, dict):
-        raise TypeError("protocol and receipt must be dicts")
+        return {
+            "comparable": False,
+            "status": "incomparable",
+            "mismatches": [
+                {
+                    "field": "protocol",
+                    "expected": "non-empty protocol and receipt dicts",
+                    "actual": None if protocol is None else type(protocol).__name__,
+                }
+            ],
+        }
+    active = {k: v for k, v in protocol.items() if v is not None}
+    if not active:
+        return {
+            "comparable": False,
+            "status": "incomparable",
+            "mismatches": [
+                {
+                    "field": "protocol",
+                    "expected": "at least one explicit protocol constraint",
+                    "actual": protocol,
+                }
+            ],
+        }
     mismatches = []
-    if receipt.get("digest") and receipt.get("digest") != _receipt_digest(receipt):
+    if not receipt.get("digest") or receipt.get("digest") != _receipt_digest(receipt):
         mismatches.append(
             {"field": "digest", "expected": _receipt_digest(receipt), "actual": receipt.get("digest")}
         )
-    exec_info = receipt.get("execution") or {}
-    ident = receipt.get("runtime_identity") or {}
-    for key, expected in protocol.items():
-        if expected is None:
-            continue
+    exec_info = receipt.get("execution") if isinstance(receipt.get("execution"), dict) else {}
+    ident = receipt.get("runtime_identity") if isinstance(receipt.get("runtime_identity"), dict) else {}
+    if not exec_info and not ident:
+        mismatches.append(
+            {"field": "receipt", "expected": "execution or runtime_identity metadata", "actual": None}
+        )
+    for key, expected in active.items():
         if key in exec_info:
             actual = exec_info[key]
         elif key in ident:
@@ -165,14 +190,13 @@ def _join_batch(batch, compilations, measured):
             raise ValueError(f"{ident}: missing timed invocation receipt")
         if not run.get("invocation_id") or run.get("digest") != _receipt_digest(run):
             raise ValueError(f"{ident}: timed invocation contents changed")
-        if "protocol" in row and row["protocol"] is not None:
-            verdict = check_protocol(row["protocol"], run)
-            if not verdict["comparable"]:
-                diffs = ", ".join(
-                    f"{m['field']}: expected {m['expected']!r}, got {m['actual']!r}"
-                    for m in verdict["mismatches"]
-                )
-                raise ValueError(f"{ident}: incomparable measurement protocol ({diffs})")
+        verdict = check_protocol(row.get("protocol"), run)
+        if not verdict["comparable"]:
+            diffs = ", ".join(
+                f"{m['field']}: expected {m['expected']!r}, got {m['actual']!r}"
+                for m in verdict["mismatches"]
+            )
+            raise ValueError(f"{ident}: incomparable measurement protocol ({diffs})")
         receipt = run["runtime_identity"]
         if receipt != row.get("runtime_identity", receipt):
             raise ValueError(f"{ident}: timed invocation differs from reported execution")

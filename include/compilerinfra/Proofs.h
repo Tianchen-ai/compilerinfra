@@ -86,8 +86,9 @@ struct TailDimension {
   mlir::Value dynamicOffset;
   int64_t tileSize = 1;
   int64_t step = 1;
-  std::optional<int64_t> tileAlignment; // e.g. offset known multiple of tile
+  std::optional<int64_t> tileAlignment; // Verified against IR; ignored if unproven
   bool hasExplicitMask = false;
+  mlir::Value maskPredicate; // Required i1 / vector<tileSize x i1> predicate for MaskedSafe
   std::optional<int64_t> paddedCapacity;
 };
 

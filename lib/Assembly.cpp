@@ -908,19 +908,11 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         }
         for (const auto &d : declIt->second) {
           bool isImpl = d.value.status == ParityStatus::Implemented;
-          bool anySelected = false;
+          bool anyConfigured = false;
           for (const auto &b : d.value.bindings) {
             if (chosen.count(b)) {
-              anySelected = true;
+              anyConfigured = true;
               break;
-            }
-            if (auto iit = profile->implementations.find(b);
-                iit != profile->implementations.end()) {
-              auto chk = profile->checkImplementation(b);
-              if (!chk)
-                anySelected = true;
-              else
-                llvm::consumeError(std::move(chk));
             }
           }
           parityItems.push_back(Object{
@@ -930,7 +922,8 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
               {"architecture", d.value.architecture},
               {"status", spelling(d.value.status).str()},
               {"registered", isImpl},
-              {"selected", isImpl && anySelected},
+              {"configured", isImpl && anyConfigured},
+              {"selected", false},
               {"auto_generated", false},
               {"bindings", Array(d.value.bindings)},
               {"reason", d.value.reason},

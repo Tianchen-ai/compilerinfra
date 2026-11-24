@@ -11,6 +11,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
 #include <iostream>
+#include <type_traits>
 
 using namespace compilerinfra;
 using namespace mlir;
@@ -60,11 +61,16 @@ void testLocalPrinterAndTemplates(MLIRContext &ctx) {
   assert(!printer.operations["arith.addi"].isCustom());
   assert(!printer.operations["func.func"].isCustom());
 
-  // Legacy Operation& lambda automatically classifies as custom.
-  PrintRule legacy = [](Operation &, PrintPoint, PrintContext &) {
+  // Audit fix 5: Operation& callbacks CANNOT implicitly convert to PrintRule;
+  // they must be explicitly declared via PrintRule::custom(..., reason).
+  auto rawOpFn = [](Operation &, PrintPoint, PrintContext &) {
     return llvm::Error::success();
   };
-  assert(legacy.isCustom());
+  static_assert(!std::is_constructible_v<PrintRule, decltype(rawOpFn)>,
+                "Operation& callback must not implicitly convert to PrintRule");
+  PrintRule explicitCustom = PrintRule::custom(rawOpFn, "audited_escape");
+  assert(explicitCustom.isCustom());
+  assert(explicitCustom.reason() == "audited_escape");
 
   llvm::SmallString<256> buf;
   llvm::raw_svector_ostream os(buf);
@@ -97,6 +103,12 @@ void testTypedContractsAndNumericalFlags(MLIRContext &ctx) {
   });
   assert(addOp && copyOp);
 
+  // Audit fix 4b: IsIsolatedFromAbove (e.g. func.func) without
+  // MemoryEffectOpInterface must NOT be treated as known pure.
+  bool effectsKnown = true;
+  EffectMask fnEff = observedMemoryEffects(fn.getOperation(), &effectsKnown);
+  assert(!effectsKnown && fnEff == EffectMask::All);
+
   TargetProfile target;
   target.name = "demo";
   target.reuse = Reuse::Vendor;
@@ -111,9 +123,11 @@ void testTypedContractsAndNumericalFlags(MLIRContext &ctx) {
   };
   TypedContract tc;
   tc.operandTypes = {ScalarTypeKind::BF16};
+  tc.accumulatorTypes = {ScalarTypeKind::F32};
   tc.shape.minOperands = 2;
   tc.shape.maxOperands = 2;
   tc.shape.operandRanks = {2, 2};
+  tc.layout.minAlignmentBytes = 64;
   tc.layout.requireContiguousMinorDim = true;
   tc.effects = EffectMask::Read | EffectMask::Write;
   tc.numerical.requireInputSubnormalFlush = true;
@@ -122,37 +136,42 @@ void testTypedContractsAndNumericalFlags(MLIRContext &ctx) {
   populateTypedContractSummaries(ftzImpl);
   target.implementations["exits/demo::brgemm_bf16_ftz"] = ftzImpl;
 
-  // Under default IEEE denormal mode, FTZ contract must be rejected!
+  setDenormalMode(fn, llvm::DenormalMode::getPreserveSign());
+
+  // Audit fix 4a: Missing accumulator_type and missing alignment MUST fail!
   {
     auto err =
         target.checkImplementationForOp("exits/demo::brgemm_bf16_ftz", copyOp);
-    assert(bool(err) && "expected FTZ rejection under IEEE denormal mode");
+    assert(bool(err) && "missing accumulator_type must be rejected");
     llvm::consumeError(std::move(err));
   }
-
-  // Setting preserve-sign denormal mode on enclosing function enables it!
-  setDenormalMode(fn, llvm::DenormalMode::getPreserveSign());
+  copyOp->setAttr("accumulator_type", TypeAttr::get(Float32Type::get(&ctx)));
   {
     auto err =
         target.checkImplementationForOp("exits/demo::brgemm_bf16_ftz", copyOp);
-    assert(!err && "expected FTZ contract to pass under preserve-sign mode");
+    assert(bool(err) && "missing alignment attribute must be rejected");
+    llvm::consumeError(std::move(err));
+  }
+  copyOp->setAttr("alignment",
+                  IntegerAttr::get(IntegerType::get(&ctx, 64), 64));
+  {
+    auto err =
+        target.checkImplementationForOp("exits/demo::brgemm_bf16_ftz", copyOp);
+    assert(!err && "contract must pass once accumulator_type and alignment match");
   }
 
-  // Test FastMath propagation intersection.
-  auto *cloneA = addOp->clone();
-  auto *cloneB = addOp->clone();
-  fn.getBody().front().push_front(cloneB);
-  fn.getBody().front().push_front(cloneA);
-  setFastMath(cloneA, arith::FastMathFlags::reassoc |
-                          arith::FastMathFlags::contract);
-  setFastMath(cloneB, arith::FastMathFlags::reassoc | arith::FastMathFlags::nnan);
-  propagateNumericalFlags({cloneA, cloneB}, addOp);
-  assert(hasFastMath(addOp, arith::FastMathFlags::reassoc));
-  assert(!hasFastMath(addOp, arith::FastMathFlags::contract));
+  // Audit fix 4c: Explicit fastmath=none MUST tighten global fastmath default!
+  target.numerical.defaultFastMath = arith::FastMathFlags::fast;
+  setFastMath(copyOp, arith::FastMathFlags::none);
+  assert(!hasFastMath(copyOp, arith::FastMathFlags::reassoc, target.numerical));
+
+  // Explicit denormal-fp-math="ieee,ieee" MUST tighten global FTZ default!
+  target.numerical.defaultDenormal = llvm::DenormalMode::getPreserveSign();
+  setDenormalMode(fn, llvm::DenormalMode::getIEEE());
+  assert(!allowsSubnormalFlush(copyOp, target.numerical));
 }
 
 void testNarrowAddressProof(MLIRContext &ctx) {
-  // Multi-region module: region 0 is safe [0, 1024), second func has huge i64!
   auto mod = parseIR(ctx, R"mlir(
     module {
       func.func @safe_kernel(%buf: memref<4096xf32>) {
@@ -174,25 +193,78 @@ void testNarrowAddressProof(MLIRContext &ctx) {
         %v = memref.load %buf[%idx] : memref<?xf32>
         return
       }
+      func.func @empty_no_mem(%x: f32) -> f32 {
+        %y = arith.addf %x, %x : f32
+        return %y : f32
+      }
+      func.func @vec_and_shr(%buf: memref<4096xf32>) -> vector<4xi64> {
+        %v_bad = arith.constant dense<[0, 1, 2, 5000000000]> : vector<4xi64>
+        %v_ok  = arith.constant dense<[0, 1, 2, 3]> : vector<4xi64>
+        %c100 = arith.constant 100 : i64
+        %c32 = arith.constant 32 : i64
+        %c4 = arith.constant 4 : i64
+        %shr_bad = arith.shrsi %c100, %c32 : i64
+        %shr_ok  = arith.shrsi %c100, %c4 : i64
+        %sum_vec = arith.addi %v_bad, %v_ok : vector<4xi64>
+        %idx_bad = arith.index_cast %shr_bad : i64 to index
+        %idx_ok  = arith.index_cast %shr_ok : i64 to index
+        %ld0 = memref.load %buf[%idx_bad] : memref<4096xf32>
+        %ld1 = memref.load %buf[%idx_ok] : memref<4096xf32>
+        return %sum_vec : vector<4xi64>
+      }
     }
   )mlir");
 
   auto funcs = llvm::to_vector(mod->getOps<func::FuncOp>());
-  assert(funcs.size() == 2);
+  assert(funcs.size() == 4);
 
-  // 1. Safe kernel with 4-byte element scale: max byte offset = 63*16*4 = 4032.
   AddressProofOptions opts;
   opts.targetBitwidth = 32;
   opts.isSigned = true;
   opts.requireNonNegative = true;
   opts.elementByteScale = 4;
+
+  // 1. Safe kernel -> proven 32-bit.
   auto safeProof = proveNarrowAddress(funcs[0], {}, opts);
   assert(safeProof.proven && safeProof.chosenBitwidth == 32);
 
-  // 2. Whole-module scan MUST NOT stop at first region — catches trunci
-  // wraparound in second function!
+  // 2. Whole-module scan catches trunci wraparound in second function.
   auto modProof = proveNarrowAddress(mod->getOperation(), {}, opts);
   assert(!modProof.proven && modProof.chosenBitwidth == 64);
+
+  // 3. Audit fix 1b (before/after): Empty root set MUST NOT approve narrowing!
+  auto emptyProof = proveNarrowAddress(funcs[2], {}, opts);
+  assert(!emptyProof.proven && emptyProof.chosenBitwidth == 64);
+
+  // 4. Audit fix 1a (before/after): Explicit vector<4xi64> address root!
+  Value vBad, vOk, idxBad, idxOk;
+  funcs[3].walk([&](arith::ConstantOp cst) {
+    if (auto d = llvm::dyn_cast<DenseIntElementsAttr>(cst.getValue())) {
+      if (llvm::any_of(d.getValues<APInt>(),
+                       [](const APInt &x) { return x.sgt(100); }))
+        vBad = cst.getResult();
+      else
+        vOk = cst.getResult();
+    }
+  });
+  SmallVector<arith::IndexCastOp, 2> casts;
+  funcs[3].walk([&](arith::IndexCastOp ic) { casts.push_back(ic); });
+  assert(vBad && vOk && casts.size() == 2);
+  idxBad = casts[0].getResult();
+  idxOk = casts[1].getResult();
+
+  auto vecBadProof = proveNarrowAddress(funcs[3], {vBad}, opts);
+  assert(!vecBadProof.proven &&
+         "vector<4xi64> exceeding i32 must not be skipped");
+  auto vecOkProof = proveNarrowAddress(funcs[3], {vOk}, opts);
+  assert(vecOkProof.proven && vecOkProof.chosenBitwidth == 32);
+
+  // 5. Audit fix 1c (before/after): Right shift by >= 32 must be rejected!
+  auto shrBadProof = proveNarrowAddress(funcs[3], {idxBad}, opts);
+  assert(!shrBadProof.proven &&
+         "right shift by >= targetBitwidth must be rejected");
+  auto shrOkProof = proveNarrowAddress(funcs[3], {idxOk}, opts);
+  assert(shrOkProof.proven && shrOkProof.chosenBitwidth == 32);
 }
 
 void testValueReplayProof(MLIRContext &ctx) {
@@ -213,91 +285,146 @@ void testValueReplayProof(MLIRContext &ctx) {
   SmallVector<memref::LoadOp, 2> loads;
   cleanMod->walk([&](memref::LoadOp l) { loads.push_back(l); });
   assert(loads.size() == 2);
-  auto okReplay = proveValueReplay(loads[0], loads[1]);
-  assert(okReplay.proven && "distinct alloc store should not block replay");
+  assert(proveValueReplay(loads[0], loads[1]).proven);
 
-  // Case B: Intervening aliasing store to %src before second load -> rejected!
-  auto clobberMod = parseIR(ctx, R"mlir(
+  // Case B (Audit fix 2a before/after): Arithmetic op fed by prior load must
+  // trace transitive use-def reads and reject intervening clobber!
+  auto arithFromLoadMod = parseIR(ctx, R"mlir(
     module {
-      func.func @clobber(%src: memref<64xf32>, %cst: f32) -> f32 {
+      func.func @arith_from_load(%src: memref<64xf32>, %cst: f32) -> f32 {
         %c0 = arith.constant 0 : index
-        %v1 = memref.load %src[%c0] : memref<64xf32>
+        %ld = memref.load %src[%c0] : memref<64xf32>
+        %mul1 = arith.mulf %ld, %cst : f32
         memref.store %cst, %src[%c0] : memref<64xf32>
-        %v2 = memref.load %src[%c0] : memref<64xf32>
-        %sum = arith.addf %v1, %v2 : f32
-        return %sum : f32
+        %ld2 = memref.load %src[%c0] : memref<64xf32>
+        %mul2 = arith.mulf %ld2, %cst : f32
+        %res = arith.addf %mul1, %mul2 : f32
+        return %res : f32
       }
     }
   )mlir");
-  loads.clear();
-  clobberMod->walk([&](memref::LoadOp l) { loads.push_back(l); });
-  auto badReplay = proveValueReplay(loads[0], loads[1]);
-  assert(!badReplay.proven && badReplay.clobberOp != nullptr);
+  SmallVector<arith::MulFOp, 2> muls;
+  arithFromLoadMod->walk([&](arith::MulFOp m) { muls.push_back(m); });
+  assert(muls.size() == 2);
+  auto arithReplay = proveValueReplay(muls[0], muls[1]);
+  assert(!arithReplay.proven &&
+         "arithmetic op fed by load must include transitive read locations");
 
-  // Case C: Replay inside a loop with clobbering store AFTER replay in the same
-  // loop body (cross-iteration alias hazard!) -> must be rejected!
-  auto loopClobberMod = parseIR(ctx, R"mlir(
+  // Case C (Audit fix 2b before/after): Store in sibling `else` branch of a
+  // nested `scf.if` inside `scf.for` executes on subsequent loop iterations!
+  auto nestedElseClobberMod = parseIR(ctx, R"mlir(
     module {
-      func.func @loop_clobber(%src: memref<64xf32>, %cst: f32) {
+      func.func @nested_else_clobber(%src: memref<64xf32>, %cst: f32) {
         %c0 = arith.constant 0 : index
         %c4 = arith.constant 4 : index
         %c1 = arith.constant 1 : index
         %v1 = memref.load %src[%c0] : memref<64xf32>
         scf.for %i = %c0 to %c4 step %c1 {
-          %v2 = memref.load %src[%c0] : memref<64xf32>
-          memref.store %cst, %src[%i] : memref<64xf32>
+          %gt = arith.cmpi sgt, %i, %c0 : index
+          scf.if %gt {
+            %v2 = memref.load %src[%c0] : memref<64xf32>
+          } else {
+            memref.store %cst, %src[%i] : memref<64xf32>
+          }
         }
         return
       }
     }
   )mlir");
   loads.clear();
-  loopClobberMod->walk([&](memref::LoadOp l) { loads.push_back(l); });
-  auto loopReplay = proveValueReplay(loads[0], loads[1]);
-  assert(!loopReplay.proven && "loop backedge store must invalidate replay");
+  nestedElseClobberMod->walk([&](memref::LoadOp l) { loads.push_back(l); });
+  assert(loads.size() == 2);
+  auto elseClobber = proveValueReplay(loads[0], loads[1]);
+  assert(!elseClobber.proven &&
+         "sibling else-branch store in enclosing loop must invalidate replay");
 }
 
 void testTailAccessProof(MLIRContext &ctx) {
   auto mod = parseIR(ctx, R"mlir(
     module {
-      func.func @tail(%n: index) {
+      func.func @tail(%unknown_off: index) {
         %c0 = arith.constant 0 : index
         %c1 = arith.constant 1 : index
         %c8 = arith.constant 8 : index
         %c16 = arith.constant 16 : index
+        %c120 = arith.constant 120 : index
+        %ramp = arith.constant dense<[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]> : vector<16xindex>
+        %lim120 = arith.constant dense<120> : vector<16xindex>
+        %lim128 = arith.constant dense<128> : vector<16xindex>
         scf.for %blk = %c0 to %c8 step %c1 {
-          %off = arith.muli %blk, %c16 : index
-          "arith.addi"(%off, %c0) : (index, index) -> index
+          %off_aligned = arith.muli %blk, %c16 : index
+          %splat = "vector.splat"(%off_aligned) : (index) -> vector<16xindex>
+          %coords = arith.addi %splat, %ramp : vector<16xindex>
+          %good_mask = arith.cmpi slt, %coords, %lim120 : vector<16xindex>
+          %bad_mask  = arith.cmpi slt, %coords, %lim128 : vector<16xindex>
+        }
+        scf.for %unaligned_iv = %c0 to %c120 step %c1 {
+          "arith.addi"(%unaligned_iv, %c0) : (index, index) -> index
         }
         return
       }
     }
   )mlir");
   IntegerRangeContext ranges(mod->getOperation());
-  Value offVal;
-  mod->walk([&](arith::MulIOp mul) { offVal = mul.getResult(); });
-  assert(offVal);
+  auto fn = *mod->getOps<func::FuncOp>().begin();
+  Value unknownOff = fn.getArgument(0);
+  Value alignedOff, unalignedIv, goodMask, badMask;
+  SmallVector<scf::ForOp, 2> loops;
+  fn.walk([&](scf::ForOp l) { loops.push_back(l); });
+  assert(loops.size() == 2);
+  unalignedIv = loops[1].getInductionVar();
+  loops[0].walk([&](arith::MulIOp mul) { alignedOff = mul.getResult(); });
+  SmallVector<arith::CmpIOp, 2> cmps;
+  loops[0].walk([&](arith::CmpIOp c) { cmps.push_back(c); });
+  assert(alignedOff && cmps.size() == 2);
+  goodMask = cmps[0].getResult();
+  badMask = cmps[1].getResult();
 
   // 1. Exact divisible 8 * 16 == 128 -> ExactInBounds without mask!
   TailDimension exact;
   exact.staticExtent = 128;
-  exact.dynamicOffset = offVal;
+  exact.dynamicOffset = alignedOff;
   exact.tileSize = 16;
   exact.step = 1;
   auto pExact = proveTailAccess({exact}, &ranges);
   assert(pExact.proven && pExact.kind == TailKind::ExactInBounds);
 
-  // 2. Non-divisible extent 120 without mask -> Unproven (RVV tail overflow)!
-  TailDimension unaligned = exact;
-  unaligned.staticExtent = 120;
-  unaligned.hasExplicitMask = false;
-  auto pBad = proveTailAccess({unaligned}, &ranges);
-  assert(!pBad.proven &&
-         pBad.fallback == TailFallback::RequireMaskOrScalarTail);
+  // 2. Audit fix 3a (before/after): Bogus caller `tileAlignment = 16` on an
+  // unaligned offset `unalignedIv` in [0, 120) MUST NOT be trusted!
+  TailDimension bogusAlign;
+  bogusAlign.staticExtent = 128;
+  bogusAlign.dynamicOffset = unalignedIv;
+  bogusAlign.tileSize = 16;
+  bogusAlign.step = 1;
+  bogusAlign.tileAlignment = 16; // False claim: step is 1, not 16!
+  auto pBogusAlign = proveTailAccess({bogusAlign}, &ranges);
+  assert(!pBogusAlign.proven &&
+         "unverified tileAlignment claim must be rejected");
 
-  // 3. Same non-divisible extent 120 WITH explicit mask -> MaskedSafe!
-  unaligned.hasExplicitMask = true;
-  auto pMasked = proveTailAccess({unaligned}, &ranges);
+  // 3. Audit fix 3b (before/after): Unknown offset + `hasExplicitMask=true`
+  // MUST NOT be approved, and missing/wrong maskPredicate MUST NOT be approved!
+  TailDimension unknownMasked;
+  unknownMasked.staticExtent = 120;
+  unknownMasked.dynamicOffset = unknownOff;
+  unknownMasked.tileSize = 16;
+  unknownMasked.hasExplicitMask = true;
+  unknownMasked.maskPredicate = goodMask;
+  assert(!proveTailAccess({unknownMasked}, &ranges).proven &&
+         "unknown offset must not pass MaskedSafe");
+
+  TailDimension unverifiedMask = exact;
+  unverifiedMask.staticExtent = 120;
+  unverifiedMask.hasExplicitMask = true; // No maskPredicate!
+  assert(!proveTailAccess({unverifiedMask}, &ranges).proven &&
+         "hasExplicitMask=true without maskPredicate must be rejected");
+
+  unverifiedMask.maskPredicate = badMask; // Compares < 128 instead of < 120!
+  assert(!proveTailAccess({unverifiedMask}, &ranges).proven &&
+         "maskPredicate exceeding logical extent 120 must be rejected");
+
+  // 4. Verified lane mask comparing `off + [0..15] < 120` -> MaskedSafe!
+  unverifiedMask.maskPredicate = goodMask;
+  auto pMasked = proveTailAccess({unverifiedMask}, &ranges);
   assert(pMasked.proven && pMasked.kind == TailKind::MaskedSafe);
 }
 
@@ -323,6 +450,7 @@ int main() {
                   scf::SCFDialect>();
   MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();
+  ctx.allowUnregisteredDialects();
 
   testLocalPrinterAndTemplates(ctx);
   testTypedContractsAndNumericalFlags(ctx);
@@ -331,6 +459,6 @@ int main() {
   testTailAccessProof(ctx);
   testParityAndReadinessMetadata();
 
-  std::cout << "ALL V0.5 P0+P1 TESTS PASSED\n";
+  std::cout << "ALL V0.5.1 AUDIT REGRESSION TESTS PASSED\n";
   return 0;
 }

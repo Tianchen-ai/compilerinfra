@@ -67,15 +67,15 @@ compilerinfra::effectiveFastMath(mlir::Operation *op,
                                  mlir::arith::FastMathFlags fallback) {
   if (!op)
     return fallback;
-  if (auto iface = llvm::dyn_cast<mlir::arith::ArithFastMathInterface>(op)) {
-    if (auto attr = iface.getFastMathFlagsAttr())
-      return attr.getValue() | fallback;
-  }
   if (auto attr = op->getAttrOfType<mlir::arith::FastMathFlagsAttr>("fastmath"))
-    return attr.getValue() | fallback;
+    return attr.getValue();
   if (auto sattr = op->getAttrOfType<mlir::StringAttr>("fastmath")) {
     if (auto parsed = parseFastMathString(sattr.getValue()))
-      return *parsed | fallback;
+      return *parsed;
+  }
+  if (auto iface = llvm::dyn_cast<mlir::arith::ArithFastMathInterface>(op)) {
+    if (auto attr = iface.getFastMathFlagsAttr())
+      return attr.getValue();
   }
   return fallback;
 }
@@ -114,8 +114,13 @@ compilerinfra::effectiveDenormalMode(mlir::Operation *op,
     for (llvm::StringRef attrName : {"denormal-fp-math", "ci.denormal_mode"}) {
       if (auto s = cur->getAttrOfType<mlir::StringAttr>(attrName)) {
         auto parsed = llvm::parseDenormalFPAttribute(s.getValue());
-        if (parsed.isValid())
-          return fallback.mergeCalleeMode(parsed);
+        if (parsed.isValid()) {
+          if (parsed.Output == llvm::DenormalMode::Dynamic)
+            parsed.Output = fallback.Output;
+          if (parsed.Input == llvm::DenormalMode::Dynamic)
+            parsed.Input = fallback.Input;
+          return parsed;
+        }
       }
     }
   }
@@ -277,14 +282,9 @@ EffectMask compilerinfra::observedMemoryEffects(mlir::Operation *op,
     }
     return out;
   }
-  if (op->hasTrait<mlir::OpTrait::IsIsolatedFromAbove>()) {
-    if (known)
-      *known = true;
-    return EffectMask::None;
-  }
   if (known)
     *known = false;
-  return EffectMask::Read | EffectMask::Write;
+  return EffectMask::All;
 }
 
 static std::string joinTypes(llvm::ArrayRef<ScalarTypeKind> kinds) {
@@ -434,17 +434,23 @@ llvm::Error compilerinfra::checkTypedContract(
     if (!accType)
       if (auto ta = op->getAttrOfType<mlir::TypeAttr>("accumulator_type"))
         accType = ta.getValue();
-    if (accType && !matchesAnyKind(accType, tc.accumulatorTypes))
+    if (!accType)
+      return createStringError(contract.name +
+                               ": missing required accumulator type");
+    if (!matchesAnyKind(accType, tc.accumulatorTypes))
       return createStringError(contract.name +
                                ": unsupported accumulator type");
   }
 
   // 3. Layout & address space checks.
   if (tc.layout.minAlignmentBytes > 0) {
-    if (auto alignAttr = op->getAttrOfType<mlir::IntegerAttr>("alignment"))
-      if (alignAttr.getValue().getZExtValue() < tc.layout.minAlignmentBytes)
-        return createStringError(contract.name +
-                                 ": alignment below contract minimum");
+    auto alignAttr = op->getAttrOfType<mlir::IntegerAttr>("alignment");
+    if (!alignAttr || alignAttr.getValue().isNegative() ||
+        alignAttr.getValue().getZExtValue() < tc.layout.minAlignmentBytes)
+      return createStringError(
+          contract.name +
+          ": missing or insufficient alignment attribute (requires >= " +
+          std::to_string(tc.layout.minAlignmentBytes) + " bytes)");
   }
   for (mlir::Type ty : op->getOperandTypes()) {
     auto mr = llvm::dyn_cast<mlir::MemRefType>(ty);
