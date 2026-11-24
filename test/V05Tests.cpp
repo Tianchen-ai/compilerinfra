@@ -7,6 +7,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cassert>
@@ -564,6 +566,279 @@ void testTailAccessProof(MLIRContext &ctx) {
          "i8 mask coordinates wrapping 128 -> -128 must be rejected");
 }
 
+// Minimal custom dialect ops exercising IndexedRegionOpInterface,
+// TiledAccessOpInterface, and AddressOpInterface via ExternalModel.
+class DemoDialect : public Dialect {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DemoDialect)
+  explicit DemoDialect(MLIRContext *context)
+      : Dialect(getDialectNamespace(), context, TypeID::get<DemoDialect>()) {
+    initialize();
+  }
+  static StringRef getDialectNamespace() { return "demo"; }
+  void initialize();
+};
+
+class DemoOwnerSpaceOp
+    : public Op<DemoOwnerSpaceOp, OpTrait::SingleBlock,
+                OpTrait::NoTerminator> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DemoOwnerSpaceOp)
+  using Op::Op;
+  static StringRef getOperationName() { return "demo.owner_space"; }
+  static ArrayRef<StringRef> getAttributeNames() {
+    static StringRef names[] = {"extent", "owner_tile"};
+    return names;
+  }
+};
+
+class DemoSliceReadOp
+    : public Op<DemoSliceReadOp, OpTrait::ZeroRegions, OpTrait::OneResult> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DemoSliceReadOp)
+  using Op::Op;
+  static StringRef getOperationName() { return "demo.slice_read"; }
+  static ArrayRef<StringRef> getAttributeNames() {
+    static StringRef names[] = {"owner_tile"};
+    return names;
+  }
+};
+
+class DemoAddressOp
+    : public Op<DemoAddressOp, OpTrait::ZeroRegions, OpTrait::OneResult> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(DemoAddressOp)
+  using Op::Op;
+  static StringRef getOperationName() { return "demo.address"; }
+  static ArrayRef<StringRef> getAttributeNames() { return {}; }
+};
+
+struct DemoOwnerSpaceBounds
+    : public IndexedRegionOpInterface::ExternalModel<DemoOwnerSpaceBounds,
+                                                     DemoOwnerSpaceOp> {
+  LogicalResult getRegionArgBounds(Operation *op, BlockArgument arg,
+                                   RegionIndexBounds &out) const {
+    if (arg.getArgNumber() != 0)
+      return failure();
+    auto ext = op->getAttrOfType<IntegerAttr>("extent");
+    auto tile = op->getAttrOfType<IntegerAttr>("owner_tile");
+    if (!ext || !tile || ext.getInt() <= 0 || tile.getInt() <= 0)
+      return failure();
+    int64_t t = tile.getInt();
+    int64_t groups = (ext.getInt() + t - 1) / t;
+    out.staticLower = 0;
+    out.staticUpperExclusive = groups * t;
+    out.staticStep = t;
+    return success();
+  }
+};
+
+struct DemoSliceReadAccess
+    : public TiledAccessOpInterface::ExternalModel<DemoSliceReadAccess,
+                                                   DemoSliceReadOp> {
+  LogicalResult getAccessedAxes(Operation *op,
+                                SmallVectorImpl<AccessAxis> &axes) const {
+    if (op->getNumOperands() != 2)
+      return failure();
+    auto tile = op->getAttrOfType<IntegerAttr>("owner_tile");
+    if (!tile)
+      return failure();
+    AccessAxis ownerAx;
+    ownerAx.container = op->getOperand(0);
+    ownerAx.containerDim = 0;
+    ownerAx.coord = op->getOperand(1);
+    ownerAx.tileSize = tile.getInt();
+    ownerAx.step = 1;
+    axes.push_back(ownerAx);
+
+    AccessAxis laneAx;
+    laneAx.container = op->getOperand(0);
+    laneAx.containerDim = 1;
+    laneAx.entireAxisFromZero = true;
+    laneAx.tileSize = 0; // Derived from containerDim 1 static extent!
+    laneAx.step = 1;
+    axes.push_back(laneAx);
+    return success();
+  }
+};
+
+struct DemoLinearAddress
+    : public AddressOpInterface::ExternalModel<DemoLinearAddress,
+                                               DemoAddressOp> {
+  LogicalResult getLinearAddress(Operation *op,
+                                 LinearAddressDescriptor &desc) const {
+    if (op->getNumOperands() != 3)
+      return failure();
+    desc.baseContainer = op->getOperand(0);
+    desc.coordinates.push_back(op->getOperand(1));
+    desc.dynamicStrides.push_back(op->getOperand(2));
+    desc.constantOffset = 0;
+    return success();
+  }
+};
+
+void DemoDialect::initialize() {
+  addOperations<DemoOwnerSpaceOp, DemoSliceReadOp, DemoAddressOp>();
+  auto *ctx = getContext();
+  DemoOwnerSpaceOp::attachInterface<DemoOwnerSpaceBounds>(*ctx);
+  DemoSliceReadOp::attachInterface<DemoSliceReadAccess>(*ctx);
+  DemoAddressOp::attachInterface<DemoLinearAddress>(*ctx);
+}
+
+void testV053OpAndValueDerivedProofs(MLIRContext &ctx) {
+  ctx.getOrLoadDialect<DemoDialect>();
+
+  // 1. Audit-mig Reproducer 2A (Mojo K=4097, depth=64 tail overread):
+  // Passing the actual memref.subview Operation* or its result Value derives
+  // offset = %pIv in {0, 64, ..., 4096} and extent = 4097 from IR, rejecting
+  // [4096, 4160) > 4097 while approving K=4096!
+  auto mojoMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @mojo_tail_4097(%panel: memref<4097x64xf32>) {
+        %c0 = arith.constant 0 : index
+        %c64 = arith.constant 64 : index
+        %c4097 = arith.constant 4097 : index
+        scf.for %p = %c0 to %c4097 step %c64 {
+          %sub = memref.subview %panel[%p, 0] [64, 64] [1, 1]
+              : memref<4097x64xf32> to memref<64x64xf32, strided<[64, 1], offset: ?>>
+        }
+        return
+      }
+      func.func @mojo_tail_4096(%panel: memref<4096x64xf32>) {
+        %c0 = arith.constant 0 : index
+        %c64 = arith.constant 64 : index
+        %c4096 = arith.constant 4096 : index
+        scf.for %p = %c0 to %c4096 step %c64 {
+          %sub = memref.subview %panel[%p, 0] [64, 64] [1, 1]
+              : memref<4096x64xf32> to memref<64x64xf32, strided<[64, 1], offset: ?>>
+        }
+        return
+      }
+    }
+  )mlir");
+  SmallVector<memref::SubViewOp, 2> subviews;
+  mojoMod->walk([&](memref::SubViewOp sv) { subviews.push_back(sv); });
+  assert(subviews.size() == 2);
+  auto p4097Op = proveTailAccess(subviews[0].getOperation());
+  auto p4097Val = proveTailAccess(subviews[0].getResult());
+  assert(!p4097Op.proven && !p4097Val.proven &&
+         "K=4097, depth=64 last tile [4096, 4160) must be rejected from IR");
+  auto p4096Op = proveTailAccess(subviews[1].getOperation());
+  auto p4096Val = proveTailAccess(subviews[1].getResult());
+  assert(p4096Op.proven && p4096Op.kind == TailKind::ExactInBounds);
+  assert(p4096Val.proven && p4096Val.kind == TailKind::ExactInBounds);
+
+  // 2. Audit-mig Reproducer 2B (Triton/cuTile extent=100, ownerTile=64 bug):
+  // IndexedRegionOpInterface + TiledAccessOpInterface derive CTA base %owner in
+  // {0, 64} and reject extent=100 while approving extent=128!
+  auto ownerMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @owner_100(%v100: memref<100x64xf16>) {
+        "demo.owner_space"() ({
+        ^bb0(%owner: index):
+          %s = "demo.slice_read"(%v100, %owner) {owner_tile = 64 : i64}
+              : (memref<100x64xf16>, index) -> tensor<64x64xf16>
+        }) {extent = 100 : i64, owner_tile = 64 : i64} : () -> ()
+        return
+      }
+      func.func @owner_128(%v128: memref<128x64xf16>) {
+        "demo.owner_space"() ({
+        ^bb0(%owner: index):
+          %s = "demo.slice_read"(%v128, %owner) {owner_tile = 64 : i64}
+              : (memref<128x64xf16>, index) -> tensor<64x64xf16>
+        }) {extent = 128 : i64, owner_tile = 64 : i64} : () -> ()
+        return
+      }
+    }
+  )mlir");
+  SmallVector<DemoSliceReadOp, 2> sliceReads;
+  ownerMod->walk([&](DemoSliceReadOp sr) { sliceReads.push_back(sr); });
+  assert(sliceReads.size() == 2);
+  assert(!proveTailAccess(sliceReads[0].getOperation()).proven &&
+         "extent=100, ownerTile=64 must be rejected without fake extent-tile");
+  auto p128 = proveTailAccess(sliceReads[1].getOperation());
+  assert(p128.proven && p128.kind == TailKind::ExactInBounds);
+
+  // 3. Standard vector.maskedload + (container, coordinates, mask) Value API:
+  auto vecMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @masked_vec(%buf: memref<120xf32>) {
+        %c0 = arith.constant 0 : index
+        %c16 = arith.constant 16 : index
+        %c128 = arith.constant 128 : index
+        %pass = arith.constant dense<0.0> : vector<16xf32>
+        %lim120 = arith.constant dense<120> : vector<16xindex>
+        %lim128 = arith.constant dense<128> : vector<16xindex>
+        %ramp = vector.step : vector<16xindex>
+        scf.for %off = %c0 to %c128 step %c16 {
+          %splat = vector.splat %off : vector<16xindex>
+          %coords = arith.addi %splat, %ramp : vector<16xindex>
+          %good_mask = arith.cmpi slt, %coords, %lim120 : vector<16xindex>
+          %bad_mask  = arith.cmpi slt, %coords, %lim128 : vector<16xindex>
+          %v_ok  = vector.maskedload %buf[%off], %good_mask, %pass
+              : memref<120xf32>, vector<16xi1>, vector<16xf32> into vector<16xf32>
+          %v_bad = vector.maskedload %buf[%off], %bad_mask, %pass
+              : memref<120xf32>, vector<16xi1>, vector<16xf32> into vector<16xf32>
+        }
+        return
+      }
+    }
+  )mlir");
+  SmallVector<vector::MaskedLoadOp, 2> mloads;
+  Value vecCoords, goodMaskVal, bufArg;
+  vecMod->walk([&](func::FuncOp f) { bufArg = f.getArgument(0); });
+  vecMod->walk([&](arith::AddIOp a) { vecCoords = a.getResult(); });
+  vecMod->walk([&](vector::MaskedLoadOp ml) { mloads.push_back(ml); });
+  assert(mloads.size() == 2 && vecCoords && bufArg);
+  goodMaskVal = mloads[0].getMask();
+  auto mlOk = proveTailAccess(mloads[0].getOperation());
+  assert(mlOk.proven && mlOk.kind == TailKind::MaskedSafe);
+  assert(!proveTailAccess(mloads[1].getOperation()).proven &&
+         "vector.maskedload with < 128 mask on memref<120> must fail");
+  auto coordApiOk = proveTailAccess(bufArg, {vecCoords}, goodMaskVal);
+  assert(coordApiOk.proven && coordApiOk.kind == TailKind::MaskedSafe);
+  assert(!proveTailAccess(bufArg, {vecCoords}).proven &&
+         "unmasked 128-span vector coordinates on memref<120> must fail");
+
+  // 4. AddressOpInterface & Value-based proveNarrowAddress:
+  // Even when coord (65536) and stride (65536) each fit i32, coord * stride =
+  // 2^32 overflows signed i32 and MUST be rejected by proveNarrowAddress(op)!
+  auto addrMod = parseIR(ctx, R"mlir(
+    module {
+      func.func @addr_test(%base: memref<?xf32>) {
+        %c0 = arith.constant 0 : i64
+        %c1 = arith.constant 1 : i64
+        %c65537 = arith.constant 65537 : i64
+        %s65536 = arith.constant 65536 : i64
+        %c1024 = arith.constant 1024 : i64
+        scf.for %i = %c0 to %c65537 step %c1 : i64 {
+          %bad_ptr = "demo.address"(%base, %i, %s65536)
+              : (memref<?xf32>, i64, i64) -> memref<?xf32>
+        }
+        scf.for %j = %c0 to %c1024 step %c1 : i64 {
+          %ok_ptr = "demo.address"(%base, %j, %c1024)
+              : (memref<?xf32>, i64, i64) -> memref<?xf32>
+        }
+        return
+      }
+    }
+  )mlir");
+  AddressProofOptions addrOpts;
+  addrOpts.targetBitwidth = 32;
+  addrOpts.isSigned = true;
+  addrOpts.requireNonNegative = true;
+  addrOpts.elementByteScale = 4;
+  SmallVector<DemoAddressOp, 2> demoAddrs;
+  addrMod->walk([&](DemoAddressOp a) { demoAddrs.push_back(a); });
+  assert(demoAddrs.size() == 2);
+  assert(!proveNarrowAddress(demoAddrs[0].getOperation(), addrOpts).proven &&
+         "65536 * 65536 overflows i32 and must be rejected");
+  assert(!proveNarrowAddress(demoAddrs[0].getResult(), addrOpts).proven);
+  auto addrOk = proveNarrowAddress(demoAddrs[1].getOperation(), addrOpts);
+  assert(addrOk.proven && addrOk.chosenBitwidth == 32);
+  assert(proveNarrowAddress(demoAddrs[1].getResult(), addrOpts).proven);
+}
+
 void testParityAndReadinessMetadata() {
   assert(spelling(ParityStatus::Implemented) == "implemented");
   assert(spelling(ParityStatus::Unsupported) == "unsupported");
@@ -583,7 +858,8 @@ void testParityAndReadinessMetadata() {
 int main() {
   DialectRegistry registry;
   registry.insert<arith::ArithDialect, func::FuncDialect, memref::MemRefDialect,
-                  scf::SCFDialect>();
+                  scf::SCFDialect, tensor::TensorDialect,
+                  vector::VectorDialect>();
   MLIRContext ctx(registry);
   ctx.loadAllAvailableDialects();
   ctx.allowUnregisteredDialects();
@@ -593,8 +869,9 @@ int main() {
   testNarrowAddressProof(ctx);
   testValueReplayProof(ctx);
   testTailAccessProof(ctx);
+  testV053OpAndValueDerivedProofs(ctx);
   testParityAndReadinessMetadata();
 
-  std::cout << "ALL V0.5.1 AUDIT REGRESSION TESTS PASSED\n";
+  std::cout << "ALL V0.5.3 AUDIT REGRESSION TESTS PASSED\n";
   return 0;
 }

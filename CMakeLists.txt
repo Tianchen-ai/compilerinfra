@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CompilerInfra VERSION 0.5.2 LANGUAGES C CXX)
+project(CompilerInfra VERSION 0.5.3 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -53,7 +53,7 @@ else()
   target_link_libraries(CompilerInfraCore PUBLIC
     MLIRParser MLIRBytecodeWriter MLIRPass MLIRAnalysis MLIRArithDialect
     MLIRInferIntRangeInterface MLIRLoopLikeInterface MLIRSideEffectInterfaces
-    MLIRIR LLVMSupport)
+    MLIRViewLikeInterface MLIRIR LLVMSupport)
 endif()
 
 option(COMPILERINFRA_BUILD_TESTS "Build CompilerInfra SDK unit tests" OFF)
@@ -64,7 +64,8 @@ if(standalone AND COMPILERINFRA_BUILD_TESTS)
     target_link_libraries(ci-v05-tests PRIVATE CompilerInfraCore MLIR LLVM)
   else()
     target_link_libraries(ci-v05-tests PRIVATE CompilerInfraCore
-      MLIRFuncDialect MLIRMemRefDialect MLIRSCFDialect)
+      MLIRFuncDialect MLIRMemRefDialect MLIRSCFDialect MLIRTensorDialect
+      MLIRVectorDialect)
   endif()
   add_test(NAME ci-v05-tests COMMAND ci-v05-tests)
 endif()

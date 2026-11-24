@@ -78,6 +78,8 @@ def _observed_hits_by_exit_candidate_arch(
     target_candidate_key: str,
     target_desc: dict[str, Any],
     records_doc: dict[str, Any] | None = None,
+    *,
+    is_base_candidate: bool = False,
 ) -> dict[tuple[str, str, str], set[str]]:
     """Partition winning selection receipts by (exit, candidate, architecture)."""
     hits: dict[tuple[str, str, str], set[str]] = defaultdict(set)
@@ -112,9 +114,10 @@ def _observed_hits_by_exit_candidate_arch(
                     continue
                 if target_fp is not None and rep.get("fingerprint") != target_fp:
                     continue
-                if target_candidate_key == "base" and rep.get("product_default") is not True:
-                    continue
-                if target_candidate_key != "base" and rep.get("candidate") not in (target_candidate_key, None):
+                if is_base_candidate or target_candidate_key == "base":
+                    if rep.get("product_default") is not True:
+                        continue
+                elif rep.get("candidate") not in (target_candidate_key, None):
                     continue
                 arch = _extract_arch(rep, None, target_desc)
                 _collect_winning_receipt_hits(rep, target_candidate_key, arch, hits)
@@ -162,7 +165,11 @@ def build_parity_report(
     configured_map = desc.get("selected", {})
     records_doc = json.loads(Path(records).read_text(encoding="utf-8")) if records else None
     observed_winners = _observed_hits_by_exit_candidate_arch(
-        scope.observations, key, desc, records_doc
+        scope.observations,
+        key,
+        desc,
+        records_doc,
+        is_base_candidate=(key == scope.base_key),
     )
 
     target_exits = [exit_filter] if exit_filter else list(exits.keys())
@@ -308,7 +315,11 @@ def build_readiness_report(
                 per_exit_accuracy[ex] = accuracy(sub_doc)
 
     observed_winners = _observed_hits_by_exit_candidate_arch(
-        scope.observations, key, desc, raw_records
+        scope.observations,
+        key,
+        desc,
+        raw_records,
+        is_base_candidate=(key == scope.base_key),
     )
 
     # Revert evidence must match the CURRENT installed fingerprint; stale

@@ -3,34 +3,134 @@
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/AffineExpr.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/LoopLikeInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include <algorithm>
 
 using namespace compilerinfra;
 using namespace mlir;
 
-IntegerRangeContext::IntegerRangeContext(Operation *root) : rootOp(root) {
-  if (!root)
-    return;
-  DataFlowConfig cfg;
-  cfg.setInterprocedural(false);
-  solver = std::make_unique<DataFlowSolver>(cfg);
-  solver->load<dataflow::DeadCodeAnalysis>();
-  solver->load<dataflow::IntegerRangeAnalysis>();
-  succeeded = mlir::succeeded(solver->initializeAndRun(root));
+namespace {
+Operation *findEnclosingProofScope(Operation *op) {
+  if (!op)
+    return nullptr;
+  Operation *cur = op;
+  while (cur->getParentOp() && !cur->hasTrait<OpTrait::IsIsolatedFromAbove>())
+    cur = cur->getParentOp();
+  return cur;
 }
 
-IntegerRangeContext::~IntegerRangeContext() = default;
+Operation *findEnclosingProofScope(Value v) {
+  if (!v)
+    return nullptr;
+  if (Operation *def = v.getDefiningOp())
+    return findEnclosingProofScope(def);
+  auto barg = llvm::cast<BlockArgument>(v);
+  Region *reg = barg.getOwner() ? barg.getOwner()->getParent() : nullptr;
+  return findEnclosingProofScope(reg ? reg->getParentOp() : nullptr);
+}
+
+bool contextCoversScope(const IntegerRangeContext *ctx, Operation *scope) {
+  if (!ctx || !ctx->valid() || !ctx->root() || !scope)
+    return false;
+  return ctx->root() == scope || ctx->root()->isAncestor(scope);
+}
+
+std::optional<int64_t> matchScalarConstInt(Value v) {
+  if (!v)
+    return std::nullopt;
+  if (auto c = v.getDefiningOp<arith::ConstantOp>())
+    if (auto ia = llvm::dyn_cast<IntegerAttr>(c.getValue()))
+      if (ia.getValue().getSignificantBits() <= 64)
+        return ia.getValue().getSExtValue();
+  return std::nullopt;
+}
+
+ConstantIntRanges makeNonNegRange(unsigned bw, const APInt &lo128,
+                                  const APInt &hi128) {
+  APInt maxS = APInt::getSignedMaxValue(bw).sext(128);
+  APInt maxU = APInt::getMaxValue(bw).zext(128);
+  APInt clampedLo = llvm::APIntOps::smax(APInt(128, 0, true), lo128);
+  APInt sHi = llvm::APIntOps::smin(hi128, maxS);
+  APInt uHi = llvm::APIntOps::umin(hi128, maxU);
+  if (clampedLo.ugt(uHi))
+    return ConstantIntRanges::maxRange(bw);
+  auto uRng = ConstantIntRanges::fromUnsigned(clampedLo.trunc(bw), uHi.trunc(bw));
+  if (hi128.sle(maxS) && clampedLo.sle(sHi)) {
+    return uRng.intersection(
+        ConstantIntRanges::fromSigned(clampedLo.trunc(bw), sHi.trunc(bw)));
+  }
+  return uRng;
+}
 
 std::optional<ConstantIntRanges>
-IntegerRangeContext::query(Value value) const {
-  if (!succeeded || !value)
+queryValueImpl(const IntegerRangeContext &ctx, Value value,
+               const DataFlowSolver *solver, unsigned depth);
+
+std::optional<ConstantIntRanges>
+inferSteppedArgRange(unsigned bw, std::optional<int64_t> staticLb, Value dynLb,
+                     std::optional<int64_t> staticUb, Value dynUb,
+                     std::optional<int64_t> staticStep, Value dynStep,
+                     const IntegerRangeContext &ctx,
+                     const DataFlowSolver *solver, unsigned depth) {
+  if (bw == 0 || bw > 64 || depth > 8)
+    return std::nullopt;
+  constexpr unsigned W = 128;
+
+  auto boundOf = [&](std::optional<int64_t> cst,
+                     Value dyn) -> std::optional<std::pair<APInt, APInt>> {
+    if (cst) {
+      APInt v(W, *cst, true);
+      return std::make_pair(v, v);
+    }
+    if (!dyn)
+      return std::nullopt;
+    auto r = queryValueImpl(ctx, dyn, solver, depth + 1);
+    if (!r || r->smin().getBitWidth() == 0)
+      return std::nullopt;
+    if (r->smin().isMinSignedValue() && r->smax().isMaxSignedValue() &&
+        r->smin().getBitWidth() >= 32)
+      return std::nullopt;
+    return std::make_pair(r->smin().sext(W), r->smax().sext(W));
+  };
+
+  auto lbB = boundOf(staticLb, dynLb);
+  auto ubB = boundOf(staticUb, dynUb);
+  auto stB = boundOf(staticStep, dynStep);
+  if (!lbB || !ubB || !stB)
+    return std::nullopt;
+
+  if (lbB->first.isNegative() || !stB->first.sgt(0))
+    return std::nullopt;
+  // Inside the body of `for iv = lb to ub step s` (with s > 0), `iv < ub`.
+  if (ubB->second.sle(lbB->first))
+    return std::nullopt;
+
+  APInt ivMin = lbB->first;
+  APInt ivMax = ubB->second - APInt(W, 1, true);
+  if (lbB->first == lbB->second && stB->first == stB->second) {
+    APInt span = ubB->second - APInt(W, 1, true) - lbB->first;
+    APInt steps = span.sdiv(stB->first);
+    ivMax = lbB->first + steps * stB->first;
+  }
+  if (ivMax.slt(ivMin))
+    return std::nullopt;
+  return makeNonNegRange(bw, ivMin, ivMax);
+}
+
+std::optional<ConstantIntRanges>
+queryValueImpl(const IntegerRangeContext &ctx, Value value,
+               const DataFlowSolver *solver, unsigned depth) {
+  if (!ctx.valid() || !value || depth > 12)
     return std::nullopt;
   if (auto constOp = value.getDefiningOp<arith::ConstantOp>()) {
     if (auto intAttr = llvm::dyn_cast<IntegerAttr>(constOp.getValue())) {
@@ -64,11 +164,105 @@ IntegerRangeContext::query(Value value) const {
           .intersection(ConstantIntRanges::fromUnsigned(umin, umax));
     }
   }
-  const auto *lattice =
-      solver->lookupState<dataflow::IntegerValueRangeLattice>(value);
-  if (!lattice || lattice->getValue().isUninitialized())
-    return std::nullopt;
-  return lattice->getValue().getValue();
+
+  if (Operation *def = value.getDefiningOp()) {
+    StringRef opName = def->getName().getStringRef();
+    if (opName == "vector.step") {
+      auto st = llvm::dyn_cast<ShapedType>(value.getType());
+      unsigned bw = ConstantIntRanges::getStorageBitwidth(
+          st ? st.getElementType() : Type{});
+      if (st && st.getRank() == 1 && st.getDimSize(0) > 0 && bw > 0 &&
+          bw <= 64) {
+        return makeNonNegRange(bw, APInt(128, 0, true),
+                               APInt(128, st.getDimSize(0) - 1, true));
+      }
+    }
+    if ((opName == "vector.splat" || opName == "tensor.splat" ||
+         opName == "vector.broadcast") &&
+        def->getNumOperands() == 1 &&
+        llvm::isa<IntegerType, IndexType>(def->getOperand(0).getType())) {
+      return queryValueImpl(ctx, def->getOperand(0), solver, depth + 1);
+    }
+  }
+
+  std::optional<ConstantIntRanges> latticeRange;
+  if (solver) {
+    const auto *lattice =
+        solver->lookupState<dataflow::IntegerValueRangeLattice>(value);
+    if (lattice && !lattice->getValue().isUninitialized())
+      latticeRange = lattice->getValue().getValue();
+  }
+
+  if (auto barg = llvm::dyn_cast<BlockArgument>(value)) {
+    unsigned bw = ConstantIntRanges::getStorageBitwidth(value.getType());
+    Operation *parentOp =
+        barg.getOwner() && barg.getOwner()->getParent()
+            ? barg.getOwner()->getParent()->getParentOp()
+            : nullptr;
+    std::optional<ConstantIntRanges> steppedRange;
+    if (auto idxReg = llvm::dyn_cast_or_null<IndexedRegionOpInterface>(parentOp)) {
+      RegionIndexBounds rb;
+      if (mlir::succeeded(idxReg.getRegionArgBounds(barg, rb))) {
+        steppedRange = inferSteppedArgRange(
+            bw, rb.staticLower, rb.dynamicLower, rb.staticUpperExclusive,
+            rb.dynamicUpperExclusive, rb.staticStep, rb.dynamicStep, ctx,
+            solver, depth + 1);
+      }
+    } else if (auto loop = llvm::dyn_cast_or_null<LoopLikeOpInterface>(parentOp)) {
+      auto ivs = loop.getLoopInductionVars();
+      auto lbs = loop.getLoopLowerBounds();
+      auto ubs = loop.getLoopUpperBounds();
+      auto steps = loop.getLoopSteps();
+      if (ivs && lbs && ubs && steps && ivs->size() == lbs->size() &&
+          ivs->size() == ubs->size() && ivs->size() == steps->size()) {
+        for (size_t i = 0; i < ivs->size(); ++i) {
+          if ((*ivs)[i] != barg)
+            continue;
+          auto extractTerm = [](OpFoldResult ofr, std::optional<int64_t> &cst,
+                                Value &dyn) {
+            if (Value v = ofr.dyn_cast<Value>())
+              dyn = v;
+            else if (auto ia =
+                         llvm::dyn_cast_or_null<IntegerAttr>(ofr.dyn_cast<Attribute>()))
+              cst = ia.getInt();
+          };
+          std::optional<int64_t> sLb, sUb, sSt;
+          Value dLb, dUb, dSt;
+          extractTerm((*lbs)[i], sLb, dLb);
+          extractTerm((*ubs)[i], sUb, dUb);
+          extractTerm((*steps)[i], sSt, dSt);
+          steppedRange = inferSteppedArgRange(bw, sLb, dLb, sUb, dUb, sSt, dSt,
+                                              ctx, solver, depth + 1);
+          break;
+        }
+      }
+    }
+    if (steppedRange) {
+      return latticeRange ? latticeRange->intersection(*steppedRange)
+                          : steppedRange;
+    }
+  }
+
+  return latticeRange;
+}
+} // namespace
+
+IntegerRangeContext::IntegerRangeContext(Operation *root) : rootOp(root) {
+  if (!root)
+    return;
+  DataFlowConfig cfg;
+  cfg.setInterprocedural(false);
+  solver = std::make_unique<DataFlowSolver>(cfg);
+  solver->load<dataflow::DeadCodeAnalysis>();
+  solver->load<dataflow::IntegerRangeAnalysis>();
+  succeeded = mlir::succeeded(solver->initializeAndRun(root));
+}
+
+IntegerRangeContext::~IntegerRangeContext() = default;
+
+std::optional<ConstantIntRanges>
+IntegerRangeContext::query(Value value) const {
+  return queryValueImpl(*this, value, solver.get(), 0);
 }
 
 namespace {
@@ -100,9 +294,6 @@ bool fitsSignedWidth(const ConstantIntRanges &r, unsigned bits,
   return lo.sge(minT) && hi.sle(maxT);
 }
 
-// Unsigned non-wrapping fit: must be non-negative in signed view AND within
-// unsigned (or signed-positive when `mustAlsoFitSignedPositive` is true) upper
-// bound so high bits above `bits` are provably zero before narrowing.
 bool fitsUnsignedWidth(const ConstantIntRanges &r, unsigned bits,
                        bool mustAlsoFitSignedPositive = false,
                        uint64_t scale = 1) {
@@ -129,16 +320,46 @@ bool rangeFitsOptions(const ConstantIntRanges &r,
                            /*mustAlsoFitSignedPositive=*/false, scale);
 }
 
+bool apIntervalFitsOptions(const APInt &lo, const APInt &hi,
+                           const AddressProofOptions &opts,
+                           bool checkNonNegative) {
+  unsigned calcW = lo.getBitWidth();
+  unsigned T = opts.targetBitwidth;
+  if (opts.isSigned) {
+    if (checkNonNegative && lo.isNegative())
+      return false;
+    APInt minT = APInt::getSignedMinValue(T).sext(calcW);
+    APInt maxT = APInt::getSignedMaxValue(T).sext(calcW);
+    return lo.sge(minT) && hi.sle(maxT);
+  }
+  if (lo.isNegative())
+    return false;
+  APInt maxU = APInt::getMaxValue(T).zext(calcW);
+  return hi.ule(maxU);
+}
+
 bool isCastOrTruncOp(Operation *op) {
   return llvm::isa<arith::IndexCastOp, arith::IndexCastUIOp, arith::TruncIOp>(
       op);
 }
-} // namespace
 
-AddressProof compilerinfra::proveNarrowAddress(
-    Operation *scopeRoot, llvm::ArrayRef<Value> addressValues,
-    const AddressProofOptions &options,
-    const IntegerRangeContext *existingRanges) {
+bool isStandardMemoryIndexingOp(Operation *op) {
+  if (!op)
+    return false;
+  if (llvm::isa<OffsetSizeAndStrideOpInterface>(op))
+    return true;
+  StringRef name = op->getName().getStringRef();
+  return name == "memref.load" || name == "memref.store" ||
+         name == "tensor.extract" || name == "tensor.insert" ||
+         name == "vector.load" || name == "vector.store" ||
+         name == "vector.maskedload" || name == "vector.maskedstore" ||
+         name == "vector.transfer_read" || name == "vector.transfer_write";
+}
+
+AddressProof proveNarrowRootsImpl(Operation *scopeRoot,
+                                  llvm::ArrayRef<Value> addressValues,
+                                  const AddressProofOptions &options,
+                                  const IntegerRangeContext *existingRanges) {
   AddressProof out;
   out.chosenBitwidth = options.fallbackBitwidth;
   if (!scopeRoot) {
@@ -151,7 +372,7 @@ AddressProof compilerinfra::proveNarrowAddress(
   }
 
   std::unique_ptr<IntegerRangeContext> localSolver;
-  if (!existingRanges) {
+  if (!contextCoversScope(existingRanges, scopeRoot)) {
     localSolver = std::make_unique<IntegerRangeContext>(scopeRoot);
     existingRanges = localSolver.get();
   }
@@ -183,8 +404,9 @@ AddressProof compilerinfra::proveNarrowAddress(
     }
   } else {
     scopeRoot->walk([&](Operation *op) {
-      bool memOrCast =
-          isCastOrTruncOp(op) || llvm::isa<MemoryEffectOpInterface>(op);
+      bool memOrCast = isCastOrTruncOp(op) ||
+                       llvm::isa<MemoryEffectOpInterface, AddressOpInterface>(op) ||
+                       isStandardMemoryIndexingOp(op);
       if (!memOrCast)
         return;
       for (Value v : op->getOperands())
@@ -227,19 +449,29 @@ AddressProof compilerinfra::proveNarrowAddress(
       return out;
     }
 
-    // Whitelist BlockArguments inside scopeRoot.
     if (auto barg = llvm::dyn_cast<BlockArgument>(cur)) {
       Region *parentReg = barg.getOwner()->getParent();
       Operation *parentOp = parentReg ? parentReg->getParentOp() : nullptr;
       if (!parentOp || !scopeRoot->isAncestor(parentOp)) {
-        // Entry argument of scopeRoot or outer dominating parameter: range
-        // already verified above.
         if (parentOp == scopeRoot && !barg.getOwner()->isEntryBlock()) {
           out.culpritValue = cur;
           out.reason = "non-entry CFG block argument is not whitelisted";
           return out;
         }
         continue;
+      }
+      if (auto idxReg = llvm::dyn_cast<IndexedRegionOpInterface>(parentOp)) {
+        RegionIndexBounds rb;
+        if (barg.getOwner()->isEntryBlock() && parentReg->hasOneBlock() &&
+            mlir::succeeded(idxReg.getRegionArgBounds(barg, rb))) {
+          if (rb.dynamicLower)
+            enqueue(rb.dynamicLower);
+          if (rb.dynamicUpperExclusive)
+            enqueue(rb.dynamicUpperExclusive);
+          if (rb.dynamicStep)
+            enqueue(rb.dynamicStep);
+          continue;
+        }
       }
       if (auto loop = llvm::dyn_cast<LoopLikeOpInterface>(parentOp)) {
         if (!barg.getOwner()->isEntryBlock() || !parentReg->hasOneBlock()) {
@@ -294,9 +526,17 @@ AddressProof compilerinfra::proveNarrowAddress(
     if (!def || !scopeRoot->isAncestor(def))
       continue;
 
-    // Strict op whitelist: only operations whose signed/unsigned semantics at
-    // narrowed width T are completely modeled are admitted.
-    if (llvm::isa<arith::ConstantOp>(def)) {
+    if (llvm::isa<arith::ConstantOp>(def))
+      continue;
+
+    StringRef defName = def->getName().getStringRef();
+    if (defName == "vector.step")
+      continue;
+    if ((defName == "vector.splat" || defName == "tensor.splat" ||
+         defName == "vector.broadcast") &&
+        def->getNumOperands() == 1 &&
+        isAddressScalarOrShapedInt(def->getOperand(0).getType())) {
+      enqueue(def->getOperand(0));
       continue;
     }
 
@@ -316,7 +556,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Signed/truncating casts: ExtSI, IndexCast, TruncI.
     if (llvm::isa<arith::ExtSIOp, arith::IndexCastOp, arith::TruncIOp>(def)) {
       Value src = def->getOperand(0);
       auto srcRng = existingRanges->query(src);
@@ -342,7 +581,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Unsigned casts: ExtUI, IndexCastUI.
     if (llvm::isa<arith::ExtUIOp, arith::IndexCastUIOp>(def)) {
       Value src = def->getOperand(0);
       auto srcRng = existingRanges->query(src);
@@ -366,7 +604,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Add / Sub / Mul (modeled separately for signed vs unsigned targets).
     if (llvm::isa<arith::AddIOp, arith::SubIOp, arith::MulIOp>(def)) {
       Value lhs = def->getOperand(0), rhs = def->getOperand(1);
       auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
@@ -436,7 +673,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Signed division, remainder, min, max.
     if (llvm::isa<arith::DivSIOp, arith::RemSIOp, arith::MinSIOp,
                   arith::MaxSIOp>(def)) {
       Value lhs = def->getOperand(0), rhs = def->getOperand(1);
@@ -475,8 +711,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Unsigned division, remainder, min, max (Audit v0.5.1 item 1: operands
-    // must fit UNSIGNED narrow width and be non-negative so high bits are 0!).
     if (llvm::isa<arith::DivUIOp, arith::RemUIOp, arith::MinUIOp,
                   arith::MaxUIOp>(def)) {
       Value lhs = def->getOperand(0), rhs = def->getOperand(1);
@@ -502,7 +736,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Shifts: ShLI, ShRSI, ShRUI.
     if (llvm::isa<arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp>(def)) {
       Value lhs = def->getOperand(0), rhs = def->getOperand(1);
       auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
@@ -583,7 +816,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Bitwise: AndI, OrI, XOrI.
     if (llvm::isa<arith::AndIOp, arith::OrIOp, arith::XOrIOp>(def)) {
       Value lhs = def->getOperand(0), rhs = def->getOperand(1);
       auto lhsR = existingRanges->query(lhs), rhsR = existingRanges->query(rhs);
@@ -599,8 +831,6 @@ AddressProof compilerinfra::proveNarrowAddress(
       continue;
     }
 
-    // Read-free InferIntRangeInterface metadata/symbol ops with zero dynamic
-    // integer operands (e.g. symbol constants or static/memref dim queries).
     if (llvm::isa<InferIntRangeInterface>(def)) {
       bool hasNonConstIntOperand = false;
       for (Value opnd : def->getOperands()) {
@@ -615,7 +845,6 @@ AddressProof compilerinfra::proveNarrowAddress(
         continue;
     }
 
-    // Default conservative rejection: any unmodeled operation is unproven.
     out.culpritOp = def;
     out.culpritValue = cur;
     out.reason = "operation not in narrow-address whitelist: " +
@@ -626,6 +855,244 @@ AddressProof compilerinfra::proveNarrowAddress(
   out.proven = true;
   out.chosenBitwidth = options.targetBitwidth;
   return out;
+}
+
+AddressProof verifyLinearCombinationFits(
+    Operation *op, Operation *scopeRoot, const LinearAddressDescriptor &desc,
+    const AddressProofOptions &options, const IntegerRangeContext &ranges) {
+  AddressProof out;
+  out.chosenBitwidth = options.fallbackBitwidth;
+  constexpr unsigned W = 192;
+
+  size_t n = desc.coordinates.size();
+  bool hasDynStrides = !desc.dynamicStrides.empty();
+  bool hasStaticStrides = !desc.staticStrides.empty();
+  if (n > 0 && ((hasDynStrides && desc.dynamicStrides.size() != n) ||
+                (hasStaticStrides && desc.staticStrides.size() != n) ||
+                (!hasDynStrides && !hasStaticStrides))) {
+    out.culpritOp = op;
+    out.reason = "linear address descriptor has mismatched coordinate/stride arity";
+    return out;
+  }
+
+  llvm::SmallVector<Value, 16> roots;
+  roots.append(desc.coordinates.begin(), desc.coordinates.end());
+  if (hasDynStrides)
+    roots.append(desc.dynamicStrides.begin(), desc.dynamicStrides.end());
+
+  if (!roots.empty()) {
+    AddressProofOptions unitOpts = options;
+    unitOpts.requireNonNegative = false;
+    unitOpts.elementByteScale = 1;
+    auto rootProof = proveNarrowRootsImpl(scopeRoot, roots, unitOpts, &ranges);
+    if (!rootProof.proven)
+      return rootProof;
+  }
+
+  AddressProofOptions termOpts = options;
+  termOpts.requireNonNegative = false;
+  termOpts.elementByteScale = 1;
+
+  APInt sumLo(W, desc.constantOffset, /*isSigned=*/true);
+  APInt sumHi(W, desc.constantOffset, /*isSigned=*/true);
+  if (!apIntervalFitsOptions(sumLo, sumHi, termOpts, false)) {
+    out.culpritOp = op;
+    out.reason = "constant address offset exceeds target narrow bitwidth";
+    return out;
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    Value cVal = desc.coordinates[i];
+    auto rc = ranges.query(cVal);
+    if (!rc) {
+      out.culpritOp = op;
+      out.culpritValue = cVal;
+      out.reason = "missing coordinate integer range";
+      return out;
+    }
+    APInt cLo = options.isSigned ? rc->smin().sext(W) : rc->umin().zext(W);
+    APInt cHi = options.isSigned ? rc->smax().sext(W) : rc->umax().zext(W);
+
+    APInt sLo(W, 0, true), sHi(W, 0, true);
+    if (hasDynStrides) {
+      auto rs = ranges.query(desc.dynamicStrides[i]);
+      if (!rs) {
+        out.culpritOp = op;
+        out.culpritValue = desc.dynamicStrides[i];
+        out.reason = "missing dynamic stride integer range";
+        return out;
+      }
+      sLo = options.isSigned ? rs->smin().sext(W) : rs->umin().zext(W);
+      sHi = options.isSigned ? rs->smax().sext(W) : rs->umax().zext(W);
+    } else {
+      if (desc.staticStrides[i] == ShapedType::kDynamic) {
+        out.culpritOp = op;
+        out.reason = "unresolved dynamic stride in container layout";
+        return out;
+      }
+      sLo = APInt(W, desc.staticStrides[i], /*isSigned=*/true);
+      sHi = sLo;
+    }
+    if (!apIntervalFitsOptions(sLo, sHi, termOpts, false)) {
+      out.culpritOp = op;
+      out.reason = "stride exceeds target narrow bitwidth";
+      return out;
+    }
+
+    APInt p1 = cLo * sLo, p2 = cLo * sHi, p3 = cHi * sLo, p4 = cHi * sHi;
+    APInt tLo = llvm::APIntOps::smin(llvm::APIntOps::smin(p1, p2),
+                                     llvm::APIntOps::smin(p3, p4));
+    APInt tHi = llvm::APIntOps::smax(llvm::APIntOps::smax(p1, p2),
+                                     llvm::APIntOps::smax(p3, p4));
+    if (!apIntervalFitsOptions(tLo, tHi, termOpts, false)) {
+      out.culpritOp = op;
+      out.culpritValue = cVal;
+      out.reason = "coordinate * stride product overflows narrow bitwidth";
+      return out;
+    }
+
+    sumLo += tLo;
+    sumHi += tHi;
+    if (!apIntervalFitsOptions(sumLo, sumHi, termOpts, false)) {
+      out.culpritOp = op;
+      out.culpritValue = cVal;
+      out.reason = "linear address sum overflows narrow bitwidth";
+      return out;
+    }
+  }
+
+  APInt scaleAP(W, options.elementByteScale == 0 ? 1 : options.elementByteScale,
+                /*isSigned=*/false);
+  APInt finalLo = sumLo * scaleAP;
+  APInt finalHi = sumHi * scaleAP;
+  if (!apIntervalFitsOptions(finalLo, finalHi, options,
+                             options.requireNonNegative)) {
+    out.culpritOp = op;
+    out.reason = "scaled linear address exceeds target narrow bitwidth";
+    return out;
+  }
+
+  out.proven = true;
+  out.chosenBitwidth = options.targetBitwidth;
+  return out;
+}
+} // namespace
+
+AddressProof compilerinfra::proveNarrowAddress(
+    Value addressValue, const AddressProofOptions &options,
+    const IntegerRangeContext *ranges) {
+  AddressProof out;
+  out.chosenBitwidth = options.fallbackBitwidth;
+  if (!addressValue) {
+    out.reason = "null addressValue";
+    return out;
+  }
+  if (Operation *def = addressValue.getDefiningOp()) {
+    if (llvm::isa<AddressOpInterface>(def))
+      return proveNarrowAddress(def, options, ranges);
+  }
+  Operation *scopeRoot = findEnclosingProofScope(addressValue);
+  if (!scopeRoot) {
+    out.culpritValue = addressValue;
+    out.reason = "unable to resolve enclosing scopeRoot from addressValue";
+    return out;
+  }
+  return proveNarrowRootsImpl(scopeRoot, {addressValue}, options, ranges);
+}
+
+AddressProof compilerinfra::proveNarrowAddress(
+    Operation *op, const AddressProofOptions &options,
+    const IntegerRangeContext *ranges) {
+  AddressProof out;
+  out.chosenBitwidth = options.fallbackBitwidth;
+  if (!op) {
+    out.reason = "null operation";
+    return out;
+  }
+  if (options.targetBitwidth == 0 || options.targetBitwidth > 64) {
+    out.reason = "invalid targetBitwidth";
+    return out;
+  }
+
+  Operation *scopeRoot = op->hasTrait<OpTrait::IsIsolatedFromAbove>()
+                             ? op
+                             : findEnclosingProofScope(op);
+  if (!scopeRoot) {
+    out.culpritOp = op;
+    out.reason = "unable to resolve enclosing scopeRoot";
+    return out;
+  }
+
+  std::unique_ptr<IntegerRangeContext> localSolver;
+  if (!contextCoversScope(ranges, scopeRoot)) {
+    localSolver = std::make_unique<IntegerRangeContext>(scopeRoot);
+    ranges = localSolver.get();
+  }
+  if (!ranges->valid()) {
+    out.reason = "IntegerRangeAnalysis failed to converge on scopeRoot";
+    return out;
+  }
+
+  if (auto addrOp = llvm::dyn_cast<AddressOpInterface>(op)) {
+    LinearAddressDescriptor desc;
+    if (mlir::failed(addrOp.getLinearAddress(desc))) {
+      out.culpritOp = op;
+      out.reason = "AddressOpInterface::getLinearAddress failed";
+      return out;
+    }
+    return verifyLinearCombinationFits(op, scopeRoot, desc, options, *ranges);
+  }
+
+  if (isStandardMemoryIndexingOp(op) || isCastOrTruncOp(op)) {
+    llvm::SmallVector<Value, 8> idxOperands;
+    Value memrefContainer;
+    for (Value v : op->getOperands()) {
+      if (!memrefContainer && llvm::isa<MemRefType>(v.getType()))
+        memrefContainer = v;
+      if (isAddressScalarOrShapedInt(v.getType()) &&
+          !leafScalarType(v.getType()).isInteger(1))
+        idxOperands.push_back(v);
+    }
+    if (auto mt = memrefContainer
+                      ? llvm::dyn_cast<MemRefType>(memrefContainer.getType())
+                      : MemRefType{};
+        mt && !llvm::isa<OffsetSizeAndStrideOpInterface>(op) &&
+        static_cast<size_t>(mt.getRank()) == idxOperands.size() &&
+        mt.getRank() > 0) {
+      int64_t memOff = 0;
+      llvm::SmallVector<int64_t, 4> memStrides;
+      if (mlir::succeeded(mt.getStridesAndOffset(memStrides, memOff)) &&
+          memOff != ShapedType::kDynamic &&
+          llvm::none_of(memStrides,
+                        [](int64_t s) { return s == ShapedType::kDynamic; })) {
+        LinearAddressDescriptor desc;
+        desc.baseContainer = memrefContainer;
+        desc.coordinates.assign(idxOperands.begin(), idxOperands.end());
+        desc.staticStrides.assign(memStrides.begin(), memStrides.end());
+        desc.constantOffset = memOff;
+        return verifyLinearCombinationFits(op, scopeRoot, desc, options,
+                                           *ranges);
+      }
+    }
+    return proveNarrowRootsImpl(scopeRoot, idxOperands, options, ranges);
+  }
+
+  if (op->hasTrait<OpTrait::IsIsolatedFromAbove>())
+    return proveNarrowRootsImpl(op, {}, options, ranges);
+
+  out.culpritOp = op;
+  out.reason = "operation does not implement AddressOpInterface or standard "
+               "MLIR memory indexing: " +
+               op->getName().getStringRef().str();
+  return out;
+}
+
+AddressProof compilerinfra::proveNarrowAddress(
+    Operation *scopeRoot, llvm::ArrayRef<Value> addressValues,
+    const AddressProofOptions &options,
+    const IntegerRangeContext *existingRanges) {
+  return proveNarrowRootsImpl(scopeRoot, addressValues, options,
+                              existingRanges);
 }
 
 namespace {
@@ -675,9 +1142,6 @@ bool collectOpReadEffects(Operation *root,
   return ok;
 }
 
-// Strict whitelist transitive read collection: non-entry CFG block arguments
-// (which may carry values loaded in predecessor blocks) are rejected as
-// unproven instead of being assumed immutable.
 bool collectTransitiveReads(Operation *firstOp, Operation *scopeOp,
                             llvm::SmallVectorImpl<Value> &locations,
                             llvm::SmallVectorImpl<Operation *> &readOps,
@@ -710,8 +1174,6 @@ bool collectTransitiveReads(Operation *firstOp, Operation *scopeOp,
     Region *parentReg = ownerBlk ? ownerBlk->getParent() : nullptr;
     Operation *parentOp = parentReg ? parentReg->getParentOp() : nullptr;
 
-    // Whitelist 1: Entry block parameter of the isolated enclosing function/op
-    // (has zero predecessors). Non-entry CFG block arguments are REJECTED!
     if (parentOp == scopeOp) {
       if (ownerBlk->isEntryBlock() &&
           scopeOp->hasTrait<OpTrait::IsIsolatedFromAbove>())
@@ -720,8 +1182,21 @@ bool collectTransitiveReads(Operation *firstOp, Operation *scopeOp,
       return false;
     }
 
-    // Whitelist 2: Single-block LoopLikeOpInterface induction / iter_args,
-    // tracing all incoming init/bound/step/yielded values recursively.
+    if (auto idxReg = llvm::dyn_cast_or_null<IndexedRegionOpInterface>(parentOp)) {
+      RegionIndexBounds rb;
+      if (scopeOp->isAncestor(parentOp) && ownerBlk->isEntryBlock() &&
+          parentReg->hasOneBlock() &&
+          mlir::succeeded(idxReg.getRegionArgBounds(barg, rb))) {
+        if (rb.dynamicLower && !enqueueVal(rb.dynamicLower))
+          return false;
+        if (rb.dynamicUpperExclusive && !enqueueVal(rb.dynamicUpperExclusive))
+          return false;
+        if (rb.dynamicStep && !enqueueVal(rb.dynamicStep))
+          return false;
+        return true;
+      }
+    }
+
     if (auto loop = llvm::dyn_cast_or_null<LoopLikeOpInterface>(parentOp)) {
       if (scopeOp->isAncestor(parentOp) && ownerBlk->isEntryBlock() &&
           parentReg->hasOneBlock()) {
@@ -888,7 +1363,7 @@ bool checkPathBetween(Operation *startOp, Operation *replayOp,
   if (startOp != startTop) {
     for (Operation *enc = commonRegion->getParentOp(); enc != nullptr;
          enc = enc->getParentOp()) {
-      if (llvm::isa<LoopLikeOpInterface>(enc)) {
+      if (llvm::isa<LoopLikeOpInterface, IndexedRegionOpInterface>(enc)) {
         if (!checkInterferenceOnOp(enc, locations, hasGlobalRead, aa, out))
           return false;
         break;
@@ -898,7 +1373,7 @@ bool checkPathBetween(Operation *startOp, Operation *replayOp,
 
   for (Operation *cur = startOp; cur != startTop; cur = cur->getParentOp()) {
     Operation *parent = cur->getParentOp();
-    if (llvm::isa<LoopLikeOpInterface>(parent) ||
+    if (llvm::isa<LoopLikeOpInterface, IndexedRegionOpInterface>(parent) ||
         !cur->getParentRegion()->hasOneBlock()) {
       if (!checkInterferenceOnOp(parent, locations, hasGlobalRead, aa, out))
         return false;
@@ -918,7 +1393,7 @@ bool checkPathBetween(Operation *startOp, Operation *replayOp,
 
   for (Operation *cur = replayOp; cur != replayTop; cur = cur->getParentOp()) {
     Operation *parent = cur->getParentOp();
-    if (llvm::isa<LoopLikeOpInterface>(parent) ||
+    if (llvm::isa<LoopLikeOpInterface, IndexedRegionOpInterface>(parent) ||
         !cur->getParentRegion()->hasOneBlock()) {
       if (!checkInterferenceOnOp(parent, locations, hasGlobalRead, aa, out))
         return false;
@@ -1021,16 +1496,6 @@ std::optional<SRange> resolveSignedBounds(std::optional<int64_t> cst, Value dyn,
   return SRange{r->smin().sext(W), r->smax().sext(W)};
 }
 
-std::optional<int64_t> matchScalarConstInt(Value v) {
-  if (!v)
-    return std::nullopt;
-  if (auto c = v.getDefiningOp<arith::ConstantOp>())
-    if (auto ia = llvm::dyn_cast<IntegerAttr>(c.getValue()))
-      if (ia.getValue().getSignificantBits() <= 64)
-        return ia.getValue().getSExtValue();
-  return std::nullopt;
-}
-
 bool opCannotWrapSigned(Operation *op, const IntegerRangeContext *ranges) {
   if (!ranges)
     return false;
@@ -1078,10 +1543,6 @@ bool opCannotWrapSigned(Operation *op, const IntegerRangeContext *ranges) {
   return wMin.sge(minT) && wMax.sle(maxT);
 }
 
-// Strict whitelist divisibility proof: models signed and unsigned casts
-// separately. Zero-extension (`extui` / `index_castui`) preserves divisibility
-// ONLY when the source value is proven non-negative (e.g. i8(-3) is divisible
-// by 3 as signed -3, whereas zero-extended 253 is NOT!).
 bool isProvenMultipleOf(Value v, int64_t align,
                         const IntegerRangeContext *ranges, unsigned depth = 0) {
   if (!v || align <= 0 || depth > 16)
@@ -1099,6 +1560,27 @@ bool isProvenMultipleOf(Value v, int64_t align,
       return false;
     Operation *parent =
         barg.getOwner()->getParent() ? barg.getOwner()->getParentOp() : nullptr;
+    if (auto idxReg = llvm::dyn_cast_or_null<IndexedRegionOpInterface>(parent)) {
+      RegionIndexBounds rb;
+      if (mlir::succeeded(idxReg.getRegionArgBounds(barg, rb))) {
+        bool lbOk = false, stOk = false;
+        if (rb.staticLower)
+          lbOk = *rb.staticLower >= 0 && (*rb.staticLower % align) == 0;
+        else if (rb.dynamicLower) {
+          auto lbR = ranges->query(rb.dynamicLower);
+          lbOk = lbR && !lbR->smin().isNegative() &&
+                 isProvenMultipleOf(rb.dynamicLower, align, ranges, depth + 1);
+        }
+        if (rb.staticStep)
+          stOk = *rb.staticStep > 0 && (*rb.staticStep % align) == 0;
+        else if (rb.dynamicStep) {
+          auto stR = ranges->query(rb.dynamicStep);
+          stOk = stR && stR->smin().sgt(0) &&
+                 isProvenMultipleOf(rb.dynamicStep, align, ranges, depth + 1);
+        }
+        return lbOk && stOk;
+      }
+    }
     if (auto loop = llvm::dyn_cast_or_null<LoopLikeOpInterface>(parent)) {
       auto ivs = loop.getLoopInductionVars();
       auto lbs = loop.getLoopLowerBounds();
@@ -1181,8 +1663,6 @@ bool isProvenMultipleOf(Value v, int64_t align,
     if (srcW == 0 || dstW == 0)
       return false;
     auto sr = ranges->query(src);
-    // Zero-extension only preserves the signed integer value (and therefore
-    // signed divisibility) when `src` is proven non-negative and non-wrapping!
     if (!sr ||
         !fitsUnsignedWidth(*sr, std::min(srcW, dstW),
                            /*mustAlsoFitSignedPositive=*/true, 1))
@@ -1259,32 +1739,61 @@ std::optional<int64_t> matchSplatConstInt(Value v, int64_t expectedLen) {
   return std::nullopt;
 }
 
-bool matchRampVector(Value v, int64_t tileSize, int64_t baseOffset,
-                     int64_t step) {
+bool extractRampParameters(Value v, int64_t expectedLen, int64_t &baseOut,
+                           int64_t &stepOut) {
   auto st = llvm::dyn_cast<ShapedType>(v.getType());
-  if (!st || st.getRank() != 1 || st.getDimSize(0) != tileSize)
+  if (!st || st.getRank() != 1 || st.getDimSize(0) != expectedLen ||
+      expectedLen <= 0)
     return false;
   Operation *def = v.getDefiningOp();
   if (!def)
     return false;
-  if (baseOffset == 0 && step == 1 &&
-      def->getName().getStringRef() == "vector.step")
+  if (def->getName().getStringRef() == "vector.step") {
+    baseOut = 0;
+    stepOut = 1;
     return true;
+  }
   if (auto c = llvm::dyn_cast<arith::ConstantOp>(def)) {
     if (auto dense = llvm::dyn_cast<DenseIntElementsAttr>(c.getValue())) {
-      if (dense.getNumElements() != tileSize)
+      if (dense.getNumElements() != expectedLen)
         return false;
+      auto vals = dense.getValues<APInt>();
+      auto it = vals.begin();
+      if ((*it).getSignificantBits() > 64)
+        return false;
+      int64_t first = (*it).getSExtValue();
+      if (expectedLen == 1) {
+        baseOut = first;
+        stepOut = 1;
+        return true;
+      }
+      ++it;
+      if ((*it).getSignificantBits() > 64)
+        return false;
+      int64_t second = (*it).getSExtValue();
+      if (second <= first)
+        return false;
+      int64_t step = second - first;
       int64_t idx = 0;
-      for (const APInt &elem : dense.getValues<APInt>()) {
+      for (const APInt &elem : vals) {
         if (elem.getSignificantBits() > 64 ||
-            elem.getSExtValue() != baseOffset + idx * step)
+            elem.getSExtValue() != first + idx * step)
           return false;
         ++idx;
       }
+      baseOut = first;
+      stepOut = step;
       return true;
     }
   }
   return false;
+}
+
+bool matchRampVector(Value v, int64_t tileSize, int64_t baseOffset,
+                     int64_t step) {
+  int64_t b = 0, s = 0;
+  return extractRampParameters(v, tileSize, b, s) && b == baseOffset &&
+         s == step;
 }
 
 bool matchLaneCoordinates(Value coordVal, const TailDimension &d) {
@@ -1349,8 +1858,6 @@ bool matchExtentBound(Value boundVal, const TailDimension &d) {
   return false;
 }
 
-// Verify that `pred` masks out every out-of-bounds lane without wrapping in the
-// actual lane coordinate storage bitwidth `coordBits` (e.g. narrow i8/i16/i32).
 bool verifyMaskPredicate(Value pred, const TailDimension &d,
                          const APInt &maxCoord128,
                          const std::optional<SRange> &extB,
@@ -1406,8 +1913,6 @@ bool verifyMaskPredicate(Value pred, const TailDimension &d,
     return false;
   }
 
-  // Audit v0.5.1 item 3b: check non-wrapping in the ACTUAL lane coordinate
-  // element bitwidth (not just i64!), separately for signed vs unsigned cmpi!
   unsigned coordBits =
       ConstantIntRanges::getStorageBitwidth(leafScalarType(coordVal.getType()));
   if (coordBits == 0 || coordBits > 64 || !extB || extB->lo.isNegative())
@@ -1425,11 +1930,9 @@ bool verifyMaskPredicate(Value pred, const TailDimension &d,
 
   return matchLaneCoordinates(coordVal, d) && matchExtentBound(boundVal, d);
 }
-} // namespace
 
-TailProof
-compilerinfra::proveTailAccess(llvm::ArrayRef<TailDimension> dimensions,
-                               const IntegerRangeContext *ranges) {
+TailProof proveTailDimensionsImpl(llvm::ArrayRef<TailDimension> dimensions,
+                                  const IntegerRangeContext *ranges) {
   TailProof out;
   if (dimensions.empty()) {
     out.reason = "no tail dimensions supplied";
@@ -1465,8 +1968,8 @@ compilerinfra::proveTailAccess(llvm::ArrayRef<TailDimension> dimensions,
         kind = TailKind::ExactInBounds;
       } else if (d.staticExtent && d.step == 1 &&
                  *d.staticExtent >= d.tileSize &&
-                 (*d.staticExtent % d.tileSize == 0) && d.tileAlignment &&
-                 *d.tileAlignment == d.tileSize &&
+                 (*d.staticExtent % d.tileSize == 0) &&
+                 (!d.tileAlignment || *d.tileAlignment == d.tileSize) &&
                  verifyOffsetAlignment(d, d.tileSize, ranges) &&
                  offB->hi.slt(APInt(W, *d.staticExtent, true))) {
         kind = TailKind::ExactInBounds;
@@ -1501,4 +2004,612 @@ compilerinfra::proveTailAccess(llvm::ArrayRef<TailDimension> dimensions,
   out.fallback =
       out.proven ? TailFallback::None : TailFallback::RequireMaskOrScalarTail;
   return out;
+}
+
+void resolveContainerExtentFromIR(Value container, unsigned dim,
+                                  std::optional<int64_t> &staticExtent,
+                                  Value &dynamicExtent) {
+  if (staticExtent || dynamicExtent || !container)
+    return;
+  auto st = llvm::dyn_cast<ShapedType>(container.getType());
+  if (!st || dim >= static_cast<unsigned>(st.getRank()))
+    return;
+  if (!st.isDynamicDim(dim)) {
+    staticExtent = st.getDimSize(dim);
+    return;
+  }
+  if (Operation *def = container.getDefiningOp()) {
+    StringRef n = def->getName().getStringRef();
+    if (n == "memref.alloc" || n == "memref.alloca" || n == "tensor.empty") {
+      unsigned dynIdx = 0;
+      for (unsigned d = 0; d < dim; ++d)
+        if (st.isDynamicDim(d))
+          ++dynIdx;
+      if (dynIdx < def->getNumOperands()) {
+        dynamicExtent = def->getOperand(dynIdx);
+        return;
+      }
+    }
+  }
+  for (Operation *user : container.getUsers()) {
+    StringRef un = user->getName().getStringRef();
+    if ((un == "memref.dim" || un == "tensor.dim") &&
+        user->getNumOperands() == 2 && user->getOperand(0) == container) {
+      if (auto c = matchScalarConstInt(user->getOperand(1));
+          c && *c == static_cast<int64_t>(dim)) {
+        dynamicExtent = user->getResult(0);
+        return;
+      }
+    }
+  }
+}
+
+bool convertAccessAxisToTailDim(const AccessAxis &ax, TailDimension &out,
+                                const IntegerRangeContext *ranges,
+                                std::string &err) {
+  out = TailDimension{};
+  out.staticExtent = ax.staticExtent;
+  out.dynamicExtent = ax.dynamicExtent;
+  resolveContainerExtentFromIR(ax.container, ax.containerDim, out.staticExtent,
+                               out.dynamicExtent);
+  out.paddedCapacity = ax.paddedCapacity;
+  if (ax.maskPredicate) {
+    out.hasExplicitMask = true;
+    out.maskPredicate = ax.maskPredicate;
+  }
+
+  if (ax.entireAxisFromZero && !ax.coord) {
+    out.staticOffset = 0;
+    if (ax.tileSize > 0)
+      out.tileSize = ax.tileSize;
+    else if (out.staticExtent && *out.staticExtent > 0)
+      out.tileSize = *out.staticExtent;
+    else {
+      err = "entireAxisFromZero axis has non-positive or unknown tileSize";
+      return false;
+    }
+    out.step = ax.step;
+    return true;
+  }
+
+  if (!ax.coord) {
+    err = "AccessAxis requires a non-null IR coordinate Value";
+    return false;
+  }
+
+  if (auto st = llvm::dyn_cast<ShapedType>(ax.coord.getType())) {
+    if (st.getRank() != 1 || st.getDimSize(0) <= 0 ||
+        !llvm::isa<IntegerType, IndexType>(st.getElementType())) {
+      err = "shaped coordinate Value must be a static 1D integer/index vector "
+            "or tensor";
+      return false;
+    }
+    int64_t len = st.getDimSize(0);
+    int64_t rampBase = 0, rampStep = 0;
+    if (extractRampParameters(ax.coord, len, rampBase, rampStep)) {
+      out.staticOffset = rampBase;
+      out.tileSize = len;
+      out.step = rampStep;
+      return true;
+    }
+    if (Value splatSrc = matchSplatScalar(ax.coord, len)) {
+      if (auto c = matchScalarConstInt(splatSrc))
+        out.staticOffset = *c;
+      else
+        out.dynamicOffset = splatSrc;
+      out.tileSize = 1;
+      out.step = 1;
+      return true;
+    }
+    if (auto add = ax.coord.getDefiningOp<arith::AddIOp>()) {
+      for (int side : {0, 1}) {
+        Value baseVec = add->getOperand(side);
+        Value rampVec = add->getOperand(1 - side);
+        if (!extractRampParameters(rampVec, len, rampBase, rampStep) ||
+            rampBase != 0)
+          continue;
+        if (Value splatSrc = matchSplatScalar(baseVec, len)) {
+          if (auto c = matchScalarConstInt(splatSrc))
+            out.staticOffset = *c;
+          else
+            out.dynamicOffset = splatSrc;
+          out.tileSize = len;
+          out.step = rampStep;
+          return true;
+        }
+        if (auto cst = matchSplatConstInt(baseVec, len)) {
+          out.staticOffset = *cst;
+          out.tileSize = len;
+          out.step = rampStep;
+          return true;
+        }
+      }
+    }
+    // General 1D vector coordinate fallback: sound ONLY for unmasked in-bounds
+    // range checks (`rng.smin >= 0 && rng.smax < extent`).
+    if (!ax.maskPredicate && ranges) {
+      out.dynamicOffset = ax.coord;
+      out.tileSize = 1;
+      out.step = 1;
+      return true;
+    }
+    err = "unable to decompose shaped lane coordinate into base + ramp";
+    return false;
+  }
+
+  if (!llvm::isa<IntegerType, IndexType>(ax.coord.getType())) {
+    err = "coordinate Value is neither scalar nor 1D shaped integer/index";
+    return false;
+  }
+  if (auto c = matchScalarConstInt(ax.coord))
+    out.staticOffset = *c;
+  else
+    out.dynamicOffset = ax.coord;
+  out.tileSize = ax.tileSize;
+  out.step = ax.step;
+  return true;
+}
+
+bool extractStandardAccessAxes(Operation *op,
+                               llvm::SmallVectorImpl<AccessAxis> &axes,
+                               const IntegerRangeContext *ranges,
+                               std::string &err) {
+  if (auto oss = llvm::dyn_cast<OffsetSizeAndStrideOpInterface>(op)) {
+    StringRef opName = op->getName().getStringRef();
+    Value container;
+    if (opName == "tensor.insert_slice" ||
+        opName == "tensor.parallel_insert_slice") {
+      if (op->getNumOperands() >= 2)
+        container = op->getOperand(1);
+    } else if (op->getNumOperands() >= 1) {
+      container = op->getOperand(0);
+    }
+    auto st = container ? llvm::dyn_cast<ShapedType>(container.getType())
+                        : ShapedType{};
+    auto offsets = oss.getMixedOffsets();
+    auto sizes = oss.getMixedSizes();
+    auto strides = oss.getMixedStrides();
+    if (!st || offsets.size() != static_cast<size_t>(st.getRank()) ||
+        sizes.size() != offsets.size() || strides.size() != offsets.size()) {
+      err = "OffsetSizeAndStrideOpInterface rank mismatch on container";
+      return false;
+    }
+    for (size_t d = 0; d < offsets.size(); ++d) {
+      AccessAxis ax;
+      ax.container = container;
+      ax.containerDim = static_cast<unsigned>(d);
+      if (llvm::isa<Value>(offsets[d])) {
+        ax.coord = llvm::cast<Value>(offsets[d]);
+      } else if (auto ia = llvm::dyn_cast_or_null<IntegerAttr>(
+                     llvm::isa<Attribute>(offsets[d])
+                         ? llvm::cast<Attribute>(offsets[d])
+                         : Attribute{})) {
+        if (ia.getInt() == 0 && llvm::isa<Attribute>(sizes[d]) &&
+            !st.isDynamicDim(d) &&
+            llvm::cast<IntegerAttr>(llvm::cast<Attribute>(sizes[d])).getInt() ==
+                st.getDimSize(d)) {
+          ax.entireAxisFromZero = true;
+        } else if (ia.getInt() == 0) {
+          ax.entireAxisFromZero = true;
+        } else {
+          // Non-zero attribute offset on OffsetSizeAndStrideOpInterface:
+          // materialize directly via TailDimension in caller below!
+          err = "__use_oss_direct__";
+          return false;
+        }
+      } else {
+        err = "unsupported mixed offset on OffsetSizeAndStrideOpInterface";
+        return false;
+      }
+
+      if (auto szAttr = llvm::dyn_cast_or_null<IntegerAttr>(
+              llvm::isa<Attribute>(sizes[d]) ? llvm::cast<Attribute>(sizes[d])
+                                             : Attribute{})) {
+        ax.tileSize = szAttr.getInt();
+      } else if (llvm::isa<Value>(sizes[d])) {
+        Value szV = llvm::cast<Value>(sizes[d]);
+        if (!ranges) {
+          err = "dynamic slice size requires IntegerRangeContext";
+          return false;
+        }
+        auto sr = ranges->query(szV);
+        if (!sr || sr->smin().sle(0) || sr->smax().getSignificantBits() > 62) {
+          err = "dynamic slice size is non-positive or unbounded";
+          return false;
+        }
+        ax.tileSize = sr->smax().getSExtValue();
+      }
+
+      if (auto stAttr = llvm::dyn_cast_or_null<IntegerAttr>(
+              llvm::isa<Attribute>(strides[d])
+                  ? llvm::cast<Attribute>(strides[d])
+                  : Attribute{})) {
+        ax.step = stAttr.getInt();
+      } else if (llvm::isa<Value>(strides[d])) {
+        Value stV = llvm::cast<Value>(strides[d]);
+        auto c = matchScalarConstInt(stV);
+        if (!c || *c <= 0) {
+          err = "dynamic non-constant slice stride cannot be proven";
+          return false;
+        }
+        ax.step = *c;
+      }
+      axes.push_back(ax);
+    }
+    return true;
+  }
+
+  StringRef name = op->getName().getStringRef();
+  if (name == "memref.load" || name == "tensor.extract") {
+    if (op->getNumOperands() < 1)
+      return false;
+    Value base = op->getOperand(0);
+    auto st = llvm::dyn_cast<ShapedType>(base.getType());
+    auto indices = op->getOperands().drop_front(1);
+    if (!st || indices.size() != static_cast<size_t>(st.getRank())) {
+      err = "scalar load/extract rank mismatch";
+      return false;
+    }
+    for (auto [d, idxV] : llvm::enumerate(indices)) {
+      AccessAxis ax;
+      ax.container = base;
+      ax.containerDim = static_cast<unsigned>(d);
+      ax.coord = idxV;
+      ax.tileSize = 1;
+      ax.step = 1;
+      axes.push_back(ax);
+    }
+    return true;
+  }
+
+  if (name == "memref.store" || name == "tensor.insert") {
+    if (op->getNumOperands() < 2)
+      return false;
+    Value base = op->getOperand(1);
+    auto st = llvm::dyn_cast<ShapedType>(base.getType());
+    auto indices = op->getOperands().drop_front(2);
+    if (!st || indices.size() != static_cast<size_t>(st.getRank())) {
+      err = "scalar store/insert rank mismatch";
+      return false;
+    }
+    for (auto [d, idxV] : llvm::enumerate(indices)) {
+      AccessAxis ax;
+      ax.container = base;
+      ax.containerDim = static_cast<unsigned>(d);
+      ax.coord = idxV;
+      ax.tileSize = 1;
+      ax.step = 1;
+      axes.push_back(ax);
+    }
+    return true;
+  }
+
+  if (name == "vector.load" || name == "vector.store" ||
+      name == "vector.maskedload" || name == "vector.maskedstore") {
+    bool isStore = (name == "vector.store");
+    Value base = op->getOperand(isStore ? 1 : 0);
+    auto st = llvm::dyn_cast<ShapedType>(base.getType());
+    Type vecTyRaw = (name == "vector.load" || name == "vector.maskedload")
+                        ? op->getResult(0).getType()
+                        : (name == "vector.store"
+                               ? op->getOperand(0).getType()
+                               : op->getOperand(op->getNumOperands() - 1).getType());
+    auto vt = llvm::dyn_cast<VectorType>(vecTyRaw);
+    if (!st || !vt || vt.isScalable() || vt.getRank() > st.getRank()) {
+      err = "unsupported or scalable vector load/store type";
+      return false;
+    }
+    unsigned rank = static_cast<unsigned>(st.getRank());
+    unsigned idxStart = isStore ? 2 : 1;
+    if (op->getNumOperands() < idxStart + rank) {
+      err = "vector load/store operand count mismatch";
+      return false;
+    }
+    Value mask;
+    if (name == "vector.maskedload" || name == "vector.maskedstore") {
+      if (vt.getRank() != 1) {
+        err = "multi-dimensional maskedload/maskedstore not modeled";
+        return false;
+      }
+      mask = op->getOperand(idxStart + rank);
+    }
+    unsigned vecOffset = rank - static_cast<unsigned>(vt.getRank());
+    for (unsigned d = 0; d < rank; ++d) {
+      AccessAxis ax;
+      ax.container = base;
+      ax.containerDim = d;
+      ax.coord = op->getOperand(idxStart + d);
+      ax.tileSize = (d >= vecOffset) ? vt.getDimSize(d - vecOffset) : 1;
+      ax.step = 1;
+      if (mask && d == rank - 1)
+        ax.maskPredicate = mask;
+      axes.push_back(ax);
+    }
+    return true;
+  }
+
+  if (name == "vector.transfer_read" || name == "vector.transfer_write") {
+    bool isWrite = (name == "vector.transfer_write");
+    Value base = op->getOperand(isWrite ? 1 : 0);
+    auto st = llvm::dyn_cast<ShapedType>(base.getType());
+    auto vt = llvm::dyn_cast<VectorType>(
+        isWrite ? op->getOperand(0).getType() : op->getResult(0).getType());
+    auto permAttr = op->getAttrOfType<AffineMapAttr>("permutation_map");
+    if (!st || !vt || vt.isScalable() || !permAttr) {
+      err = "unsupported vector.transfer_read/write type or permutation_map";
+      return false;
+    }
+    unsigned rank = static_cast<unsigned>(st.getRank());
+    unsigned idxStart = isWrite ? 2 : 1;
+    if (op->getNumOperands() < idxStart + rank) {
+      err = "vector.transfer operand count mismatch";
+      return false;
+    }
+    Value mask;
+    unsigned maskPos = isWrite ? (2 + rank) : (2 + rank);
+    if (auto segs = op->getAttrOfType<DenseI32ArrayAttr>("operandSegmentSizes")) {
+      if (segs.size() >= 4 && segs[isWrite ? 3 : 3] == 1 &&
+          maskPos < op->getNumOperands())
+        mask = op->getOperand(maskPos);
+    }
+    llvm::SmallVector<int64_t, 4> axisTile(rank, 1);
+    AffineMap pm = permAttr.getValue();
+    for (unsigned r = 0; r < pm.getNumResults(); ++r) {
+      AffineExpr expr = pm.getResult(r);
+      if (auto dimExpr = llvm::dyn_cast<AffineDimExpr>(expr)) {
+        unsigned d = dimExpr.getPosition();
+        if (d >= rank) {
+          err = "invalid permutation_map dim index";
+          return false;
+        }
+        axisTile[d] = std::max<int64_t>(axisTile[d], vt.getDimSize(r));
+      } else if (auto cstExpr = llvm::dyn_cast<AffineConstantExpr>(expr)) {
+        if (cstExpr.getValue() != 0) {
+          err = "unsupported non-zero constant in permutation_map";
+          return false;
+        }
+      } else {
+        err = "non-projected permutation_map in vector.transfer";
+        return false;
+      }
+    }
+    if (mask && vt.getRank() != 1) {
+      err = "multi-dimensional masked vector.transfer not modeled";
+      return false;
+    }
+    for (unsigned d = 0; d < rank; ++d) {
+      AccessAxis ax;
+      ax.container = base;
+      ax.containerDim = d;
+      ax.coord = op->getOperand(idxStart + d);
+      ax.tileSize = axisTile[d];
+      ax.step = 1;
+      if (mask && pm.getNumResults() == 1 &&
+          llvm::isa<AffineDimExpr>(pm.getResult(0)) &&
+          llvm::cast<AffineDimExpr>(pm.getResult(0)).getPosition() == d)
+        ax.maskPredicate = mask;
+      axes.push_back(ax);
+    }
+    return true;
+  }
+
+  err = "operation does not implement TiledAccessOpInterface or standard MLIR "
+        "memory/slice access: " +
+        name.str();
+  return false;
+}
+
+bool extractOssDirectTailDims(OffsetSizeAndStrideOpInterface oss,
+                              llvm::SmallVectorImpl<TailDimension> &dims,
+                              const IntegerRangeContext *ranges,
+                              std::string &err) {
+  Operation *op = oss.getOperation();
+  StringRef opName = op->getName().getStringRef();
+  Value container = (opName == "tensor.insert_slice" ||
+                     opName == "tensor.parallel_insert_slice")
+                        ? op->getOperand(1)
+                        : op->getOperand(0);
+  auto st = llvm::dyn_cast<ShapedType>(container.getType());
+  auto offsets = oss.getMixedOffsets();
+  auto sizes = oss.getMixedSizes();
+  auto strides = oss.getMixedStrides();
+  if (!st || offsets.size() != static_cast<size_t>(st.getRank())) {
+    err = "OffsetSizeAndStrideOpInterface rank mismatch";
+    return false;
+  }
+  for (size_t d = 0; d < offsets.size(); ++d) {
+    TailDimension td;
+    resolveContainerExtentFromIR(container, static_cast<unsigned>(d),
+                                 td.staticExtent, td.dynamicExtent);
+    if (llvm::isa<Value>(offsets[d])) {
+      Value offV = llvm::cast<Value>(offsets[d]);
+      if (auto c = matchScalarConstInt(offV))
+        td.staticOffset = *c;
+      else
+        td.dynamicOffset = offV;
+    } else if (auto ia = llvm::dyn_cast_or_null<IntegerAttr>(
+                   llvm::isa<Attribute>(offsets[d])
+                       ? llvm::cast<Attribute>(offsets[d])
+                       : Attribute{})) {
+      td.staticOffset = ia.getInt();
+    } else {
+      err = "unsupported offset on OffsetSizeAndStrideOpInterface";
+      return false;
+    }
+
+    if (auto szAttr = llvm::dyn_cast_or_null<IntegerAttr>(
+            llvm::isa<Attribute>(sizes[d]) ? llvm::cast<Attribute>(sizes[d])
+                                           : Attribute{})) {
+      td.tileSize = szAttr.getInt();
+    } else if (llvm::isa<Value>(sizes[d])) {
+      Value szV = llvm::cast<Value>(sizes[d]);
+      if (!ranges) {
+        err = "dynamic slice size requires IntegerRangeContext";
+        return false;
+      }
+      auto sr = ranges->query(szV);
+      if (!sr || sr->smin().sle(0) || sr->smax().getSignificantBits() > 62) {
+        err = "dynamic slice size is non-positive or unbounded";
+        return false;
+      }
+      td.tileSize = sr->smax().getSExtValue();
+    }
+
+    if (auto stAttr = llvm::dyn_cast_or_null<IntegerAttr>(
+            llvm::isa<Attribute>(strides[d]) ? llvm::cast<Attribute>(strides[d])
+                                             : Attribute{})) {
+      td.step = stAttr.getInt();
+    } else if (llvm::isa<Value>(strides[d])) {
+      Value stV = llvm::cast<Value>(strides[d]);
+      auto c = matchScalarConstInt(stV);
+      if (!c || *c <= 0) {
+        err = "dynamic non-constant slice stride cannot be proven";
+        return false;
+      }
+      td.step = *c;
+    }
+    dims.push_back(td);
+  }
+  return true;
+}
+} // namespace
+
+TailProof compilerinfra::proveTailAccess(Operation *accessOp,
+                                         const IntegerRangeContext *ranges) {
+  TailProof out;
+  if (!accessOp) {
+    out.reason = "null accessOp";
+    return out;
+  }
+  Operation *scopeRoot = findEnclosingProofScope(accessOp);
+  std::unique_ptr<IntegerRangeContext> localSolver;
+  if (!contextCoversScope(ranges, scopeRoot)) {
+    localSolver = std::make_unique<IntegerRangeContext>(scopeRoot);
+    ranges = localSolver.get();
+  }
+  if (!ranges || !ranges->valid()) {
+    out.reason = "IntegerRangeAnalysis failed to converge on enclosing scope";
+    return out;
+  }
+
+  llvm::SmallVector<TailDimension, 4> dims;
+  if (auto tiled = llvm::dyn_cast<TiledAccessOpInterface>(accessOp)) {
+    llvm::SmallVector<AccessAxis, 4> axes;
+    if (mlir::failed(tiled.getAccessedAxes(axes)) || axes.empty()) {
+      out.reason = "TiledAccessOpInterface::getAccessedAxes failed or empty";
+      return out;
+    }
+    for (const auto &ax : axes) {
+      TailDimension td;
+      if (!convertAccessAxisToTailDim(ax, td, ranges, out.reason))
+        return out;
+      dims.push_back(td);
+    }
+    return proveTailDimensionsImpl(dims, ranges);
+  }
+
+  llvm::SmallVector<AccessAxis, 4> stdAxes;
+  std::string err;
+  if (!extractStandardAccessAxes(accessOp, stdAxes, ranges, err)) {
+    if (err == "__use_oss_direct__") {
+      if (!extractOssDirectTailDims(
+              llvm::cast<OffsetSizeAndStrideOpInterface>(accessOp), dims,
+              ranges, out.reason))
+        return out;
+      return proveTailDimensionsImpl(dims, ranges);
+    }
+    out.reason = std::move(err);
+    return out;
+  }
+  for (const auto &ax : stdAxes) {
+    TailDimension td;
+    if (!convertAccessAxisToTailDim(ax, td, ranges, out.reason))
+      return out;
+    dims.push_back(td);
+  }
+  return proveTailDimensionsImpl(dims, ranges);
+}
+
+TailProof compilerinfra::proveTailAccess(Value addressOrSliceValue,
+                                         const IntegerRangeContext *ranges) {
+  TailProof out;
+  if (!addressOrSliceValue) {
+    out.reason = "null addressOrSliceValue";
+    return out;
+  }
+  Operation *def = addressOrSliceValue.getDefiningOp();
+  if (!def ||
+      !llvm::isa<TiledAccessOpInterface, OffsetSizeAndStrideOpInterface>(def)) {
+    out.reason = "value defining op does not implement TiledAccessOpInterface "
+                 "or OffsetSizeAndStrideOpInterface; pass the access Operation* "
+                 "or (container, coordinates)";
+    return out;
+  }
+  return proveTailAccess(def, ranges);
+}
+
+TailProof compilerinfra::proveTailAccess(Value container,
+                                         llvm::ArrayRef<Value> coordinates,
+                                         Value maskPredicate,
+                                         const IntegerRangeContext *ranges) {
+  TailProof out;
+  if (!container || coordinates.empty()) {
+    out.reason = "null container or empty coordinates";
+    return out;
+  }
+  auto st = llvm::dyn_cast<ShapedType>(container.getType());
+  if (!st || coordinates.size() != static_cast<size_t>(st.getRank())) {
+    out.reason = "container is not a ShapedType or coordinate rank mismatches";
+    return out;
+  }
+
+  Operation *scopeRoot = nullptr;
+  for (Value c : coordinates) {
+    if (c && c.getDefiningOp()) {
+      scopeRoot = findEnclosingProofScope(c);
+      break;
+    }
+  }
+  if (!scopeRoot && maskPredicate && maskPredicate.getDefiningOp())
+    scopeRoot = findEnclosingProofScope(maskPredicate);
+  if (!scopeRoot)
+    scopeRoot = findEnclosingProofScope(container);
+
+  std::unique_ptr<IntegerRangeContext> localSolver;
+  if (!contextCoversScope(ranges, scopeRoot)) {
+    localSolver = std::make_unique<IntegerRangeContext>(scopeRoot);
+    ranges = localSolver.get();
+  }
+  if (!ranges || !ranges->valid()) {
+    out.reason = "IntegerRangeAnalysis failed to converge on enclosing scope";
+    return out;
+  }
+
+  bool maskAssigned = false;
+  llvm::SmallVector<TailDimension, 4> dims;
+  for (unsigned d = 0; d < static_cast<unsigned>(st.getRank()); ++d) {
+    AccessAxis ax;
+    ax.container = container;
+    ax.containerDim = d;
+    ax.coord = coordinates[d];
+    if (maskPredicate &&
+        (st.getRank() == 1 || llvm::isa<ShapedType>(coordinates[d].getType()))) {
+      ax.maskPredicate = maskPredicate;
+      maskAssigned = true;
+    }
+    TailDimension td;
+    if (!convertAccessAxisToTailDim(ax, td, ranges, out.reason))
+      return out;
+    dims.push_back(td);
+  }
+  if (maskPredicate && !maskAssigned) {
+    out.reason = "maskPredicate could not be associated with a unique lane axis";
+    return out;
+  }
+  return proveTailDimensionsImpl(dims, ranges);
+}
+
+TailProof compilerinfra::proveTailAccess(llvm::ArrayRef<TailDimension> dimensions,
+                                         const IntegerRangeContext *ranges) {
+  return proveTailDimensionsImpl(dimensions, ranges);
 }
