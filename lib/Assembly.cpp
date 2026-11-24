@@ -78,7 +78,8 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
   }
   if (u.exit) {
     if (owner != "exits/" + node || u.id != field(*n, "unit") ||
-        bool(u.exit->value.emit) == bool(u.exit->value.terminal))
+        !u.exit->value.terminal.package ||
+        u.exit->value.terminal.operations.empty())
       return createStringError(u.id + ": invalid exit implementation");
     auto at = field(*manifest.getObject("exits")->getObject(node), "at");
     if (auto e = c.record(owner, u.id, at, "exit", u.exit->source))
@@ -536,7 +537,6 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       if (!c.exits.count(name))
         return createStringError("missing emitter for " + name);
       auto &implementation = c.exits.at(name)->value;
-      (*status)["emission"] = implementation.terminal ? "recursive" : "legacy";
       auto overrides = settings(config, "exits", name);
       auto profile = std::make_shared<TargetProfile>();
       profile->name = name;
@@ -612,39 +612,32 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       }
       Exit t;
       t.name = name;
-      t.emit = implementation.emit;
       t.dependencies = profile->dependencies;
-      if (implementation.terminal) {
-        auto printer = *implementation.terminal;
-        if (!printer.package || printer.operations.empty() ||
-            llvm::any_of(printer.operations, [](const auto &p) {
-              return p.first.empty() || !p.second;
-            }))
-          return createStringError(name + ": incomplete terminal printer");
-        for (auto &op : profile->implementationOps)
-          if (!printer.operations.count(op))
-            return createStringError(name + ": no print rule for " + op);
-        for (auto &[key, contract] : profile->implementations) {
-          if (contract.source != ImplementationSource::Runtime)
-            continue;
-          auto *runtime = manifest.getObject("runtimes");
-          auto owner = runtime->getString(name);
-          auto *files = manifest.getObject("kernel_sources");
-          auto text =
-              files ? files->getString(contract.resource) : std::nullopt;
-          if (!owner ||
-              !llvm::StringRef(contract.resource)
-                   .starts_with((*owner + "/kernels/").str()) ||
-              !text)
-            return createStringError(key + ": missing runtime kernel source " +
-                                     contract.resource);
-          printer.runtimeSources.emplace(key, text->str());
-        }
-        t.emit = [printer = std::move(printer)](mlir::ModuleOp m,
-                                                llvm::raw_pwrite_stream &out) {
-          return printer.emit(m, out);
-        };
+      auto printer = implementation.terminal;
+      if (!printer.package || printer.operations.empty() ||
+          llvm::any_of(printer.operations, [](const auto &p) {
+            return p.first.empty() || !p.second;
+          }))
+        return createStringError(name + ": incomplete terminal printer");
+      for (auto &op : profile->implementationOps)
+        if (!printer.operations.count(op))
+          return createStringError(name + ": no print rule for " + op);
+      for (auto &[key, contract] : profile->implementations) {
+        if (contract.source != ImplementationSource::Runtime)
+          continue;
+        auto *runtime = manifest.getObject("runtimes");
+        auto owner = runtime->getString(name);
+        auto *files = manifest.getObject("kernel_sources");
+        auto text = files ? files->getString(contract.resource) : std::nullopt;
+        if (!owner ||
+            !llvm::StringRef(contract.resource)
+                 .starts_with((*owner + "/kernels/").str()) ||
+            !text)
+          return createStringError(key + ": missing runtime kernel source " +
+                                   contract.resource);
+        printer.runtimeSources.emplace(key, text->str());
       }
+      t.printer = std::move(printer);
       std::set<std::string> owners{"exits/" + name};
       for (auto &eligible : *manifest.getObject("units")
                                  ->getObject(field(e, "unit"))
@@ -791,15 +784,12 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         for (auto &add : dialects)
           add(r);
       };
-      if (implementation.terminal) {
-        auto &verify = t.stages.back().verifyOutput;
-        verify = [prior = verify, printer = *implementation.terminal,
-                  profile](mlir::ModuleOp m) {
-          if (mlir::failed(prior(m)))
-            return mlir::failure();
-          return printer.verify(m, *profile);
-        };
-      }
+      auto &verify = t.stages.back().verifyOutput;
+      verify = [prior = verify, printer = t.printer, profile](mlir::ModuleOp m) {
+        if (mlir::failed(prior(m)))
+          return mlir::failure();
+        return printer.verify(m, *profile);
+      };
       selected[name] = Array(chosen);
       return t;
     };

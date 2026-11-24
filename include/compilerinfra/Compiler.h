@@ -2,6 +2,7 @@
 #define COMPILERINFRA_COMPILER_H
 
 #include "compilerinfra/Decision.h"
+#include "compilerinfra/Terminal.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -23,8 +24,6 @@ namespace compilerinfra {
 using RegisterDialects = std::function<void(mlir::DialectRegistry &)>;
 using Import = std::function<llvm::Expected<mlir::OwningOpRef<mlir::ModuleOp>>(
     llvm::MemoryBufferRef, mlir::MLIRContext &)>;
-using Emit =
-    std::function<llvm::Error(mlir::ModuleOp, llvm::raw_pwrite_stream &)>;
 using BuildPasses = std::function<llvm::Error(mlir::OpPassManager &)>;
 using BoundaryCheck = std::function<mlir::LogicalResult(mlir::ModuleOp)>;
 
@@ -74,7 +73,7 @@ struct Exit {
   std::string name;
   RegisterDialects registerDialects;
   std::vector<Stage> stages;
-  Emit emit;
+  TerminalPrinter printer;
   BoundaryCheck verifyInput;
   std::map<std::string, std::function<llvm::json::Object()>> dependencies;
 };

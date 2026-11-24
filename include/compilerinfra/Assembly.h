@@ -80,13 +80,8 @@ struct FamilyBinding {
 struct ExitImplementation {
   using Capabilities =
       std::function<llvm::Expected<TargetProfile>(const llvm::json::Object &)>;
-  ExitImplementation() = default;
-  [[deprecated("register a TerminalPrinter to emit verified operations")]]
-  ExitImplementation(Emit legacy, Capabilities caps)
-      : emit(std::move(legacy)), capabilities(std::move(caps)) {}
-  Emit emit;
   Capabilities capabilities;
-  std::optional<TerminalPrinter> terminal;
+  TerminalPrinter terminal;
 };
 template <typename T> struct Located {
   T value;

@@ -261,7 +261,7 @@ llvm::Expected<Artifact> Session::compile(mlir::OwningOpRef<ModuleOp> module,
   Artifact bytes;
   llvm::raw_svector_ostream output(bytes);
   auto error = range.through ? writeIR(module.get(), format, output)
-                             : impl->exit.emit(module.get(), output);
+                             : impl->exit.printer.emit(module.get(), output);
   if (auto result = diagnostics.finish(std::move(error)))
     return result;
   return bytes;

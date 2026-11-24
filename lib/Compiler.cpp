@@ -33,8 +33,8 @@ Compiler::Compiler(std::shared_ptr<const Definition> definition)
     : definition(std::move(definition)) {}
 
 static llvm::Error validateExit(const Exit &exit) {
-  if (!exit.emit)
-    return createStringError("missing artifact emitter for exit " + exit.name);
+  if (!exit.printer.package || exit.printer.operations.empty())
+    return createStringError("missing terminal printer for exit " + exit.name);
 
   llvm::StringSet<> stageNames;
   llvm::StringSet<> slotNames;

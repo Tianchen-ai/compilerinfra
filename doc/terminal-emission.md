@@ -1,6 +1,6 @@
-# CompilerInfra v0.4 设计稿：从出口终端 IR 发射
+# CompilerInfra v0.4：从出口终端 IR 发射
 
-**状态：v0.4 已批准。** 出口的最后一个边界固定执行结构。产品沿用编译树、会话、检查点、产物及 JIT 接口。新出口登记 `TerminalPrinter`，旧模块回调在 layout 中显示为 legacy。[装配入口](../include/compilerinfra/Assembly.h) · [打印协议](../include/compilerinfra/Terminal.h)
+**状态：v0.4.2 生效。** 出口的最后一个边界固定执行结构。产品沿用编译树、会话、检查点、产物及 JIT 接口。每个出口统一登记 `TerminalPrinter`，从验证后的终端 IR 逐操作发射。[装配入口](../include/compilerinfra/Assembly.h) · [打印协议](../include/compilerinfra/Terminal.h)
 
 ## 1. 终端边界
 
@@ -19,11 +19,11 @@
 
 | 时机 | 框架和产品 verifier 能执行的检查 | 需要轻量人工审查的判断 |
 |---|---|---|
-| 链接 | 每出口声明唯一发射模式。新模式的 op、目标实现、依赖、打印规则均可解析，登记位置符合树的归属。拒绝重复或缺失注册。 | 合同作用域是否诚实，哪一层真正拥有这个决定。 |
+| 链接 | 每出口登记 `TerminalPrinter`。操作、目标实现、依赖、打印规则均可解析，登记位置符合树的归属。拒绝重复或缺失注册。 | 合同作用域是否诚实，哪一层真正拥有这个决定。 |
 | 完成终端边界或由其恢复 | 先执行 MLIR verifier 及出口的完整合法化检查，再逐层走访子 region。检查 SSA 支配、类型／region 签名、效果接口、显式地址宽度、绑定的实现及前提。产品 verifier 按模型检查 bounds/guard、资源寿命和完成依赖；未知证明应选择宽实现或给出定位到 op 的错误。 | 一个已声明的效果是否完整，范围证明是否适用于真实输入，库 ABI 和数值许可是否吻合。 |
 | 打印 | 未登记 op、未消费 region、无法解析的操作数、符号或产物引用就地报错。普通编译、`--through` 和 `--after` 使用同一边界规则。 | C++ 打印函数和外部库的任意行为无法靠注册签名证明。抽查终端 IR 与目标片段，尤其检查新出现的循环、scratch、同步、初始化和写回。 |
 
-**兼容窗口。** 原整 module 回调标记为 deprecated；已有出口在 `inspect/layout` 中显示 legacy，新登记默认使用逐 op 模式，迁移期间同一出口只启用一种。先用原产物 ABI 跑通新出口，再删除该出口旧回调和旁路。最后一个在用出口迁移后删除框架回调、兼容装配分支和旧脚手架说明。缺少打印规则直接诊断，不能静默退回旧路径。
+缺少打印规则或操作合同时直接报诊断，不提供整 module 发射旁路。
 
 ## 2. 有合同的目标操作
 
@@ -88,7 +88,7 @@ SDK 在已有 configuration 上定义统一的有序上限 `reuse=native|vendor|
 
 先按档位过滤，再查合法性、依赖与机器能力，最后在可行集合上估价。高档位允许低档位胜出，配置的基线也受同样过滤。强制超档候选应诊断。explain 分列“超出档位”“依赖不可用”“数值或布局不兼容”和“合法但估价较高”；普通 JIT 无需打开观察。
 
-SDK 0.4 保留 legacy 兼容期。用现有产品的 derive、compile、compare 检查终端检查点，独立 Bench 核对数值和完整调用。普通算术与单一内建只需要类型及打印规则。
+用现有产品的 derive、compile、compare 检查终端检查点，独立 Bench 核对数值和完整调用。普通算术与单一内建只需要类型及打印规则。
 
 `ImplementationContract.resource` 为 runtime 源码相对产品根的路径，位于所属出口的 `runtime/<exit>/kernels/`。构建把同一份文本安装并提供给已链接的编译库。打印规则用 `PrintContext::source(implementation)` 读取当前候选绑定的源码，使离线发射与 JIT 生成相同的产物。厂商实现登记依赖 ID；出口登记对应的运行主机 probe，返回 `available`、实得版本及库路径、已查询的符号或失败原因。CMake 向拥有它的单元提供 `CI_OPTIONAL_<id>`，其中连字符转换为下划线。`doctor` 同时提供构建期状态和本机查询结果。
 
