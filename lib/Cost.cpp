@@ -214,7 +214,7 @@ compilerinfra::detail::rankCandidates(const DecisionProgram &p,
         legality = table.family.verify(op, r.proposal.value, *table.target);
       for (auto &impl : r.proposal.implementations)
         if (!legality)
-          legality = table.target->checkImplementation(impl);
+          legality = table.target->checkImplementationForOp(impl, op);
       if (!legality && table.family.verifyCandidate)
         legality = table.family.verifyCandidate(op, r.proposal, *table.target);
       if (legality) {

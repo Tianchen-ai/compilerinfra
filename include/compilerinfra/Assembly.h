@@ -52,10 +52,13 @@ struct TargetProfile {
   std::set<std::string> features;
   TargetServices services;
   Reuse reuse = Reuse::Vendor;
+  NumericalOptions numerical;
   std::map<std::string, ImplementationContract> implementations;
   std::set<std::string> implementationOps;
   std::map<std::string, std::function<llvm::json::Object()>> dependencies;
   llvm::Error checkImplementation(llvm::StringRef name) const;
+  llvm::Error checkImplementationForOp(llvm::StringRef name,
+                                       mlir::Operation *op) const;
 };
 using ModelCheck =
     std::function<mlir::LogicalResult(mlir::ModuleOp, const TargetProfile &)>;

@@ -38,7 +38,7 @@ if(NOT COMPILERINFRA_LINK_MLIR_DYLIB AND TARGET LLVMSupport)
     endif()
   endforeach()
 endif()
-add_library(CompilerInfraCore STATIC lib/Assembly.cpp lib/Cost.cpp lib/Compiler.cpp lib/Decision.cpp lib/Session.cpp lib/Terminal.cpp)
+add_library(CompilerInfraCore STATIC lib/Assembly.cpp lib/Contract.cpp lib/Cost.cpp lib/Compiler.cpp lib/Decision.cpp lib/Session.cpp lib/Terminal.cpp)
 add_library(CompilerInfra::Core ALIAS CompilerInfraCore)
 set_target_properties(CompilerInfraCore PROPERTIES EXPORT_NAME Core POSITION_INDEPENDENT_CODE ON)
 target_compile_features(CompilerInfraCore PUBLIC cxx_std_17)
@@ -50,7 +50,9 @@ target_include_directories(CompilerInfraCore SYSTEM PUBLIC
 if(COMPILERINFRA_LINK_MLIR_DYLIB)
   target_link_libraries(CompilerInfraCore PUBLIC MLIR LLVM)
 else()
-  target_link_libraries(CompilerInfraCore PUBLIC MLIRParser MLIRBytecodeWriter MLIRPass MLIRIR LLVMSupport)
+  target_link_libraries(CompilerInfraCore PUBLIC
+    MLIRParser MLIRBytecodeWriter MLIRPass MLIRAnalysis MLIRArithDialect
+    MLIRInferIntRangeInterface MLIRSideEffectInterfaces MLIRIR LLVMSupport)
 endif()
 
 add_library(CompilerInfraRuntime INTERFACE)

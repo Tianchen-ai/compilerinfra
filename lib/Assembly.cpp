@@ -92,12 +92,14 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
       return createStringError(u.id + ": invalid dependency probe " +
                                localName);
   }
-  for (auto &[impl, where] : u.implementations) {
+  for (auto &[rawImpl, where] : u.implementations) {
+    ImplementationContract impl = rawImpl;
+    populateTypedContractSummaries(impl);
     if (!exitUnit || impl.name.empty() || impl.operation.empty() ||
         impl.symbol.empty() || impl.operands.empty() || impl.layout.empty() ||
         impl.accumulator.empty() || impl.effects.empty() ||
-        impl.numerical.empty() || impl.estimator.empty() || !impl.verify ||
-        !impl.available)
+        impl.numerical.empty() || impl.estimator.empty() ||
+        (!impl.verify && !impl.typed) || !impl.available)
       return createStringError(u.id + ": incomplete implementation " +
                                impl.name);
     if (impl.source == ImplementationSource::External &&
@@ -126,6 +128,7 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
                          ? "runtime"
                          : "external";
     item["reuse"] = spelling(impl.minimum).str();
+    item["typed_contract"] = impl.typed.has_value();
     item["operands"] = impl.operands;
     item["layout"] = impl.layout;
     item["accumulator"] = impl.accumulator;
@@ -134,7 +137,7 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
     item["estimator"] = impl.estimator;
     item["cost_parameters"] = Array(impl.costParameters);
     item["dependencies"] = Array(impl.dependencies);
-    c.contracts[node].emplace(id, impl);
+    c.contracts[node].emplace(id, std::move(impl));
   }
   for (auto &[v, s] : u.contributions) {
     auto id = u.qualify(v.name);
@@ -280,6 +283,14 @@ llvm::Error checkConfiguration(const Object &config, const Object &manifest,
       auto v = entries.getAsString();
       if (v != "native" && v != "vendor" && v != "library")
         return createStringError("reuse must be native, vendor or library");
+      continue;
+    }
+    if (group == "numerical") {
+      if (!entries.getAsObject())
+        return createStringError("numerical configuration must be an object");
+      auto parsed = NumericalOptions::parse(*entries.getAsObject());
+      if (!parsed)
+        return parsed.takeError();
       continue;
     }
     if ((group != "nodes" && group != "exits") || !entries.getAsObject())
@@ -552,6 +563,12 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
       profile->reuse = reuse == "native"    ? Reuse::Native
                        : reuse == "library" ? Reuse::Library
                                             : Reuse::Vendor;
+      if (auto *numCfg = config.getObject("numerical")) {
+        auto parsed = NumericalOptions::parse(*numCfg);
+        if (!parsed)
+          return parsed.takeError();
+        profile->numerical = *parsed;
+      }
       if (auto *deps =
               manifest.getObject("product")->getArray("optional_dependencies"))
         for (auto &decl : *deps) {
@@ -623,6 +640,7 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         if (!printer.operations.count(op))
           return createStringError(name + ": no print rule for " + op);
       for (auto &[key, contract] : profile->implementations) {
+        printer.implementationSymbols.emplace(key, contract.symbol);
         if (contract.source != ImplementationSource::Runtime)
           continue;
         auto *runtime = manifest.getObject("runtimes");
@@ -636,6 +654,25 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
           return createStringError(key + ": missing runtime kernel source " +
                                    contract.resource);
         printer.runtimeSources.emplace(key, text->str());
+      }
+      {
+        unsigned declCount = 0, localCount = 0;
+        Array customOps;
+        for (const auto &[opName, rule] : printer.operations) {
+          if (rule.kind() == PrintRule::Kind::Declarative)
+            ++declCount;
+          else if (rule.kind() == PrintRule::Kind::Local)
+            ++localCount;
+          else
+            customOps.push_back(
+                Object{{"operation", opName}, {"reason", rule.reason().str()}});
+        }
+        (*status)["print_rules"] = Object{
+            {"declarative", declCount},
+            {"local", localCount},
+            {"custom_count", customOps.size()},
+            {"custom", std::move(customOps)},
+        };
       }
       t.printer = std::move(printer);
       std::set<std::string> owners{"exits/" + name};

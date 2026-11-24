@@ -57,6 +57,16 @@ static llvm::Error merge(Object &base, const Object &delta) {
       base[section] = scopes;
       continue;
     }
+    if (section == "numerical") {
+      if (!scopes.getAsObject())
+        return llvm::createStringError("expected object for numerical");
+      if (!base.getObject("numerical"))
+        base["numerical"] = Object{};
+      auto *dst = base.getObject("numerical");
+      for (auto &[k, v] : *scopes.getAsObject())
+        (*dst)[k] = v;
+      continue;
+    }
     if (!scopes.getAsObject())
       return llvm::createStringError("expected scope map for " + section.str());
     if (!base.get(section))
