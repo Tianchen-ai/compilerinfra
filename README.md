@@ -24,6 +24,6 @@ with Compiler(library_path) as compiler:
     artifact = compiler.compile(root_ir, exit=exit_name)
 ```
 
-Use `compilerinfra-dev actions` to discover scaffold actions before creating a product. Pass `--workspace`, `--library`, and `--output-dir` to work on an installed product. A CLI process with no positional action accepts JSON lines and retains its candidates until EOF. MCP and DSH expose the same catalog.
+Use `compilerinfra-dev actions` to discover scaffold actions before creating a product. Pass `--workspace`, `--library`, and `--output-dir` to work on an installed product. A CLI process with no positional action accepts JSON lines and retains its candidates until EOF. MCP (`compilerinfra-agent`) exposes the same catalog.
 
 [Product tree](doc/organization.md) · [Component development](doc/components.md) · [Derivation and adoption](doc/derivation.md) · [Host integration](doc/plugins.md) · [Workspace](doc/workspace.md)

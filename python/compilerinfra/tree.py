@@ -309,6 +309,7 @@ def tree(root, complete=True, extension_roots=None):
             f.is_file()
             and rel.parts[0] != "agent"
             and "__pycache__" not in rel.parts
+            and not any(p.endswith(".egg-info") for p in rel.parts)
             and f.suffix != ".pyc"
         ):
             assets.append(

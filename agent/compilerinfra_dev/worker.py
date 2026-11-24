@@ -84,7 +84,10 @@ def serve(pipe, path, profile):
 class Worker:
     def __init__(self, library, profile):
         self.library = library
-        interpreter = Path(str(library) + ".python").read_text().strip()
+        raw = Path(str(library) + ".python").read_text().strip()
+        interpreter = (
+            raw if os.path.isabs(raw) and Path(raw).is_file() else sys.executable
+        )
         self.interpreter = interpreter
         env = os.environ.copy()
         env.pop("PYTHONHOME", None)
