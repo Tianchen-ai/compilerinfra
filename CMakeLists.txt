@@ -38,7 +38,7 @@ if(NOT COMPILERINFRA_LINK_MLIR_DYLIB AND TARGET LLVMSupport)
     endif()
   endforeach()
 endif()
-add_library(CompilerInfraCore STATIC lib/Assembly.cpp lib/Contract.cpp lib/Cost.cpp lib/Compiler.cpp lib/Decision.cpp lib/Session.cpp lib/Terminal.cpp)
+add_library(CompilerInfraCore STATIC lib/Assembly.cpp lib/Contract.cpp lib/Cost.cpp lib/Compiler.cpp lib/Decision.cpp lib/Proofs.cpp lib/Session.cpp lib/Terminal.cpp)
 add_library(CompilerInfra::Core ALIAS CompilerInfraCore)
 set_target_properties(CompilerInfraCore PROPERTIES EXPORT_NAME Core POSITION_INDEPENDENT_CODE ON)
 target_compile_features(CompilerInfraCore PUBLIC cxx_std_17)
@@ -52,7 +52,21 @@ if(COMPILERINFRA_LINK_MLIR_DYLIB)
 else()
   target_link_libraries(CompilerInfraCore PUBLIC
     MLIRParser MLIRBytecodeWriter MLIRPass MLIRAnalysis MLIRArithDialect
-    MLIRInferIntRangeInterface MLIRSideEffectInterfaces MLIRIR LLVMSupport)
+    MLIRInferIntRangeInterface MLIRLoopLikeInterface MLIRSideEffectInterfaces
+    MLIRIR LLVMSupport)
+endif()
+
+option(COMPILERINFRA_BUILD_TESTS "Build CompilerInfra SDK unit tests" OFF)
+if(standalone AND COMPILERINFRA_BUILD_TESTS)
+  enable_testing()
+  add_executable(ci-v05-tests test/V05Tests.cpp)
+  if(COMPILERINFRA_LINK_MLIR_DYLIB)
+    target_link_libraries(ci-v05-tests PRIVATE CompilerInfraCore MLIR LLVM)
+  else()
+    target_link_libraries(ci-v05-tests PRIVATE CompilerInfraCore
+      MLIRFuncDialect MLIRMemRefDialect MLIRSCFDialect)
+  endif()
+  add_test(NAME ci-v05-tests COMMAND ci-v05-tests)
 endif()
 
 add_library(CompilerInfraRuntime INTERFACE)
