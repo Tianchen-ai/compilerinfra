@@ -58,6 +58,26 @@ def write(path, data):
 
 
 def fingerprint(root):
+    if not (root / ".git").exists() and (root / "PKG-INFO").is_file():
+        product = read(root / "product.json")
+        digest = hashlib.sha256()
+        for p in sorted(root.rglob("*")):
+            rel = p.relative_to(root)
+            if (
+                any(part == "__pycache__" or part.endswith(".egg-info") for part in rel.parts)
+                or p.suffix in {".pyc", ".pyo"}
+            ):
+                continue
+            if p.is_symlink():
+                digest.update(rel.as_posix().encode() + b"\0L" + os.fsencode(os.readlink(p)))
+            elif p.is_file():
+                digest.update(rel.as_posix().encode() + b"\0")
+                digest.update(b"X" if p.stat().st_mode & 0o111 else b"F")
+                with p.open("rb") as stream:
+                    for block in iter(lambda: stream.read(1 << 20), b""):
+                        digest.update(block)
+        return {"revision": f"sdist-{product.get('version', '0')}", "changes": digest.hexdigest()}
+
     def git(*args):
         return subprocess.check_output(["git", "-C", root, *args])
 
