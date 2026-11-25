@@ -99,6 +99,7 @@ install(TARGETS CompilerInfraCore CompilerInfraRuntime ${development_target} EXP
   ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
   RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
 install(DIRECTORY include/compilerinfra DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/licenses/compilerinfra")
 write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/CompilerInfraConfigVersion.cmake"
   VERSION "${PROJECT_VERSION}" COMPATIBILITY SameMinorVersion)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/CompilerInfraConfigVersion.cmake"
