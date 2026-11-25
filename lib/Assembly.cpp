@@ -338,6 +338,12 @@ llvm::Error checkConfiguration(const Object &config, const Object &manifest,
       if (!declaration || !value.getAsObject())
         return createStringError("invalid scope " + key.str());
       for (auto &[kind, items] : *value.getAsObject()) {
+        if (group == "exits" && kind == "reuse") {
+          auto v = items.getAsString();
+          if (v != "native" && v != "vendor" && v != "library")
+            return createStringError("reuse must be native, vendor or library");
+          continue;
+        }
         if (!items.getAsObject() ||
             (kind != "optimizations" && kind != "decisions" &&
              (kind != "options" || group != "exits")))
@@ -516,8 +522,10 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
     return std::move(e);
   if (auto e = attach(c.realizers))
     return std::move(e);
-  Object sharedConfig = config;
-  sharedConfig.erase("exits");
+  Object sharedConfig;
+  for (auto &[k, v] : config)
+    if (k != "exits")
+      sharedConfig[k] = v;
   if (auto e = checkConfiguration(sharedConfig, manifest, c))
     return std::move(e);
   if (auto *overrides = config.get("exits")) {
@@ -595,12 +603,18 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         if (!facts)
           return facts.takeError();
         *profile = std::move(*facts);
+        profile->name = name;
       } else if (!options.empty())
         return createStringError(name + ": unsupported exit options");
-      auto reuse = config.getString("reuse").value_or("vendor");
-      profile->reuse = reuse == "native"    ? Reuse::Native
-                       : reuse == "library" ? Reuse::Library
-                                            : Reuse::Vendor;
+      if (auto reuse = overrides.getString("reuse")) {
+        profile->reuse = *reuse == "native"    ? Reuse::Native
+                         : *reuse == "library" ? Reuse::Library
+                                               : Reuse::Vendor;
+      } else if (auto reuse = config.getString("reuse")) {
+        profile->reuse = *reuse == "native"    ? Reuse::Native
+                         : *reuse == "library" ? Reuse::Library
+                                               : Reuse::Vendor;
+      }
       if (auto *numCfg = config.getObject("numerical")) {
         auto parsed = NumericalOptions::parse(*numCfg);
         if (!parsed)

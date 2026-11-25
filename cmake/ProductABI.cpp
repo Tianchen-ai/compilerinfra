@@ -52,6 +52,30 @@ static std::string serialize(const llvm::json::Value &value) {
 static llvm::Error merge(Object &base, const Object &delta) {
   // Configuration has three map levels: section -> scope -> settings group.
   // The values in a group are atomic, including a complete family's selection.
+  if (delta.get("reuse")) {
+    if (auto *exits = base.getObject("exits")) {
+      Object cleanedExits;
+      for (auto &[exitName, local] : *exits) {
+        if (auto *settings = local.getAsObject()) {
+          Object cleanedSettings;
+          for (auto &[k, v] : *settings)
+            if (k != "reuse")
+              cleanedSettings[k] = std::move(v);
+          if (!cleanedSettings.empty())
+            cleanedExits[exitName] = std::move(cleanedSettings);
+        } else {
+          cleanedExits[exitName] = std::move(local);
+        }
+      }
+      Object cleanedBase;
+      for (auto &[k, v] : base)
+        if (k != "exits")
+          cleanedBase[k] = std::move(v);
+      if (!cleanedExits.empty())
+        cleanedBase["exits"] = std::move(cleanedExits);
+      base = std::move(cleanedBase);
+    }
+  }
   for (auto &[section, scopes] : delta) {
     if (section == "reuse") {
       base[section] = scopes;
@@ -80,7 +104,13 @@ static llvm::Error merge(Object &base, const Object &delta) {
         (*group)[id] = Object{};
       for (auto &[kind, values] : *settings.getAsObject()) {
         auto *scope = group->getObject(id);
-        if (!scope || !values.getAsObject())
+        if (!scope)
+          return llvm::createStringError("expected object for " + kind.str());
+        if (section == "exits" && kind == "reuse") {
+          (*scope)[kind] = values;
+          continue;
+        }
+        if (!values.getAsObject())
           return llvm::createStringError("expected object for " + kind.str());
         if (!scope->get(kind))
           (*scope)[kind] = Object{};
