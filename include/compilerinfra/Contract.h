@@ -27,6 +27,7 @@ struct ImplementationContract;
 struct NumericalOptions {
   mlir::arith::FastMathFlags defaultFastMath = mlir::arith::FastMathFlags::none;
   llvm::DenormalMode defaultDenormal = llvm::DenormalMode::getIEEE();
+  bool explicitFastMath = false, explicitDenormal = false;
 
   static llvm::Expected<NumericalOptions> parse(const llvm::json::Object &obj);
   llvm::json::Object toJSON() const;

@@ -47,12 +47,30 @@ private:
   llvm::DenseMap<mlir::TypeID, std::shared_ptr<const void>> interfaces;
 };
 
+struct TargetProfile;
+
+// Register author and target references separately, even when they describe
+// the same option. The callback runs once when linking a configured exit.
+struct SemanticChoice {
+  std::string value, source, downstreamOption, reason;
+};
+struct SemanticReference {
+  std::string name, scope, upstreamConcept, upstreamDefault, citation;
+  std::function<std::optional<SemanticChoice>(
+      const TargetProfile &, const llvm::json::Object &exitOptions)> resolve;
+};
+
 struct TargetProfile {
   std::string name;
   std::set<std::string> features;
   TargetServices services;
   Reuse reuse = Reuse::Vendor;
   NumericalOptions numerical;
+  std::map<std::string, SemanticChoice> semanticDefaults;
+  // Materialize an explicit author value or the configured default. A later
+  // pass reads the attribute; it does not re-evaluate device policy.
+  llvm::Error bindSemantic(mlir::Operation *op, llvm::StringRef attribute,
+                           llvm::StringRef reference) const;
   std::map<std::string, ImplementationContract> implementations;
   std::set<std::string> implementationOps;
   std::map<std::string, std::function<llvm::json::Object()>> dependencies;
@@ -113,6 +131,7 @@ public:
   RegisterDialects dialects;
   BoundaryCheck input;
   std::vector<Located<Boundary>> boundaries;
+  std::vector<Located<SemanticReference>> semantics;
   std::vector<Located<Contribution>> contributions;
   std::vector<Located<FamilyBinding>> families;
   std::vector<Located<Strategy>> strategies;

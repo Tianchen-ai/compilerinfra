@@ -438,7 +438,18 @@ def build_readiness_report(
         if todo_caps:
             missing.append(f"parity_todo:{len(todo_caps)}")
 
+        refs = ex_meta.get("semantic_references", [])
+        deviations = [r for r in refs if r["reference_default"] and
+                      r["effective"] != r["reference_default"]]
         exit_reports[ex] = {
+            "semantics": {
+                "references": refs,
+                "missing_reference": [r["id"] for r in refs if not r["citation"]],
+                "unmapped": [r["id"] for r in refs if not r["concept"]],
+                "deviations": [r["id"] for r in deviations],
+                "missing_reason": [r["id"] for r in refs if not r["reason"] and
+                                   (r in deviations or not r["concept"])],
+            },
             "valid": ex_meta.get("valid", False),
             "reuse": ex_meta.get("reuse", "vendor"),
             "numerical": ex_meta.get("numerical", {}),

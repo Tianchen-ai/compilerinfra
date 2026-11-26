@@ -27,6 +27,17 @@ llvm::StringRef compilerinfra::spelling(ParityStatus status) {
   llvm_unreachable("invalid ParityStatus");
 }
 
+llvm::Error TargetProfile::bindSemantic(mlir::Operation *op, llvm::StringRef attribute,
+                                        llvm::StringRef reference) const {
+  if (op->hasAttr(attribute))
+    return llvm::Error::success();
+  auto entry = semanticDefaults.find(reference.str());
+  if (entry == semanticDefaults.end())
+    return createStringError("unregistered semantic default: " + reference);
+  op->setAttr(attribute, mlir::StringAttr::get(op->getContext(), entry->second.value));
+  return llvm::Error::success();
+}
+
 namespace {
 std::string field(const Object &obj, llvm::StringRef key) {
   return obj.getString(key)->str();
@@ -46,6 +57,7 @@ struct Components {
   std::map<std::string, Located<CapabilityDeclaration>> capabilities;
   std::map<std::string, std::vector<Located<ParityDeclaration>>> parity;
   Object catalog;
+  std::map<std::string, SemanticReference> semantics;
   llvm::Error record(const std::string &name, const std::string &unit,
                      const std::string &at, llvm::StringRef kind,
                      const SourceRef &source) {
@@ -81,6 +93,14 @@ llvm::Error collect(const Object &manifest, const Unit &u, Components &c) {
         return true;
     return false;
   };
+  for (auto &[ref, source] : u.semantics) {
+    auto id = u.qualify(ref.name);
+    if (ref.name.empty() || !ref.resolve)
+      return createStringError(id + ": invalid semantic reference");
+    if (auto err = c.record(id, u.id, owner, "semantic_reference", source))
+      return err;
+    c.semantics.emplace(id, ref);
+  }
   for (auto &b : u.boundaries) {
     auto at = node + "@" + b.value.name;
     if (!local(at) || !b.value.lower || !b.value.verify)
@@ -739,6 +759,21 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         return owners.count(
             field(*manifest.getObject("units")->getObject(unit), "owner"));
       };
+      Array references;
+      for (const auto &[id, ref] : c.semantics) {
+        if (!available(id))
+          continue;
+        auto choice = ref.resolve(*profile, options);
+        if (!choice)
+          continue;
+        profile->semanticDefaults.emplace(id, *choice);
+        references.emplace_back(Object{
+            {"id", id}, {"scope", ref.scope}, {"concept", ref.upstreamConcept},
+            {"reference_default", ref.upstreamDefault}, {"citation", ref.citation},
+            {"effective", choice->value}, {"source", choice->source},
+            {"downstream_option", choice->downstreamOption}, {"reason", choice->reason}});
+      }
+      (*status)["semantic_references"] = std::move(references);
       std::map<std::string, detail::DecisionProgram> pending;
       std::set<std::string> chosen;
       FamilyBindings pathBindings;

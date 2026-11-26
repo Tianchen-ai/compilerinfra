@@ -1,4 +1,4 @@
-# CompilerInfra 0.5.3
+# CompilerInfra 0.6.0
 
 CompilerInfra builds MLIR-based product compilers from a declared compilation tree. A product owns its representations, boundaries, strategies and exits. The SDK links those units into a shared library. A Python JIT can keep the compiler in process, while development hosts can derive, inspect and run candidates from the same library.
 

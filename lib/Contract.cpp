@@ -39,6 +39,7 @@ NumericalOptions::parse(const llvm::json::Object &obj) {
       if (!parsed)
         return parsed.takeError();
       out.defaultFastMath = *parsed;
+      out.explicitFastMath = true;
     } else if (k == "denormal_mode") {
       auto s = v.getAsString();
       if (!s)
@@ -47,6 +48,7 @@ NumericalOptions::parse(const llvm::json::Object &obj) {
       if (!mode.isValid())
         return createStringError("invalid numerical.denormal_mode: " + *s);
       out.defaultDenormal = mode;
+      out.explicitDenormal = true;
     } else {
       return createStringError("unknown numerical configuration field: " +
                                k.str());
@@ -114,13 +116,8 @@ compilerinfra::effectiveDenormalMode(mlir::Operation *op,
     for (llvm::StringRef attrName : {"denormal-fp-math", "ci.denormal_mode"}) {
       if (auto s = cur->getAttrOfType<mlir::StringAttr>(attrName)) {
         auto parsed = llvm::parseDenormalFPAttribute(s.getValue());
-        if (parsed.isValid()) {
-          if (parsed.Output == llvm::DenormalMode::Dynamic)
-            parsed.Output = fallback.Output;
-          if (parsed.Input == llvm::DenormalMode::Dynamic)
-            parsed.Input = fallback.Input;
+        if (parsed.isValid())
           return parsed;
-        }
       }
     }
   }

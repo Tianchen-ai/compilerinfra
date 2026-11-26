@@ -104,6 +104,12 @@ void testTypedContractsAndNumericalFlags(MLIRContext &ctx) {
       copyOp = op;
   });
   assert(addOp && copyOp);
+  // An explicit dynamic mode takes precedence over a fixed target fallback.
+  setDenormalMode(fn, llvm::DenormalMode::getDynamic());
+  assert(effectiveDenormalMode(addOp, llvm::DenormalMode::getPreserveSign()) ==
+         llvm::DenormalMode::getDynamic());
+  assert(!allowsSubnormalFlush(addOp));
+  fn->removeAttr("denormal-fp-math");
 
   // Audit fix 4b: IsIsolatedFromAbove (e.g. func.func) without
   // MemoryEffectOpInterface must NOT be treated as known pure.
@@ -833,10 +839,10 @@ void testV053OpAndValueDerivedProofs(MLIRContext &ctx) {
   assert(demoAddrs.size() == 2);
   assert(!proveNarrowAddress(demoAddrs[0].getOperation(), addrOpts).proven &&
          "65536 * 65536 overflows i32 and must be rejected");
-  assert(!proveNarrowAddress(demoAddrs[0].getResult(), addrOpts).proven);
+  assert(!proveNarrowAddress(demoAddrs[0]->getResult(0), addrOpts).proven);
   auto addrOk = proveNarrowAddress(demoAddrs[1].getOperation(), addrOpts);
   assert(addrOk.proven && addrOk.chosenBitwidth == 32);
-  assert(proveNarrowAddress(demoAddrs[1].getResult(), addrOpts).proven);
+  assert(proveNarrowAddress(demoAddrs[1]->getResult(0), addrOpts).proven);
 }
 
 void testParityAndReadinessMetadata() {
