@@ -58,6 +58,7 @@ struct SemanticReference {
   std::string name, scope, upstreamConcept, upstreamDefault, citation;
   std::function<std::optional<SemanticChoice>(
       const TargetProfile &, const llvm::json::Object &exitOptions)> resolve;
+  std::vector<std::string> manualPaths;
 };
 
 struct TargetProfile {

@@ -29,12 +29,26 @@ llvm::StringRef compilerinfra::spelling(ParityStatus status) {
 
 llvm::Error TargetProfile::bindSemantic(mlir::Operation *op, llvm::StringRef attribute,
                                         llvm::StringRef reference) const {
-  if (op->hasAttr(attribute))
-    return llvm::Error::success();
   auto entry = semanticDefaults.find(reference.str());
   if (entry == semanticDefaults.end())
     return createStringError("unregistered semantic default: " + reference);
-  op->setAttr(attribute, mlir::StringAttr::get(op->getContext(), entry->second.value));
+  mlir::Builder b(op->getContext());
+  mlir::NamedAttrList bindings(op->getAttrOfType<mlir::DictionaryAttr>("ci.semantics"));
+  auto value = op->getAttrOfType<mlir::StringAttr>(attribute);
+  if (!value && op->hasAttr(attribute))
+    return createStringError("expected string semantic attribute: " + attribute);
+  if (auto previous = llvm::dyn_cast_if_present<mlir::DictionaryAttr>(bindings.get(attribute));
+      previous && previous.get("value") == value && previous.getAs<mlir::StringAttr>("reference") == reference)
+    return llvm::Error::success();
+  auto source = value ? "author" : entry->second.source;
+  if (!value) {
+    value = b.getStringAttr(entry->second.value);
+    op->setAttr(attribute, value);
+  }
+  bindings.set(attribute, b.getDictionaryAttr({
+      b.getNamedAttr("reference", b.getStringAttr(reference)),
+      b.getNamedAttr("source", b.getStringAttr(source)), b.getNamedAttr("value", value)}));
+  op->setAttr("ci.semantics", b.getDictionaryAttr(bindings));
   return llvm::Error::success();
 }
 
@@ -767,7 +781,10 @@ llvm::Expected<Compiler> Assembly::link(const Object &manifest,
         if (!choice)
           continue;
         profile->semanticDefaults.emplace(id, *choice);
-        references.emplace_back(Object{
+        Array manual;
+        for (const auto &path : ref.manualPaths)
+          manual.emplace_back(path);
+        references.emplace_back(Object{{"manual_paths", std::move(manual)},
             {"id", id}, {"scope", ref.scope}, {"concept", ref.upstreamConcept},
             {"reference_default", ref.upstreamDefault}, {"citation", ref.citation},
             {"effective", choice->value}, {"source", choice->source},

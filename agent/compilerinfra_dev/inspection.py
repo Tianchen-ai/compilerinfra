@@ -445,6 +445,7 @@ def build_readiness_report(
             "semantics": {
                 "references": refs,
                 "missing_reference": [r["id"] for r in refs if not r["citation"]],
+                "manual_paths": sorted({path for r in refs for path in r.get("manual_paths", [])}),
                 "unmapped": [r["id"] for r in refs if not r["concept"]],
                 "deviations": [r["id"] for r in deviations],
                 "missing_reason": [r["id"] for r in refs if not r["reason"] and
