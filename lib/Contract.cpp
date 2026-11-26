@@ -1,6 +1,9 @@
 #include "compilerinfra/Contract.h"
 #include "compilerinfra/Assembly.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/raw_ostream.h"
@@ -9,6 +12,35 @@ using namespace compilerinfra;
 using llvm::createStringError;
 
 namespace {
+uint64_t memrefAlignment(mlir::Value value) {
+  mlir::IntegerAttr attr;
+  if (auto arg = llvm::dyn_cast<mlir::BlockArgument>(value)) {
+    auto fn = llvm::dyn_cast<mlir::FunctionOpInterface>(arg.getOwner()->getParentOp());
+    if (fn && &fn.getFunctionBody().front() == arg.getOwner())
+      attr = fn.getArgAttrOfType<mlir::IntegerAttr>(arg.getArgNumber(), "llvm.align");
+  } else if (auto *def = value.getDefiningOp()) {
+    if (llvm::isa<mlir::memref::AllocOp, mlir::memref::AllocaOp>(def))
+      attr = def->getAttrOfType<mlir::IntegerAttr>("alignment");
+    else if (auto cast = llvm::dyn_cast<mlir::memref::CastOp>(def))
+      return memrefAlignment(cast.getSource());
+  }
+  if (!attr || attr.getInt() <= 0 || !llvm::isPowerOf2_64(attr.getInt()))
+    return 1;
+  auto type = llvm::cast<mlir::MemRefType>(value.getType());
+  int64_t offset;
+  llvm::SmallVector<int64_t> strides;
+  if (mlir::failed(type.getStridesAndOffset(strides, offset)) ||
+      mlir::ShapedType::isDynamic(offset))
+    return 1;
+  if (offset == 0)
+    return attr.getInt();
+  auto elem = type.getElementType();
+  if (!elem.isIntOrFloat() || elem.getIntOrFloatBitWidth() % 8)
+    return 1;
+  return llvm::commonAlignment(llvm::Align(attr.getInt()),
+                               uint64_t(offset) * (elem.getIntOrFloatBitWidth() / 8)).value();
+}
+
 llvm::Expected<mlir::arith::FastMathFlags>
 parseFastMathString(llvm::StringRef text) {
   text = text.trim();
@@ -440,19 +472,21 @@ llvm::Error compilerinfra::checkTypedContract(
   }
 
   // 3. Layout & address space checks.
-  if (tc.layout.minAlignmentBytes > 0) {
-    auto alignAttr = op->getAttrOfType<mlir::IntegerAttr>("alignment");
-    if (!alignAttr || alignAttr.getValue().isNegative() ||
-        alignAttr.getValue().getZExtValue() < tc.layout.minAlignmentBytes)
-      return createStringError(
-          contract.name +
-          ": missing or insufficient alignment attribute (requires >= " +
-          std::to_string(tc.layout.minAlignmentBytes) + " bytes)");
-  }
-  for (mlir::Type ty : op->getOperandTypes()) {
-    auto mr = llvm::dyn_cast<mlir::MemRefType>(ty);
+  for (auto &operand : op->getOpOperands()) {
+    auto value = operand.get();
+    auto mr = llvm::dyn_cast<mlir::MemRefType>(value.getType());
     if (!mr)
       continue;
+    if (tc.layout.minAlignmentBytes) {
+      uint64_t proven = memrefAlignment(value);
+      if (tc.layout.knownTargetAlignment)
+        proven = std::max(proven, tc.layout.knownTargetAlignment(value));
+      if (proven < tc.layout.minAlignmentBytes)
+        return createStringError(contract.name + ": operand " +
+            std::to_string(operand.getOperandNumber()) + " has proven alignment " +
+            std::to_string(proven) + ", requires " +
+            std::to_string(tc.layout.minAlignmentBytes) + " bytes");
+    }
     if (tc.layout.requiredMemorySpace &&
         mr.getMemorySpaceAsInt() != *tc.layout.requiredMemorySpace)
       return createStringError(contract.name + ": operand memory space != " +

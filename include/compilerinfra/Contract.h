@@ -231,6 +231,9 @@ struct LayoutSpec {
   uint64_t minAlignmentBytes = 0;
   std::optional<uint64_t> requiredMemorySpace;
   bool requireContiguousMinorDim = false;
+  // A target can prove alignment for its own storage and address operations.
+  std::function<uint64_t(mlir::Value)> knownTargetAlignment;
+
 };
 
 struct NumericalContract {

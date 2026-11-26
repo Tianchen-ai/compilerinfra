@@ -162,11 +162,13 @@ void testTypedContractsAndNumericalFlags(MLIRContext &ctx) {
   }
   copyOp->setAttr("alignment",
                   IntegerAttr::get(IntegerType::get(&ctx, 64), 64));
-  {
-    auto err =
-        target.checkImplementationForOp("exits/demo::brgemm_bf16_ftz", copyOp);
-    assert(!err && "contract must pass once accumulator_type and alignment match");
+  for (unsigned i = 0; i != 2; ++i) {
+    auto err = target.checkImplementationForOp("exits/demo::brgemm_bf16_ftz", copyOp);
+    assert(bool(err) && "a consumer hint cannot prove either operand aligned");
+    llvm::consumeError(std::move(err));
+    fn.setArgAttr(i, "llvm.align", IntegerAttr::get(IntegerType::get(&ctx, 64), 64));
   }
+  llvm::cantFail(target.checkImplementationForOp("exits/demo::brgemm_bf16_ftz", copyOp));
 
   // Audit fix 4c: Explicit fastmath=none MUST tighten global fastmath default!
   target.numerical.defaultFastMath = arith::FastMathFlags::fast;
