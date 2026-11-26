@@ -10,7 +10,7 @@ From the checkout, with Python ≥3.10, Ninja, CMake, a C++17 compiler and LLVM/
 python3 -m venv .venv
 . .venv/bin/activate
 LLVM_PREFIX=$(llvm-config-20 --prefix)
-cmake -S . -B build/sdk -G Ninja -DMLIR_DIR="$LLVM_PREFIX/lib/cmake/mlir" \\
+cmake -S . -B build/sdk -G Ninja -DMLIR_DIR="$LLVM_PREFIX/lib/cmake/mlir" \
   -DCMAKE_BUILD_TYPE=Release -DCOMPILERINFRA_LINK_MLIR_DYLIB=OFF -DCMAKE_INSTALL_PREFIX="$PWD/sdk"
 cmake --build build/sdk --parallel 8
 cmake --install build/sdk
