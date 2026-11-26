@@ -12,3 +12,6 @@ __pycache__/
 *.py[cod]
 /agent/build/
 /agent/*.egg-info/
+
+/python/build/
+/python/*.egg-info/
