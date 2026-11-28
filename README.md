@@ -2,6 +2,8 @@
 
 CompilerInfra builds MLIR-based product compilers from a declared compilation tree. A product owns its representations, boundaries, strategies and exits. The SDK links those units into a shared library. A Python JIT can keep the compiler in process, while development hosts can derive, inspect and run candidates from the same library.
 
+SDK 0.6.0 records the reference and origin of resolved numerical settings for product inspection and readiness. [Changelog](CHANGELOG.md) · [IntentDSL target contracts](https://github.com/Tianchen-ai/Intent/blob/main/doc/design/kir.md)
+
 ### Install the SDK
 
 From the checkout, with Python ≥3.10, Ninja, CMake, a C++17 compiler and LLVM/MLIR 20.1.8 PIC development archives installed:
